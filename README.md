@@ -183,3 +183,4 @@ For details on wallet integration and UI, see the main project README at the rep
 - Contract changes should keep **backwards compatibility** in mind where possible (especially for future upgrades).  
 - Please run `leo build` and `leo test` before opening a PR that touches `src/main.leo` or `tests/`.  
 - For larger architectural changes (new modules like `risk_engine` or `position_manager`), keep contracts small, composable, and well‑documented.
+  
