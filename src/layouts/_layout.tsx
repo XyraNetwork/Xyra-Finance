@@ -4,32 +4,14 @@ import { useWindowScroll } from '@/hooks/use-window-scroll';
 import { useIsMounted } from '@/hooks/use-is-mounted';
 import React, { useState, useEffect } from 'react';
 import { WalletMultiButton } from '@provablehq/aleo-wallet-adaptor-react-ui';
+import { useRouter } from 'next/router';
 import { HomeIcon } from '@/components/icons/home';
 import { Twitter } from '@/components/icons/twitter';
 import { Discord } from '@/components/icons/discord';
 import { useTheme } from 'next-themes';
 import Footer from '@/components/ui/Footer';
 
-// Define the list of DaisyUI themes you want to offer
-const themes = [
-  "light",
-  "dark",
-  "cupcake",
-  "bumblebee",
-  "emerald",
-  "forest",
-  "aqua",
-  "lofi",
-  "pastel",
-  "fantasy",
-  "wireframe",
-  "black",
-  "luxury",
-  "dracula",
-  "synthwave",
-];
-
-// ThemeSelector component using Next Themes
+// ThemeSelector: simple light/dark toggle buttons using next-themes
 function ThemeSelector() {
   const { theme, setTheme } = useTheme();
   // Use a mount flag to avoid SSR mismatch
@@ -41,37 +23,53 @@ function ThemeSelector() {
 
   if (!mounted) return null;
 
+  const current = theme === 'light' ? 'light' : 'dark';
+
   return (
-    <select
-      value={theme}
-      onChange={(e) => setTheme(e.target.value)}
-      className="select select-bordered max-w-xs"
-    >
-      {themes.map((t) => (
-        <option key={t} value={t}>
-          {t.charAt(0).toUpperCase() + t.slice(1)}
-        </option>
-      ))}
-    </select>
+    <div className="inline-flex items-center rounded-full bg-base-200 p-1 text-[11px]">
+      <button
+        type="button"
+        onClick={() => setTheme('light')}
+        className={`px-3 py-1 rounded-full transition ${
+          current === 'light' ? 'bg-base-100 text-primary font-semibold' : 'text-base-content/70'
+        }`}
+      >
+        Light
+      </button>
+      <button
+        type="button"
+        onClick={() => setTheme('dark')}
+        className={`px-3 py-1 rounded-full transition ${
+          current === 'dark' ? 'bg-base-100 text-primary font-semibold' : 'text-base-content/70'
+        }`}
+      >
+        Dark
+      </button>
+    </div>
   );
 }
 
 function HeaderRightArea() {
+  const router = useRouter();
+  const isLanding = router.pathname === '/';
+
   return (
     <div className="relative order-last flex shrink-0 items-center gap-3 sm:gap-6 lg:gap-8 btn-primary-content text-primary">
       {/* Use the updated ThemeSelector */}
       <ThemeSelector />
-      <div 
-        style={{ 
-          position: 'relative', 
-          zIndex: 9999, 
-          pointerEvents: 'auto',
-          cursor: 'pointer'
-        }}
-        className="wallet-button-wrapper"
-      >
-        <WalletMultiButton />
-      </div>
+      {!isLanding && (
+        <div
+          style={{
+            position: 'relative',
+            zIndex: 9999,
+            pointerEvents: 'auto',
+            cursor: 'pointer',
+          }}
+          className="wallet-button-wrapper"
+        >
+          <WalletMultiButton />
+        </div>
+      )}
     </div>
   );
 }
@@ -88,31 +86,23 @@ export function Header() {
       style={{ zIndex: 30 }}
     >
       <div className="flex flex-wrap items-center justify-between px-8 py-8 sm:px-6 lg:px-8 xl:px-10 3xl:px-12">
-        <div className="flex items-center space-x-2">
-          {process.env.URL && (
-            <a
-              className="bg-base-300 bg-opacity-20 rounded-full p-2"
-              href={`${process.env.URL}`}
-            >
-              <HomeIcon />
-            </a>
-          )}
-          {process.env.TWITTER && (
-            <a
-              className="bg-base-300 bg-opacity-20 rounded-full p-2"
-              href={`${process.env.TWITTER}`}
-            >
-              <Twitter width="18" height="18" />
-            </a>
-          )}
-          {process.env.DISCORD && (
-            <a
-              className="bg-base-300 bg-opacity-20 rounded-full p-2"
-              href={`${process.env.DISCORD}`}
-            >
-              <Discord width="18" height="18" />
-            </a>
-          )}
+        <div className="flex items-center space-x-3">
+          <img
+            src="https://www.xyra.network/_next/image?url=%2Fassets%2Flogo.png&w=128&q=75"
+            alt="Xyra Finance"
+            className="h-8 w-auto"
+          />
+          <div className="flex flex-col">
+            <span className="text-xs font-semibold tracking-[0.18em] uppercase text-base-content/70">
+              Xyra Finance
+            </span>
+            <span className="text-[10px] text-base-content/70">
+              Private Lending &amp; Borrowing Protocol on Aleo
+            </span>
+            <span className="hidden sm:block text-[10px] text-base-content/60">
+              Over-collateralized multi-asset money market on Aleo Testnet.
+            </span>
+          </div>
         </div>
         {/* Added a wrapper div with margin-left to create more space */}
         <div className="ml-2 mt-2">

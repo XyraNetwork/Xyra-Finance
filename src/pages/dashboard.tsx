@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import type { NextPageWithLayout } from '@/types';
-import DashboardLayout from '@/layouts/dashboard/_dashboard';
+import Layout from '@/layouts/_layout';
 import Button from '@/components/ui/button';
 import { useWallet } from '@provablehq/aleo-wallet-adaptor-react';
 import { Network } from '@provablehq/aleo-types';
@@ -896,48 +896,9 @@ const DashboardPage: NextPageWithLayout = () => {
   }, [isDevAppEnv]);
 
   return (
-    <div className="flex justify-center">
-      <div className="space-y-8 w-full max-w-6xl">
-      {/* Top nav / project context */}
-      <div className="rounded-xl bg-base-200 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-lg font-semibold">Xyra Finance – Private Lending & Borrowing Protocol on Aleo</h1>
-          <p className="text-[11px] opacity-70">
-            Over-collateralized multi-asset money market on Aleo Testnet.
-          </p>
-        </div>
-        {isDevAppEnv && (
-          <div className="flex flex-wrap items-center gap-4 text-[11px] opacity-80">
-            <div>
-              <span className="opacity-60 mr-1">Program:</span>
-              <span className="font-mono text-xs">{LENDING_POOL_PROGRAM_ID}</span>
-            </div>
-            <div>
-              <span className="opacity-60 mr-1">Network:</span>
-              <span className="font-semibold">{CURRENT_NETWORK}</span>
-            </div>
-            <div className="flex items-center gap-1">
-              <span className="opacity-60">Status:</span>
-              <span className="badge badge-success badge-xs">Testnet live</span>
-            </div>
-            <div>
-              {connected ? (
-                <span className="opacity-80">
-                  Wallet:&nbsp;
-                  <span className="font-mono">
-                    {publicKey?.slice(0, 6)}...{publicKey?.slice(-4)}
-                  </span>
-                </span>
-              ) : (
-                <span className="opacity-70">Connect your Aleo wallet to start using the pool.</span>
-              )}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Main content */}
-      <div className="space-y-6">
+    <div className="flex justify-center pt-16 sm:pt-20">
+      <div className="space-y-6 w-full max-w-6xl">
+        {/* Main content */}
         {/* Aleo Pool + inline actions & position */}
         <div className="space-y-6">
           {/* Pool overview */}
@@ -951,7 +912,7 @@ const DashboardPage: NextPageWithLayout = () => {
                     href="https://testnet.explorer.provable.com/program/lending_pool_v8.aleo"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="font-mono text-[11px] text-white underline decoration-dotted underline-offset-2 hover:decoration-solid"
+                    className="font-mono text-[11px] text-base-content underline decoration-dotted underline-offset-2 hover:decoration-solid"
                   >
                     lending_pool_v8.aleo
                   </a>
@@ -1314,7 +1275,6 @@ const DashboardPage: NextPageWithLayout = () => {
         </div>
 
       </div>
-      </div>
 
       {/* Testing tools removed: no direct credits.aleo wallet usage in UI now */}
 
@@ -1500,7 +1460,7 @@ const DashboardPage: NextPageWithLayout = () => {
   );
 };
 
-DashboardPage.getLayout = (page) => <DashboardLayout>{page}</DashboardLayout>;
+DashboardPage.getLayout = (page) => <Layout>{page}</Layout>;
 
 export default DashboardPage;
 
