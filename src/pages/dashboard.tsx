@@ -934,6 +934,18 @@ const DashboardPage: NextPageWithLayout = () => {
               </button>
             </div>
 
+            {/* Public data: on-chain mappings visible to everyone */}
+            <div className="rounded-lg border-l-4 border-info/50 pl-3 py-1">
+            <div className="flex flex-wrap items-center gap-2 mb-2">
+              <span className="badge badge-sm badge-info gap-1">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3.5 h-3.5" aria-hidden>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 0 1 0-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178Z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+                </svg>
+                Public
+              </span>
+              <span className="text-xs opacity-70">Pool Overview — read from public on-chain mappings; visible to everyone.</span>
+            </div>
             <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
               <div className="p-3 rounded-lg bg-base-300">
                 <div className="flex items-center gap-1">
@@ -998,6 +1010,7 @@ const DashboardPage: NextPageWithLayout = () => {
                   <p className="text-[10px] opacity-60 mt-1">raw: {interestIndex ?? '0'}</p>
                 )}
               </div>
+            </div>
             </div>
             {/* In production, embed Actions + Your Position inside this Aleo Pool card */}
             {!isDevAppEnv && connected && (
@@ -1082,9 +1095,18 @@ const DashboardPage: NextPageWithLayout = () => {
                   </div>
                 </div>
 
-                {/* Inline Your Position summary */}
-                <div className="space-y-3">
-                  <h3 className="font-semibold text-sm">Your Position</h3>
+                {/* Inline Your Position summary — private data from decrypted records */}
+                <div className="space-y-3 rounded-lg border-l-4 border-warning/50 pl-3 py-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="font-semibold text-sm">Your Position</h3>
+                    <span className="badge badge-sm badge-warning gap-1">
+                      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3.5 h-3.5" aria-hidden>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
+                      </svg>
+                      Private
+                    </span>
+                  </div>
+                  <p className="text-xs opacity-70">Decrypted from your wallet records — only you see this.</p>
                   <div className="grid grid-cols-2 gap-3 text-sm">
                     <div className="p-3 rounded-lg bg-base-300">
                       <div className="flex items-center gap-1">
