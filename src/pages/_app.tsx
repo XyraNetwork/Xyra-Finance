@@ -51,8 +51,7 @@ function CustomApp({ Component, pageProps }: AppPropsWithLayout) {
             // decrypt records (e.g. for UserActivity) after the first approval.
             decryptPermission={DecryptPermission.AutoDecrypt}
             // Programs this dApp will interact with via executeTransaction/requestRecords
-            // Restrict permissions to the lending pool program only.
-            programs={['lending_pool_v8.aleo']}
+            programs={['lending_pool_v86.aleo', 'lending_pool_usdce_v86.aleo', 'test_usdcx_stablecoin.aleo', 'credits.aleo']}
             onError={(error) => console.error(error.message)}
           >
             <WalletModalProvider>

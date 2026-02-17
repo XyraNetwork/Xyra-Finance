@@ -1,0 +1,587 @@
+import merkle_tree.aleo;
+import test_usdcx_multisig_core.aleo;
+import test_usdcx_freezelist.aleo;
+import test_usdcx_stablecoin.aleo;
+program lending_pool_usdce_v86.aleo;
+
+record UserActivity:
+    owner as address.private;
+    total_deposits as u64.private;
+    total_withdrawals as u64.private;
+    total_borrows as u64.private;
+    total_repayments as u64.private;
+
+struct MerkleProof:
+    siblings as [field; 16u32];
+    leaf_index as u32;
+
+struct WalletEcdsaSigner:
+    wallet_id as address;
+    ecdsa_signer as [u8; 20u32];
+
+struct AdminOp:
+    op as u8;
+    threshold as u8;
+    aleo_signer as address;
+    ecdsa_signer as [u8; 20u32];
+
+mapping total_supplied:
+    key as u8.public;
+    value as u64.public;
+
+mapping total_borrowed:
+    key as u8.public;
+    value as u64.public;
+
+mapping utilization_index:
+    key as u8.public;
+    value as u64.public;
+
+mapping liquidity_index:
+    key as u8.public;
+    value as u64.public;
+
+mapping borrow_index:
+    key as u8.public;
+    value as u64.public;
+
+mapping last_update_block:
+    key as u8.public;
+    value as u64.public;
+
+mapping user_total_deposits:
+    key as field.public;
+    value as u64.public;
+
+mapping user_total_withdrawals:
+    key as field.public;
+    value as u64.public;
+
+mapping user_total_borrows:
+    key as field.public;
+    value as u64.public;
+
+mapping user_total_repayments:
+    key as field.public;
+    value as u64.public;
+
+mapping user_scaled_supply:
+    key as field.public;
+    value as u64.public;
+
+mapping user_scaled_borrow:
+    key as field.public;
+    value as u64.public;
+
+function deposit:
+    input r0 as test_usdcx_stablecoin.aleo/Token.record;
+    input r1 as u64.public;
+    input r2 as u64.public;
+    input r3 as [MerkleProof; 2u32].private;
+    gt r1 0u64 into r4;
+    assert.eq r4 true;
+    is.eq self.caller r0.owner into r5;
+    assert.eq r5 true;
+    cast r1 into r6 as u128;
+    gte r0.amount r6 into r7;
+    assert.eq r7 true;
+    hash.bhp256 self.caller into r8 as field;
+    call test_usdcx_stablecoin.aleo/transfer_private aleo1a2ehlgqhvs3p7d4hqhs0tvgk954dr8gafu9kxse2mzu9a5sqxvpsrn98pr r6 r0 r3 into r9 r10 r11 r12;
+    cast self.caller r1 0u64 0u64 0u64 into r13 as UserActivity.record;
+    async deposit r1 r8 r2 r12 into r14;
+    output r13 as UserActivity.record;
+    output r11 as test_usdcx_stablecoin.aleo/Token.record;
+    output r10 as test_usdcx_stablecoin.aleo/Token.record;
+    output r14 as lending_pool_usdce_v86.aleo/deposit.future;
+
+finalize deposit:
+    input r0 as u64.public;
+    input r1 as field.public;
+    input r2 as u64.public;
+    input r3 as test_usdcx_stablecoin.aleo/transfer_private.future;
+    await r3;
+    get.or_use last_update_block[0u8] 0u64 into r4;
+    gt r2 r4 into r5;
+    branch.eq r5 false to end_then_0_0;
+    sub r2 r4 into r6;
+    gt r6 1000u64 into r7;
+    ternary r7 1000u64 r6 into r8;
+    add r4 r8 into r9;
+    set r9 into last_update_block[0u8];
+    get.or_use total_supplied[0u8] 0u64 into r10;
+    gt r10 0u64 into r11;
+    branch.eq r11 false to end_then_1_2;
+    get.or_use total_borrowed[0u8] 0u64 into r12;
+    get.or_use liquidity_index[0u8] 1000000000000u64 into r13;
+    get.or_use borrow_index[0u8] 1000000000000u64 into r14;
+    mul r12 1000000u64 into r15;
+    div r15 r10 into r16;
+    mul 6667u64 r16 into r17;
+    div r17 1000000u64 into r18;
+    add 1000u64 r18 into r19;
+    mul r19 r16 into r20;
+    mul r20 9000u64 into r21;
+    div r21 10000000000u64 into r22;
+    mul r13 r22 into r23;
+    mul r23 r8 into r24;
+    div r24 1000000000000u64 into r25;
+    add r13 r25 into r26;
+    mul r14 r19 into r27;
+    mul r27 r8 into r28;
+    div r28 1000000000000u64 into r29;
+    add r14 r29 into r30;
+    set r26 into liquidity_index[0u8];
+    set r30 into borrow_index[0u8];
+    branch.eq true true to end_otherwise_1_3;
+    position end_then_1_2;
+    position end_otherwise_1_3;
+    branch.eq true true to end_otherwise_0_1;
+    position end_then_0_0;
+    position end_otherwise_0_1;
+    get.or_use liquidity_index[0u8] 1000000000000u64 into r31;
+    mul r0 1000000000000u64 into r32;
+    div r32 r31 into r33;
+    get.or_use user_scaled_supply[r1] 0u64 into r34;
+    add r34 r33 into r35;
+    set r35 into user_scaled_supply[r1];
+    get.or_use user_total_deposits[r1] 0u64 into r36;
+    add r36 r0 into r37;
+    set r37 into user_total_deposits[r1];
+    contains total_supplied[0u8] into r38;
+    contains total_borrowed[0u8] into r39;
+    and r38 r39 into r40;
+    branch.eq r40 false to end_then_0_4;
+    get total_supplied[0u8] into r41;
+    get total_borrowed[0u8] into r42;
+    add r41 r0 into r43;
+    set r43 into total_supplied[0u8];
+    is.eq r43 0u64 into r44;
+    branch.eq r44 false to end_then_1_6;
+    set 0u64 into utilization_index[0u8];
+    branch.eq true true to end_otherwise_1_7;
+    position end_then_1_6;
+    mul r42 1000000u64 into r45;
+    div r45 r43 into r46;
+    set r46 into utilization_index[0u8];
+    position end_otherwise_1_7;
+    branch.eq true true to end_otherwise_0_5;
+    position end_then_0_4;
+    contains total_supplied[0u8] into r47;
+    branch.eq r47 false to end_then_1_8;
+    get total_supplied[0u8] into r48;
+    add r48 r0 into r49;
+    set r49 into total_supplied[0u8];
+    is.eq r49 0u64 into r50;
+    branch.eq r50 false to end_then_2_10;
+    set 0u64 into utilization_index[0u8];
+    branch.eq true true to end_otherwise_2_11;
+    position end_then_2_10;
+    div 0u64 r49 into r51;
+    set r51 into utilization_index[0u8];
+    position end_otherwise_2_11;
+    branch.eq true true to end_otherwise_1_9;
+    position end_then_1_8;
+    contains total_borrowed[0u8] into r52;
+    branch.eq r52 false to end_then_2_12;
+    get total_borrowed[0u8] into r53;
+    add 0u64 r0 into r54;
+    set r54 into total_supplied[0u8];
+    is.eq r54 0u64 into r55;
+    branch.eq r55 false to end_then_3_14;
+    set 0u64 into utilization_index[0u8];
+    branch.eq true true to end_otherwise_3_15;
+    position end_then_3_14;
+    mul r53 1000000u64 into r56;
+    div r56 r54 into r57;
+    set r57 into utilization_index[0u8];
+    position end_otherwise_3_15;
+    branch.eq true true to end_otherwise_2_13;
+    position end_then_2_12;
+    set r0 into total_supplied[0u8];
+    set 0u64 into utilization_index[0u8];
+    position end_otherwise_2_13;
+    position end_otherwise_1_9;
+    position end_otherwise_0_5;
+
+function repay:
+    input r0 as test_usdcx_stablecoin.aleo/Token.record;
+    input r1 as u64.public;
+    input r2 as u64.public;
+    input r3 as [MerkleProof; 2u32].private;
+    gt r1 0u64 into r4;
+    assert.eq r4 true;
+    is.eq self.caller r0.owner into r5;
+    assert.eq r5 true;
+    cast r1 into r6 as u128;
+    gte r0.amount r6 into r7;
+    assert.eq r7 true;
+    hash.bhp256 self.caller into r8 as field;
+    call test_usdcx_stablecoin.aleo/transfer_private aleo1a2ehlgqhvs3p7d4hqhs0tvgk954dr8gafu9kxse2mzu9a5sqxvpsrn98pr r6 r0 r3 into r9 r10 r11 r12;
+    cast self.caller 0u64 0u64 0u64 r1 into r13 as UserActivity.record;
+    async repay r1 r8 r2 r12 into r14;
+    output r13 as UserActivity.record;
+    output r11 as test_usdcx_stablecoin.aleo/Token.record;
+    output r10 as test_usdcx_stablecoin.aleo/Token.record;
+    output r14 as lending_pool_usdce_v86.aleo/repay.future;
+
+finalize repay:
+    input r0 as u64.public;
+    input r1 as field.public;
+    input r2 as u64.public;
+    input r3 as test_usdcx_stablecoin.aleo/transfer_private.future;
+    await r3;
+    get.or_use last_update_block[0u8] 0u64 into r4;
+    gt r2 r4 into r5;
+    branch.eq r5 false to end_then_0_16;
+    sub r2 r4 into r6;
+    gt r6 1000u64 into r7;
+    ternary r7 1000u64 r6 into r8;
+    add r4 r8 into r9;
+    set r9 into last_update_block[0u8];
+    get.or_use total_supplied[0u8] 0u64 into r10;
+    gt r10 0u64 into r11;
+    branch.eq r11 false to end_then_1_18;
+    get.or_use total_borrowed[0u8] 0u64 into r12;
+    get.or_use liquidity_index[0u8] 1000000000000u64 into r13;
+    get.or_use borrow_index[0u8] 1000000000000u64 into r14;
+    mul r12 1000000u64 into r15;
+    div r15 r10 into r16;
+    mul 6667u64 r16 into r17;
+    div r17 1000000u64 into r18;
+    add 1000u64 r18 into r19;
+    mul r19 r16 into r20;
+    mul r20 9000u64 into r21;
+    div r21 10000000000u64 into r22;
+    mul r13 r22 into r23;
+    mul r23 r8 into r24;
+    div r24 1000000000000u64 into r25;
+    add r13 r25 into r26;
+    mul r14 r19 into r27;
+    mul r27 r8 into r28;
+    div r28 1000000000000u64 into r29;
+    add r14 r29 into r30;
+    set r26 into liquidity_index[0u8];
+    set r30 into borrow_index[0u8];
+    branch.eq true true to end_otherwise_1_19;
+    position end_then_1_18;
+    position end_otherwise_1_19;
+    branch.eq true true to end_otherwise_0_17;
+    position end_then_0_16;
+    position end_otherwise_0_17;
+    get.or_use borrow_index[0u8] 1000000000000u64 into r31;
+    get.or_use user_scaled_borrow[r1] 0u64 into r32;
+    mul r32 r31 into r33;
+    div r33 1000000000000u64 into r34;
+    lte r0 r34 into r35;
+    assert.eq r35 true;
+    mul r0 1000000000000u64 into r36;
+    div r36 r31 into r37;
+    sub r32 r37 into r38;
+    set r38 into user_scaled_borrow[r1];
+    get.or_use user_total_repayments[r1] 0u64 into r39;
+    add r39 r0 into r40;
+    set r40 into user_total_repayments[r1];
+    contains total_supplied[0u8] into r41;
+    contains total_borrowed[0u8] into r42;
+    and r41 r42 into r43;
+    branch.eq r43 false to end_then_0_20;
+    get total_supplied[0u8] into r44;
+    get total_borrowed[0u8] into r45;
+    lte r0 r45 into r46;
+    assert.eq r46 true;
+    sub r45 r0 into r47;
+    set r47 into total_borrowed[0u8];
+    is.eq r44 0u64 into r48;
+    branch.eq r48 false to end_then_1_22;
+    set 0u64 into utilization_index[0u8];
+    branch.eq true true to end_otherwise_1_23;
+    position end_then_1_22;
+    mul r47 1000000u64 into r49;
+    div r49 r44 into r50;
+    set r50 into utilization_index[0u8];
+    position end_otherwise_1_23;
+    branch.eq true true to end_otherwise_0_21;
+    position end_then_0_20;
+    assert.eq false true;
+    position end_otherwise_0_21;
+
+function withdraw:
+    input r0 as u64.public;
+    input r1 as u64.public;
+    gt r0 0u64 into r2;
+    assert.eq r2 true;
+    hash.bhp256 self.caller into r3 as field;
+    cast self.caller 0u64 r0 0u64 0u64 into r4 as UserActivity.record;
+    async withdraw r0 r3 r1 into r5;
+    output r4 as UserActivity.record;
+    output r5 as lending_pool_usdce_v86.aleo/withdraw.future;
+
+finalize withdraw:
+    input r0 as u64.public;
+    input r1 as field.public;
+    input r2 as u64.public;
+    get.or_use last_update_block[0u8] 0u64 into r3;
+    gt r2 r3 into r4;
+    branch.eq r4 false to end_then_0_24;
+    sub r2 r3 into r5;
+    gt r5 1000u64 into r6;
+    ternary r6 1000u64 r5 into r7;
+    add r3 r7 into r8;
+    set r8 into last_update_block[0u8];
+    get.or_use total_supplied[0u8] 0u64 into r9;
+    gt r9 0u64 into r10;
+    branch.eq r10 false to end_then_1_26;
+    get.or_use total_borrowed[0u8] 0u64 into r11;
+    get.or_use liquidity_index[0u8] 1000000000000u64 into r12;
+    get.or_use borrow_index[0u8] 1000000000000u64 into r13;
+    mul r11 1000000u64 into r14;
+    div r14 r9 into r15;
+    mul 6667u64 r15 into r16;
+    div r16 1000000u64 into r17;
+    add 1000u64 r17 into r18;
+    mul r18 r15 into r19;
+    mul r19 9000u64 into r20;
+    div r20 10000000000u64 into r21;
+    mul r12 r21 into r22;
+    mul r22 r7 into r23;
+    div r23 1000000000000u64 into r24;
+    add r12 r24 into r25;
+    mul r13 r18 into r26;
+    mul r26 r7 into r27;
+    div r27 1000000000000u64 into r28;
+    add r13 r28 into r29;
+    set r25 into liquidity_index[0u8];
+    set r29 into borrow_index[0u8];
+    branch.eq true true to end_otherwise_1_27;
+    position end_then_1_26;
+    position end_otherwise_1_27;
+    branch.eq true true to end_otherwise_0_25;
+    position end_then_0_24;
+    position end_otherwise_0_25;
+    get.or_use liquidity_index[0u8] 1000000000000u64 into r30;
+    get.or_use user_scaled_supply[r1] 0u64 into r31;
+    mul r31 r30 into r32;
+    div r32 1000000000000u64 into r33;
+    lte r0 r33 into r34;
+    assert.eq r34 true;
+    mul r0 1000000000000u64 into r35;
+    div r35 r30 into r36;
+    sub r31 r36 into r37;
+    set r37 into user_scaled_supply[r1];
+    get.or_use user_total_withdrawals[r1] 0u64 into r38;
+    add r38 r0 into r39;
+    set r39 into user_total_withdrawals[r1];
+    contains total_supplied[0u8] into r40;
+    contains total_borrowed[0u8] into r41;
+    and r40 r41 into r42;
+    branch.eq r42 false to end_then_0_28;
+    get total_supplied[0u8] into r43;
+    get total_borrowed[0u8] into r44;
+    gte r43 r0 into r45;
+    assert.eq r45 true;
+    sub r43 r0 into r46;
+    gte r46 r44 into r47;
+    assert.eq r47 true;
+    set r46 into total_supplied[0u8];
+    is.eq r46 0u64 into r48;
+    branch.eq r48 false to end_then_1_30;
+    set 0u64 into utilization_index[0u8];
+    branch.eq true true to end_otherwise_1_31;
+    position end_then_1_30;
+    mul r44 1000000u64 into r49;
+    div r49 r46 into r50;
+    set r50 into utilization_index[0u8];
+    position end_otherwise_1_31;
+    branch.eq true true to end_otherwise_0_29;
+    position end_then_0_28;
+    contains total_supplied[0u8] into r51;
+    branch.eq r51 false to end_then_1_32;
+    get total_supplied[0u8] into r52;
+    gte r52 r0 into r53;
+    assert.eq r53 true;
+    sub r52 r0 into r54;
+    set r54 into total_supplied[0u8];
+    is.eq r54 0u64 into r55;
+    branch.eq r55 false to end_then_2_34;
+    set 0u64 into utilization_index[0u8];
+    branch.eq true true to end_otherwise_2_35;
+    position end_then_2_34;
+    div 0u64 r54 into r56;
+    set r56 into utilization_index[0u8];
+    position end_otherwise_2_35;
+    branch.eq true true to end_otherwise_1_33;
+    position end_then_1_32;
+    assert.eq false true;
+    position end_otherwise_1_33;
+    position end_otherwise_0_29;
+
+function borrow:
+    input r0 as u64.public;
+    input r1 as u64.public;
+    gt r0 0u64 into r2;
+    assert.eq r2 true;
+    hash.bhp256 self.caller into r3 as field;
+    cast self.caller 0u64 0u64 r0 0u64 into r4 as UserActivity.record;
+    async borrow r0 r3 r1 into r5;
+    output r4 as UserActivity.record;
+    output r5 as lending_pool_usdce_v86.aleo/borrow.future;
+
+finalize borrow:
+    input r0 as u64.public;
+    input r1 as field.public;
+    input r2 as u64.public;
+    get.or_use last_update_block[0u8] 0u64 into r3;
+    gt r2 r3 into r4;
+    branch.eq r4 false to end_then_0_36;
+    sub r2 r3 into r5;
+    gt r5 1000u64 into r6;
+    ternary r6 1000u64 r5 into r7;
+    add r3 r7 into r8;
+    set r8 into last_update_block[0u8];
+    get.or_use total_supplied[0u8] 0u64 into r9;
+    gt r9 0u64 into r10;
+    branch.eq r10 false to end_then_1_38;
+    get.or_use total_borrowed[0u8] 0u64 into r11;
+    get.or_use liquidity_index[0u8] 1000000000000u64 into r12;
+    get.or_use borrow_index[0u8] 1000000000000u64 into r13;
+    mul r11 1000000u64 into r14;
+    div r14 r9 into r15;
+    mul 6667u64 r15 into r16;
+    div r16 1000000u64 into r17;
+    add 1000u64 r17 into r18;
+    mul r18 r15 into r19;
+    mul r19 9000u64 into r20;
+    div r20 10000000000u64 into r21;
+    mul r12 r21 into r22;
+    mul r22 r7 into r23;
+    div r23 1000000000000u64 into r24;
+    add r12 r24 into r25;
+    mul r13 r18 into r26;
+    mul r26 r7 into r27;
+    div r27 1000000000000u64 into r28;
+    add r13 r28 into r29;
+    set r25 into liquidity_index[0u8];
+    set r29 into borrow_index[0u8];
+    branch.eq true true to end_otherwise_1_39;
+    position end_then_1_38;
+    position end_otherwise_1_39;
+    branch.eq true true to end_otherwise_0_37;
+    position end_then_0_36;
+    position end_otherwise_0_37;
+    get.or_use borrow_index[0u8] 1000000000000u64 into r30;
+    mul r0 1000000000000u64 into r31;
+    div r31 r30 into r32;
+    get.or_use user_scaled_borrow[r1] 0u64 into r33;
+    add r33 r32 into r34;
+    set r34 into user_scaled_borrow[r1];
+    get.or_use user_total_borrows[r1] 0u64 into r35;
+    add r35 r0 into r36;
+    set r36 into user_total_borrows[r1];
+    contains total_supplied[0u8] into r37;
+    contains total_borrowed[0u8] into r38;
+    and r37 r38 into r39;
+    branch.eq r39 false to end_then_0_40;
+    get total_supplied[0u8] into r40;
+    get total_borrowed[0u8] into r41;
+    add r41 r0 into r42;
+    lte r42 r40 into r43;
+    assert.eq r43 true;
+    set r42 into total_borrowed[0u8];
+    is.eq r40 0u64 into r44;
+    branch.eq r44 false to end_then_1_42;
+    set 0u64 into utilization_index[0u8];
+    branch.eq true true to end_otherwise_1_43;
+    position end_then_1_42;
+    mul r42 1000000u64 into r45;
+    div r45 r40 into r46;
+    set r46 into utilization_index[0u8];
+    position end_otherwise_1_43;
+    branch.eq true true to end_otherwise_0_41;
+    position end_then_0_40;
+    contains total_supplied[0u8] into r47;
+    branch.eq r47 false to end_then_1_44;
+    get total_supplied[0u8] into r48;
+    lte r0 r48 into r49;
+    assert.eq r49 true;
+    set r0 into total_borrowed[0u8];
+    is.eq r48 0u64 into r50;
+    branch.eq r50 false to end_then_2_46;
+    set 0u64 into utilization_index[0u8];
+    branch.eq true true to end_otherwise_2_47;
+    position end_then_2_46;
+    mul r0 1000000u64 into r51;
+    div r51 r48 into r52;
+    set r52 into utilization_index[0u8];
+    position end_otherwise_2_47;
+    branch.eq true true to end_otherwise_1_45;
+    position end_then_1_44;
+    assert.eq false true;
+    position end_otherwise_1_45;
+    position end_otherwise_0_41;
+
+function accrue_interest:
+    input r0 as u64.public;
+    async accrue_interest r0 into r1;
+    output r1 as lending_pool_usdce_v86.aleo/accrue_interest.future;
+
+finalize accrue_interest:
+    input r0 as u64.public;
+    get.or_use last_update_block[0u8] 0u64 into r1;
+    gt r0 r1 into r2;
+    branch.eq r2 false to end_then_0_48;
+    sub r0 r1 into r3;
+    gt r3 1000u64 into r4;
+    ternary r4 1000u64 r3 into r5;
+    add r1 r5 into r6;
+    set r6 into last_update_block[0u8];
+    get.or_use total_supplied[0u8] 0u64 into r7;
+    gt r7 0u64 into r8;
+    branch.eq r8 false to end_then_1_50;
+    get.or_use total_borrowed[0u8] 0u64 into r9;
+    get.or_use liquidity_index[0u8] 1000000000000u64 into r10;
+    get.or_use borrow_index[0u8] 1000000000000u64 into r11;
+    mul r9 1000000u64 into r12;
+    div r12 r7 into r13;
+    mul 6667u64 r13 into r14;
+    div r14 1000000u64 into r15;
+    add 1000u64 r15 into r16;
+    mul r16 r13 into r17;
+    mul r17 9000u64 into r18;
+    div r18 10000000000u64 into r19;
+    mul r10 r19 into r20;
+    mul r20 r5 into r21;
+    div r21 1000000000000u64 into r22;
+    add r10 r22 into r23;
+    mul r11 r16 into r24;
+    mul r24 r5 into r25;
+    div r25 1000000000000u64 into r26;
+    add r11 r26 into r27;
+    set r23 into liquidity_index[0u8];
+    set r27 into borrow_index[0u8];
+    branch.eq true true to end_otherwise_1_51;
+    position end_then_1_50;
+    position end_otherwise_1_51;
+    branch.eq true true to end_otherwise_0_49;
+    position end_then_0_48;
+    position end_otherwise_0_49;
+
+function get_address_hash:
+    hash.bhp256 self.caller into r0 as field;
+    output r0 as field.private;
+
+function get_user_activity:
+    hash.bhp256 self.caller into r0 as field;
+    cast self.caller 0u64 0u64 0u64 0u64 into r1 as UserActivity.record;
+    async get_user_activity r0 into r2;
+    output r1 as UserActivity.record;
+    output r2 as lending_pool_usdce_v86.aleo/get_user_activity.future;
+
+finalize get_user_activity:
+    input r0 as field.public;
+    get.or_use user_total_deposits[r0] 0u64 into r1;
+    get.or_use user_total_withdrawals[r0] 0u64 into r2;
+    get.or_use user_total_borrows[r0] 0u64 into r3;
+    get.or_use user_total_repayments[r0] 0u64 into r4;
+
+constructor:
+    assert.eq program_owner aleo1rhgdu77hgyqd3xjj8ucu3jj9r2krwz6mnzyd80gncr5fxcwlh5rsvzp9px;

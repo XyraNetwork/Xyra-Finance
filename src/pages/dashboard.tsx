@@ -6,13 +6,27 @@ import { useWallet } from '@provablehq/aleo-wallet-adaptor-react';
 import { Network } from '@provablehq/aleo-types';
 import {
   getLendingPoolState,
+  getUsdcLendingPoolState,
   lendingDeposit,
   lendingBorrow,
   lendingRepay,
   lendingWithdraw,
+  lendingDepositUsdc,
+  lendingBorrowUsdc,
+  lendingRepayUsdc,
+  lendingWithdrawUsdc,
+  getSuitableUsdcTokenRecord,
+  getPrivateUsdcBalance,
   lendingAccrueInterest,
+  lendingAccrueInterestUsdc,
+  getLatestBlockHeight,
   debugAllRecords,
   LENDING_POOL_PROGRAM_ID,
+  USDC_LENDING_POOL_PROGRAM_ID,
+  computeAleoPoolAPY,
+  computeUsdcPoolAPY,
+  getAleoPoolUserEffectivePosition,
+  getPrivateCreditsBalance,
 } from '@/components/aleo/rpc';
 import { frontendLogger } from '@/utils/logger';
 import { CURRENT_NETWORK } from '@/types';
@@ -34,9 +48,10 @@ const DashboardPage: NextPageWithLayout = () => {
   const publicKey = address; // Use address as publicKey for compatibility
 
   const [amount, setAmount] = useState<number>(0);
-  const [deltaIndex, setDeltaIndex] = useState<number>(0);
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [txId, setTxId] = useState<string | null>(null);
+  const [vaultWithdrawTxId, setVaultWithdrawTxId] = useState<string | null>(null);
+  const [vaultBorrowTxId, setVaultBorrowTxId] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [showLogsPanel, setShowLogsPanel] = useState<boolean>(false);
   const [logsSummary, setLogsSummary] = useState<any>(null);
@@ -45,9 +60,15 @@ const DashboardPage: NextPageWithLayout = () => {
   const [totalBorrowed, setTotalBorrowed] = useState<string | null>(null);
   const [utilizationIndex, setUtilizationIndex] = useState<string | null>(null);
   const [interestIndex, setInterestIndex] = useState<string | null>(null);
+  const [liquidityIndex, setLiquidityIndex] = useState<string | null>(null);
+  const [borrowIndex, setBorrowIndex] = useState<string | null>(null);
+  const [supplyAPY, setSupplyAPY] = useState<number>(0);
+  const [borrowAPY, setBorrowAPY] = useState<number>(0);
+  const [effectiveUserSupplied, setEffectiveUserSupplied] = useState<number | null>(null);
+  const [effectiveUserBorrowed, setEffectiveUserBorrowed] = useState<number | null>(null);
   const [txFinalized, setTxFinalized] = useState<boolean>(false);
-  
-  // User position state
+
+  // User position state (from records; effective balance from mappings when available)
   const [userSupplied, setUserSupplied] = useState<string>('0');
   const [userBorrowed, setUserBorrowed] = useState<string>('0');
   const [totalDeposits, setTotalDeposits] = useState<string>('0');
@@ -57,7 +78,29 @@ const DashboardPage: NextPageWithLayout = () => {
   const [isFetchingRecords, setIsFetchingRecords] = useState<boolean>(false);
   const [isRefreshingState, setIsRefreshingState] = useState<boolean>(false);
   const [amountError, setAmountError] = useState<string | null>(null);
-  
+  const [privateAleoBalance, setPrivateAleoBalance] = useState<number | null>(null);
+
+  // USDC Pool state (lending_pool_usdce_v86.aleo — v86 interest/APY, effective balances)
+  const [totalSuppliedUsdc, setTotalSuppliedUsdc] = useState<string | null>(null);
+  const [totalBorrowedUsdc, setTotalBorrowedUsdc] = useState<string | null>(null);
+  const [utilizationIndexUsdc, setUtilizationIndexUsdc] = useState<string | null>(null);
+  const [liquidityIndexUsdc, setLiquidityIndexUsdc] = useState<string | null>(null);
+  const [borrowIndexUsdc, setBorrowIndexUsdc] = useState<string | null>(null);
+  const [supplyAPYUsdc, setSupplyAPYUsdc] = useState<number>(0);
+  const [borrowAPYUsdc, setBorrowAPYUsdc] = useState<number>(0);
+  const [userSuppliedUsdc, setUserSuppliedUsdc] = useState<string>('0');
+  const [userBorrowedUsdc, setUserBorrowedUsdc] = useState<string>('0');
+  const [effectiveUserSuppliedUsdc, setEffectiveUserSuppliedUsdc] = useState<number | null>(null);
+  const [effectiveUserBorrowedUsdc, setEffectiveUserBorrowedUsdc] = useState<number | null>(null);
+  const [totalDepositsUsdc, setTotalDepositsUsdc] = useState<string>('0');
+  const [totalWithdrawalsUsdc, setTotalWithdrawalsUsdc] = useState<string>('0');
+  const [totalBorrowsUsdc, setTotalBorrowsUsdc] = useState<string>('0');
+  const [totalRepaymentsUsdc, setTotalRepaymentsUsdc] = useState<string>('0');
+  const [isRefreshingUsdcState, setIsRefreshingUsdcState] = useState<boolean>(false);
+  const [amountUsdc, setAmountUsdc] = useState<number>(0);
+  const [amountErrorUsdc, setAmountErrorUsdc] = useState<string | null>(null);
+  const [privateUsdcBalance, setPrivateUsdcBalance] = useState<number | null>(null);
+
   // Track if we've already triggered a one-time records permission request for this connection
   const [walletPermissionsInitialized, setWalletPermissionsInitialized] = useState<boolean>(false);
   // Track if we've already loaded the user's position once after wallet connect
@@ -192,6 +235,56 @@ const DashboardPage: NextPageWithLayout = () => {
     }
   }, [connected, requestRecords, publicKey, decrypt, isFetchingRecords]);
 
+  // Fetch user position for USDC pool (lending_pool_usdce_v85.aleo) — same UserActivity record shape.
+  const fetchRecordsInBackgroundUsdc = useCallback(async () => {
+    if (!connected || !requestRecords || !publicKey) return;
+    if (isFetchingRecords) return;
+    setIsFetchingRecords(true);
+    try {
+      const records = await requestRecords(USDC_LENDING_POOL_PROGRAM_ID, false);
+      if (!records || !Array.isArray(records) || records.length === 0) {
+        setUserSuppliedUsdc('0');
+        setUserBorrowedUsdc('0');
+        setTotalDepositsUsdc('0');
+        setTotalWithdrawalsUsdc('0');
+        setTotalBorrowsUsdc('0');
+        setTotalRepaymentsUsdc('0');
+        return;
+      }
+      if (!decrypt) return;
+      let totalDepositsAccum = 0;
+      let totalWithdrawalsAccum = 0;
+      let totalBorrowsAccum = 0;
+      let totalRepaymentsAccum = 0;
+      for (let i = 0; i < records.length; i++) {
+        const rec = records[i];
+        const cipher = extractCiphertext(rec);
+        if (!cipher) continue;
+        try {
+          const decryptedText = await decrypt(cipher);
+          totalDepositsAccum += extractU64FromText('total_deposits', decryptedText);
+          totalWithdrawalsAccum += extractU64FromText('total_withdrawals', decryptedText);
+          totalBorrowsAccum += extractU64FromText('total_borrows', decryptedText);
+          totalRepaymentsAccum += extractU64FromText('total_repayments', decryptedText);
+        } catch {
+          // skip
+        }
+      }
+      const netSupplied = Math.max(0, totalDepositsAccum - totalWithdrawalsAccum);
+      const netBorrowed = Math.max(0, totalBorrowsAccum - totalRepaymentsAccum);
+      setTotalDepositsUsdc(String(totalDepositsAccum));
+      setTotalWithdrawalsUsdc(String(totalWithdrawalsAccum));
+      setTotalBorrowsUsdc(String(totalBorrowsAccum));
+      setTotalRepaymentsUsdc(String(totalRepaymentsAccum));
+      setUserSuppliedUsdc(String(netSupplied));
+      setUserBorrowedUsdc(String(netBorrowed));
+    } catch (error: any) {
+      console.warn('fetchRecordsInBackgroundUsdc:', error?.message);
+    } finally {
+      setIsFetchingRecords(false);
+    }
+  }, [connected, requestRecords, publicKey, decrypt, isFetchingRecords]);
+
   // Fetch all user records (both credits.aleo and lending_pool_v8.aleo)
   const fetchAllUserRecords = useCallback(async () => {
     if (!connected || !requestRecords || !publicKey) {
@@ -235,7 +328,84 @@ const DashboardPage: NextPageWithLayout = () => {
     return (n / 1_000_000).toFixed(decimals);
   };
 
+  // Format micro-ALEO (u64 from program) as ALEO with given decimals (default 2).
+  const formatAleoAmount = (micro: number | string | null, decimals = 2) => {
+    if (micro == null) return (0).toFixed(decimals);
+    const n = typeof micro === 'string' ? Number(micro) : micro;
+    if (!Number.isFinite(n)) return (0).toFixed(decimals);
+    return (n / 1_000_000).toFixed(decimals);
+  };
+
   const isExplorerHash = (id: string | null) => !!id && id.length >= 61;
+
+  // Derived user metrics for interest display (Aleo pool)
+  const INDEX_SCALE_ALEO = 1_000_000_000_000;
+  const numericTotalDeposits = Number(totalDeposits) || 0;
+  const numericTotalWithdrawals = Number(totalWithdrawals) || 0;
+  const numericTotalBorrows = Number(totalBorrows) || 0;
+  const numericTotalRepayments = Number(totalRepayments) || 0;
+  const principalSupplied = Math.max(0, numericTotalDeposits - numericTotalWithdrawals);
+  const principalBorrowed = Math.max(0, numericTotalBorrows - numericTotalRepayments);
+  const effectiveSuppliedVal =
+    effectiveUserSupplied != null ? effectiveUserSupplied : Number(userSupplied) || 0;
+  const effectiveBorrowedVal =
+    effectiveUserBorrowed != null ? effectiveUserBorrowed : Number(userBorrowed) || 0;
+  const liNum = liquidityIndex != null ? Number(liquidityIndex) : null;
+  const biNum = borrowIndex != null ? Number(borrowIndex) : null;
+  const liFactor =
+    liNum != null && Number.isFinite(liNum) && liNum > 0
+      ? liNum / INDEX_SCALE_ALEO
+      : 1;
+  const biFactor =
+    biNum != null && Number.isFinite(biNum) && biNum > 0
+      ? biNum / INDEX_SCALE_ALEO
+      : 1;
+  // Approximate interest using indices (can show fractional ALEO even before whole-token accrual),
+  // falling back to effective-minus-principal if indices are unavailable.
+  const interestEarnedAleo =
+    principalSupplied > 0 && liFactor > 1
+      ? Math.max(0, principalSupplied * (liFactor - 1))
+      : Math.max(0, effectiveSuppliedVal - principalSupplied);
+  const interestOwedAleo =
+    principalBorrowed > 0 && biFactor > 1
+      ? Math.max(0, principalBorrowed * (biFactor - 1))
+      : Math.max(0, effectiveBorrowedVal - principalBorrowed);
+
+  // Derived user metrics for interest display (USDC pool)
+  const INDEX_SCALE_USDC = 1_000_000_000_000;
+  const USDC_SCALE = 1_000_000;
+  const numericTotalDepositsUsdc = Number(totalDepositsUsdc) || 0;
+  const numericTotalWithdrawalsUsdc = Number(totalWithdrawalsUsdc) || 0;
+  const numericTotalBorrowsUsdc = Number(totalBorrowsUsdc) || 0;
+  const numericTotalRepaymentsUsdc = Number(totalRepaymentsUsdc) || 0;
+  const principalSuppliedUsdc = Math.max(0, numericTotalDepositsUsdc - numericTotalWithdrawalsUsdc);
+  const principalBorrowedUsdc = Math.max(0, numericTotalBorrowsUsdc - numericTotalRepaymentsUsdc);
+  const effectiveSuppliedUsdcVal =
+    effectiveUserSuppliedUsdc != null ? effectiveUserSuppliedUsdc : Number(userSuppliedUsdc) || 0;
+  const effectiveBorrowedUsdcVal =
+    effectiveUserBorrowedUsdc != null ? effectiveUserBorrowedUsdc : Number(userBorrowedUsdc) || 0;
+  const liUsdcNum = liquidityIndexUsdc != null ? Number(liquidityIndexUsdc) : null;
+  const biUsdcNum = borrowIndexUsdc != null ? Number(borrowIndexUsdc) : null;
+  const liUsdcFactor =
+    liUsdcNum != null && Number.isFinite(liUsdcNum) && liUsdcNum > 0
+      ? liUsdcNum / INDEX_SCALE_USDC
+      : 1;
+  const biUsdcFactor =
+    biUsdcNum != null && Number.isFinite(biUsdcNum) && biUsdcNum > 0
+      ? biUsdcNum / INDEX_SCALE_USDC
+      : 1;
+  const interestEarnedUsdcMicro =
+    principalSuppliedUsdc > 0 && liUsdcFactor > 1
+      ? Math.max(0, principalSuppliedUsdc * (liUsdcFactor - 1))
+      : Math.max(0, effectiveSuppliedUsdcVal - principalSuppliedUsdc);
+  const interestOwedUsdcMicro =
+    principalBorrowedUsdc > 0 && biUsdcFactor > 1
+      ? Math.max(0, principalBorrowedUsdc * (biUsdcFactor - 1))
+      : Math.max(0, effectiveBorrowedUsdcVal - principalBorrowedUsdc);
+  const interestEarnedUsdc =
+    interestEarnedUsdcMicro > 0 ? interestEarnedUsdcMicro / USDC_SCALE : 0;
+  const interestOwedUsdc =
+    interestOwedUsdcMicro > 0 ? interestOwedUsdcMicro / USDC_SCALE : 0;
 
   const getExplorerTxUrl = (id: string) => {
     let base = 'https://explorer.aleo.org/transaction';
@@ -248,6 +418,9 @@ const DashboardPage: NextPageWithLayout = () => {
     return `${base}/${id}`;
   };
 
+  const getProvableExplorerTxUrl = (id: string) =>
+    `https://testnet.explorer.provable.com/transaction?id=${encodeURIComponent(id)}`;
+
   const refreshPoolState = async (includeUserPosition: boolean = false) => {
     try {
       setIsRefreshingState(true);
@@ -256,12 +429,28 @@ const DashboardPage: NextPageWithLayout = () => {
       setTotalBorrowed(state.totalBorrowed ?? '0');
       setUtilizationIndex(state.utilizationIndex ?? '0');
       setInterestIndex(state.interestIndex ?? '0');
-      
-      // Optionally refresh user position if wallet is connected.
-      // This now reuses the decrypt+records path in fetchRecordsInBackground.
-      if (includeUserPosition && requestRecords && publicKey) {
+      setLiquidityIndex(state.liquidityIndex ?? null);
+      setBorrowIndex(state.borrowIndex ?? null);
+      const ts = Number(state.totalSupplied ?? 0) || 0;
+      const tb = Number(state.totalBorrowed ?? 0) || 0;
+      const { supplyAPY: sApy, borrowAPY: bApy } = computeAleoPoolAPY(ts, tb);
+      setSupplyAPY(sApy);
+      setBorrowAPY(bApy);
+
+      if (includeUserPosition && publicKey) {
         try {
           await fetchRecordsInBackground(LENDING_POOL_PROGRAM_ID);
+          const effective = await getAleoPoolUserEffectivePosition(LENDING_POOL_PROGRAM_ID, publicKey);
+          if (effective) {
+            setEffectiveUserSupplied(effective.effectiveSupplyBalance);
+            setEffectiveUserBorrowed(effective.effectiveBorrowDebt);
+          } else {
+            setEffectiveUserSupplied(null);
+            setEffectiveUserBorrowed(null);
+          }
+          if (requestRecords) {
+            getPrivateCreditsBalance(requestRecords, decrypt).then(setPrivateAleoBalance).catch(() => setPrivateAleoBalance(null));
+          }
         } catch (error) {
           console.warn('Failed to refresh user position from records:', error);
           setUserSupplied('0');
@@ -270,6 +459,8 @@ const DashboardPage: NextPageWithLayout = () => {
           setTotalWithdrawals('0');
           setTotalBorrows('0');
           setTotalRepayments('0');
+          setEffectiveUserSupplied(null);
+          setEffectiveUserBorrowed(null);
         }
       } else {
         setUserSupplied('0');
@@ -278,6 +469,9 @@ const DashboardPage: NextPageWithLayout = () => {
         setTotalWithdrawals('0');
         setTotalBorrows('0');
         setTotalRepayments('0');
+        setEffectiveUserSupplied(null);
+        setEffectiveUserBorrowed(null);
+        setPrivateAleoBalance(null);
       }
     } catch (e) {
       console.error('Failed to fetch pool state', e);
@@ -288,10 +482,61 @@ const DashboardPage: NextPageWithLayout = () => {
     }
   };
 
+  const refreshUsdcPoolState = async (includeUserPosition: boolean = false) => {
+    try {
+      setIsRefreshingUsdcState(true);
+      const state = await getUsdcLendingPoolState();
+      setTotalSuppliedUsdc(state.totalSupplied ?? '0');
+      setTotalBorrowedUsdc(state.totalBorrowed ?? '0');
+      setUtilizationIndexUsdc(state.utilizationIndex ?? '0');
+      setLiquidityIndexUsdc(state.liquidityIndex ?? null);
+      setBorrowIndexUsdc(state.borrowIndex ?? null);
+      const ts = Number(state.totalSupplied ?? 0) || 0;
+      const tb = Number(state.totalBorrowed ?? 0) || 0;
+      const { supplyAPY: sApy, borrowAPY: bApy } = computeUsdcPoolAPY(ts, tb);
+      setSupplyAPYUsdc(sApy);
+      setBorrowAPYUsdc(bApy);
+      if (includeUserPosition && requestRecords && publicKey) {
+        try {
+          await fetchRecordsInBackgroundUsdc();
+          const effective = await getAleoPoolUserEffectivePosition(USDC_LENDING_POOL_PROGRAM_ID, publicKey);
+          if (effective) {
+            setEffectiveUserSuppliedUsdc(effective.effectiveSupplyBalance);
+            setEffectiveUserBorrowedUsdc(effective.effectiveBorrowDebt);
+          } else {
+            setEffectiveUserSuppliedUsdc(null);
+            setEffectiveUserBorrowedUsdc(null);
+          }
+          getPrivateUsdcBalance(requestRecords, decrypt).then(setPrivateUsdcBalance).catch(() => setPrivateUsdcBalance(null));
+        } catch (error) {
+          console.warn('Failed to refresh USDC user position:', error);
+          setUserSuppliedUsdc('0');
+          setUserBorrowedUsdc('0');
+          setTotalDepositsUsdc('0');
+          setTotalWithdrawalsUsdc('0');
+          setTotalBorrowsUsdc('0');
+          setTotalRepaymentsUsdc('0');
+          setEffectiveUserSuppliedUsdc(null);
+          setEffectiveUserBorrowedUsdc(null);
+          setPrivateUsdcBalance(null);
+        }
+      } else {
+        setEffectiveUserSuppliedUsdc(null);
+        setEffectiveUserBorrowedUsdc(null);
+        setPrivateUsdcBalance(null);
+      }
+    } catch (e) {
+      console.error('Failed to fetch USDC pool state', e);
+    } finally {
+      setIsRefreshingUsdcState(false);
+    }
+  };
+
   // One-time pool state fetch on page load/refresh and when wallet connects.
   // This DOES NOT touch private records / requestRecords to avoid extra wallet prompts.
   useEffect(() => {
     refreshPoolState(false);
+    refreshUsdcPoolState(false);
   }, [publicKey, connected]);
 
   // When wallet connects, trigger a ONE-TIME broad records request to get permissions up front.
@@ -326,6 +571,12 @@ const DashboardPage: NextPageWithLayout = () => {
           );
         }
         try {
+          await requestRecords(USDC_LENDING_POOL_PROGRAM_ID, false);
+          console.log(`✅ Wallet record permissions initialized for ${USDC_LENDING_POOL_PROGRAM_ID}`);
+        } catch (e: any) {
+          console.warn(`⚠️ Failed to pre-initialize permissions for ${USDC_LENDING_POOL_PROGRAM_ID}:`, e?.message);
+        }
+        try {
           await requestRecords('credits.aleo', false);
           console.log('✅ Wallet record permissions initialized for credits.aleo');
         } catch (e: any) {
@@ -354,8 +605,8 @@ const DashboardPage: NextPageWithLayout = () => {
     (async () => {
       try {
         await refreshPoolState(true);
+        await refreshUsdcPoolState(true);
       } finally {
-        // Mark as initialized so we don't refetch repeatedly
         setUserPositionInitialized(true);
       }
     })();
@@ -401,15 +652,46 @@ const DashboardPage: NextPageWithLayout = () => {
         throw new Error('Amount must be greater than zero.');
       }
 
-      // Frontend limit checks based on current pool and user data
-      const netSupplied = Number(userSupplied) || 0;
-      const netBorrowed = Number(userBorrowed) || 0;
-      const poolSupplied = Number(totalSupplied) || 0;
-      const poolBorrowed = Number(totalBorrowed) || 0;
-      const availableLiquidity = Math.max(0, poolSupplied - poolBorrowed);
+      // First check for deposit/repay: private Aleo balance must be at least the input amount
+      if (action === 'deposit' || action === 'repay') {
+        let balance = privateAleoBalance;
+        if (balance === null && requestRecords) {
+          balance = await getPrivateCreditsBalance(requestRecords, decrypt);
+          setPrivateAleoBalance(balance);
+        }
+        if (amount > (balance ?? 0)) {
+          const msg = `Insufficient private Aleo. Your balance: ${(Math.floor((balance ?? 0) * 100) / 100).toFixed(2)} credits.`;
+          setAmountError(msg);
+          setLoading(false);
+          return;
+        }
+      }
 
-      if (action === 'withdraw' && amount > netSupplied) {
-        const msg = `You can withdraw at most ${netSupplied} from your current position.`;
+      // Frontend limit checks (Aleo pool):
+      // Program and mappings use micro-ALEO (u64). Convert to ALEO (credits) for comparisons with `amount`.
+      const netSuppliedMicro = effectiveUserSupplied ?? (Number(userSupplied) || 0);
+      const netBorrowedMicro = effectiveUserBorrowed ?? (Number(userBorrowed) || 0);
+      const poolSuppliedMicro = Number(totalSupplied) || 0;
+      const poolBorrowedMicro = Number(totalBorrowed) || 0;
+
+      const netSupplied = netSuppliedMicro / 1_000_000; // ALEO
+      const netBorrowed = netBorrowedMicro / 1_000_000; // ALEO
+      const availableLiquidity = Math.max(
+        0,
+        (poolSuppliedMicro - poolBorrowedMicro) / 1_000_000,
+      ); // ALEO
+
+      const maxWithdrawable = Math.min(netSupplied, availableLiquidity);
+      if (action === 'withdraw' && amount > maxWithdrawable) {
+        const msg = availableLiquidity < netSupplied
+          ? `You can withdraw at most ${maxWithdrawable.toFixed(
+              2,
+            )} ALEO (available pool liquidity). Your position is ${netSupplied.toFixed(
+              2,
+            )} ALEO but only ${availableLiquidity.toFixed(2)} ALEO is free for withdrawal.`
+          : `You can withdraw at most ${netSupplied.toFixed(
+              2,
+            )} ALEO from your current position.`;
         setAmountError(msg);
         console.warn(msg);
         setLoading(false);
@@ -417,7 +699,9 @@ const DashboardPage: NextPageWithLayout = () => {
       }
 
       if (action === 'repay' && amount > netBorrowed) {
-        const msg = `You need to repay at most ${netBorrowed} to fully clear your debt.`;
+        const msg = `You need to repay at most ${netBorrowed.toFixed(
+          2,
+        )} ALEO to fully clear your debt.`;
         setAmountError(msg);
         console.warn(msg);
         setLoading(false);
@@ -442,21 +726,35 @@ const DashboardPage: NextPageWithLayout = () => {
       switch (action) {
         case 'deposit':
           console.log('💰 DEPOSIT: Starting deposit transaction (executeTransaction)...');
-          tx = await lendingDeposit(executeTransaction, amount);
+          tx = await lendingDeposit(
+            executeTransaction,
+            amount,
+            publicKey || undefined,
+            requestRecords,
+            decrypt,
+          );
           console.log('💰 DEPOSIT: Transaction submitted successfully:', tx);
           break;
         case 'borrow':
           console.log('📥 BORROW: Starting borrow transaction (executeTransaction)...');
+          setVaultBorrowTxId(null);
           tx = await lendingBorrow(executeTransaction, amount);
           console.log('📥 BORROW: Transaction submitted successfully:', tx);
           break;
         case 'repay':
-          console.log('💳 REPAY: Starting repay transaction (executeTransaction)...');
-          tx = await lendingRepay(executeTransaction, amount);
+          console.log('💳 REPAY: Starting repay_with_credits transaction (executeTransaction)...');
+          tx = await lendingRepay(
+            executeTransaction,
+            amount,
+            publicKey || undefined,
+            requestRecords,
+            decrypt,
+          );
           console.log('💳 REPAY: Transaction submitted successfully:', tx);
           break;
         case 'withdraw':
           console.log('💸 WITHDRAW: Starting withdraw transaction (executeTransaction)...');
+          setVaultWithdrawTxId(null);
           tx = await lendingWithdraw(executeTransaction, amount);
           console.log('💸 WITHDRAW: Transaction submitted successfully:', tx);
           break;
@@ -486,21 +784,21 @@ const DashboardPage: NextPageWithLayout = () => {
       console.log('📤 Transaction ID:', tx);
       console.log('⏳ Starting finalization polling...');
 
-      // Poll for transaction finalization using wallet's transactionStatus
+      // Poll for transaction finalization; only then call backend for withdraw/borrow (same as USDC pool).
       let finalized = false;
-      const maxAttempts = 30; // 30 attempts
-      const delayMs = 2000; // 2 seconds between attempts
+      let txFailed = false;
+      const maxAttempts = 45;
+      const delayMs = 2000;
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         console.log(`🔄 Polling transaction status (attempt ${attempt}/${maxAttempts})...`);
         await new Promise((resolve) => setTimeout(resolve, delayMs));
-        
+
         if (transactionStatus) {
           try {
             const statusResult = await transactionStatus(tx);
             console.log(`📊 Transaction status (attempt ${attempt}):`, statusResult);
 
-            // Normalize status: adapter may return a string or an object with `.status`
             const statusText =
               typeof statusResult === 'string'
                 ? statusResult
@@ -510,55 +808,90 @@ const DashboardPage: NextPageWithLayout = () => {
             if (statusLower === 'finalized' || statusLower === 'accepted') {
               finalized = true;
               console.log('✅ Transaction finalized!', statusResult);
-
-              // If wallet returned a final on-chain tx id, prefer that for display
               const finalId =
                 (typeof statusResult === 'object' && (statusResult as any).transactionId) || tx;
               setTxId(finalId);
               break;
             }
+            if (statusLower === 'rejected' || statusLower === 'failed' || statusLower === 'dropped') {
+              txFailed = true;
+              setStatusMessage(`Transaction ${statusLower}. Vault transfer was not requested.`);
+              setLoading(false);
+              console.log('========================================\n');
+              return;
+            }
             setStatusMessage(`Transaction ${statusText || 'pending'}... (attempt ${attempt}/${maxAttempts})`);
           } catch (e) {
-            // If transactionStatus fails, continue polling
             console.warn(`⚠️ Failed to check transaction status (attempt ${attempt}):`, e);
           }
         } else {
-          console.warn(`⚠️ transactionStatus function not available (attempt ${attempt})`);
-          // Fallback: just wait and assume it will finalize
           if (attempt === maxAttempts) {
-            finalized = true; // Assume finalized after max wait time
+            finalized = true;
             console.log('⏰ Max attempts reached, assuming finalized');
           }
         }
       }
 
-      if (finalized) {
-        setTxFinalized(true);
-        console.log('✅ Transaction finalized successfully!');
-        // Clear amount input after successful transaction
-        setAmount(0);
-        // Refresh full pool + user position state once after transaction finalizes
-        console.log('📋 Refreshing pool and user position after transaction finalization...');
-        try {
-          await refreshPoolState(true);
-          setStatusMessage('Transaction finalized! Pool and position have been refreshed.');
-          // Auto-hide toast shortly after successful refresh in production
-          if (!isDevAppEnv) {
-            setTimeout(() => setStatusMessage(''), 2500);
-          }
-        } catch (refreshError) {
-          console.warn('⚠️ Failed to refresh pool state after transaction:', refreshError);
-          setStatusMessage(
-            'Transaction finalized, but automatic refresh failed. Please click Refresh to update.',
-          );
-        }
-        console.log('✅ Transaction flow completed successfully');
-      } else {
-        console.warn('⚠️ Transaction not finalized within expected time');
-        setStatusMessage(
-          'Transaction submitted but not finalized within the expected time. It may still be processing. Pool state will update once finalized.'
-        );
+      if (txFailed) {
+        setLoading(false);
+        console.log('========================================\n');
+        return;
       }
+      if (!finalized) {
+        setStatusMessage(
+          'Transaction not finalized in time. Please check the explorer. Vault transfer was not requested.'
+        );
+        setLoading(false);
+        console.log('========================================\n');
+        return;
+      }
+
+      setTxFinalized(true);
+      console.log('✅ Transaction finalized successfully!');
+
+      // Only after finalization: call backend for withdraw/borrow (vault sends credits to user).
+      if (action === 'withdraw' || action === 'borrow') {
+        setStatusMessage('Transaction finalized. Requesting credits from vault...');
+        if (publicKey) {
+          try {
+            const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:4000';
+            const endpoint = action === 'withdraw' ? '/withdraw' : '/borrow';
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 120_000);
+            const resp = await fetch(`${backendUrl}${endpoint}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ userAddress: publicKey, amountCredits: amount }),
+              signal: controller.signal,
+            });
+            clearTimeout(timeoutId);
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              const msg = (data?.error as string) || resp.statusText || 'Backend error';
+              setStatusMessage(`Vault ${action} failed: ${msg}`);
+            } else {
+              if (action === 'withdraw') setVaultWithdrawTxId(data?.transactionId ?? null);
+              else setVaultBorrowTxId(data?.transactionId ?? null);
+              setStatusMessage(data?.transactionId ? `Vault ${action} submitted.` : `Vault ${action} complete.`);
+            }
+          } catch (e: any) {
+            const msg = e?.name === 'AbortError' ? 'Request timed out' : (e?.message || 'Network error');
+            setStatusMessage(`Vault ${action}: ${msg}`);
+          }
+        }
+      }
+
+      setAmount(0);
+      console.log('📋 Refreshing pool and user position after transaction finalization...');
+      try {
+        await refreshPoolState(true);
+        setStatusMessage('Transaction finalized! Pool and position have been refreshed.');
+        if (!isDevAppEnv) setTimeout(() => setStatusMessage(''), 2500);
+      } catch (refreshError) {
+        console.warn('⚠️ Failed to refresh pool state after transaction:', refreshError);
+        setStatusMessage('Transaction finalized, but automatic refresh failed. Please click Refresh to update.');
+      }
+      console.log('✅ Transaction flow completed successfully');
       console.log('========================================\n');
     } catch (e: any) {
       console.error('========================================');
@@ -588,6 +921,200 @@ const DashboardPage: NextPageWithLayout = () => {
     } finally {
       setLoading(false);
       console.log(`🏁 ${action.toUpperCase()} flow ended (loading set to false)`);
+    }
+  };
+
+  const handleActionUsdc = async (action: 'deposit' | 'borrow' | 'repay' | 'withdraw') => {
+    if (!connected || !publicKey || !executeTransaction || !requestRecords) {
+      setStatusMessage('Please connect your wallet.');
+      return;
+    }
+    try {
+      setLoading(true);
+      setStatusMessage(`Executing USDC ${action}...`);
+      setAmountErrorUsdc(null);
+      if (amountUsdc <= 0) {
+        throw new Error('Amount must be greater than zero.');
+      }
+      const amountMicro = Math.round(amountUsdc * 1_000_000);
+      const USDC_SCALE = 1_000_000;
+      const netSuppliedMicro = (effectiveUserSuppliedUsdc ?? Number(userSuppliedUsdc)) || 0;
+      const netBorrowedMicro = (effectiveUserBorrowedUsdc ?? Number(userBorrowedUsdc)) || 0;
+      const poolSuppliedMicro = Number(totalSuppliedUsdc) || 0;
+      const poolBorrowedMicro = Number(totalBorrowedUsdc) || 0;
+      const maxWithdrawHuman = netSuppliedMicro / USDC_SCALE;
+      const maxRepayHuman = netBorrowedMicro / USDC_SCALE;
+      const availableLiquidityHuman = Math.max(0, (poolSuppliedMicro - poolBorrowedMicro) / USDC_SCALE);
+      if (action === 'withdraw' && amountUsdc > maxWithdrawHuman) {
+        setAmountErrorUsdc(`You can withdraw at most ${maxWithdrawHuman.toFixed(2)} USDC.`);
+        setLoading(false);
+        return;
+      }
+      if (action === 'repay' && amountUsdc > maxRepayHuman) {
+        setAmountErrorUsdc(`Repay at most ${maxRepayHuman.toFixed(2)} USDC.`);
+        setLoading(false);
+        return;
+      }
+      if (action === 'borrow' && amountUsdc > availableLiquidityHuman) {
+        setAmountErrorUsdc(`Borrow exceeds available liquidity (${availableLiquidityHuman.toFixed(2)}).`);
+        setLoading(false);
+        return;
+      }
+      if (action === 'deposit' || action === 'repay') {
+        let balance = privateUsdcBalance;
+        if (balance === null && requestRecords) {
+          balance = await getPrivateUsdcBalance(requestRecords, decrypt);
+          setPrivateUsdcBalance(balance);
+        }
+        if (amountUsdc > (balance ?? 0)) {
+          const msg = `Insufficient private USDC. Your balance: ${(Math.floor((balance ?? 0) * 100) / 100).toFixed(2)} USDC.`;
+          setAmountErrorUsdc(msg);
+          setStatusMessage(msg);
+          setLoading(false);
+          return;
+        }
+      }
+      let tx: string;
+      switch (action) {
+        case 'deposit': {
+          let tokenRecord = await getSuitableUsdcTokenRecord(requestRecords, amountMicro, publicKey);
+          if (!tokenRecord) {
+            console.warn('[USDC Deposit] No suitable USDCx record. See [getSuitableUsdcTokenRecord] logs above for details.');
+            setAmountErrorUsdc('No USDC record found with sufficient balance. Get USDCx from the faucet or select a record. Check browser console (F12) for details.');
+            setStatusMessage('No USDCx record with sufficient balance.');
+            setLoading(false);
+            return;
+          }
+          if (!tokenRecord.plaintext && decrypt) {
+            const cipher = tokenRecord.recordCiphertext ?? tokenRecord.record_ciphertext ?? tokenRecord.ciphertext;
+            if (typeof cipher === 'string') {
+              try {
+                const plain = await decrypt(cipher);
+                if (plain) tokenRecord = { ...tokenRecord, plaintext: plain };
+              } catch (e) {
+                console.warn('[USDC Deposit] Decrypt failed, using ciphertext:', e);
+              }
+            }
+          }
+          tx = await lendingDepositUsdc(executeTransaction, amountUsdc, tokenRecord);
+          break;
+        }
+        case 'repay': {
+          let tokenRecord = await getSuitableUsdcTokenRecord(requestRecords, amountMicro, publicKey);
+          if (!tokenRecord) {
+            console.warn('[USDC Repay] No suitable USDCx record. See [getSuitableUsdcTokenRecord] logs above for details.');
+            setAmountErrorUsdc('No USDC record found with sufficient balance for repay. Check browser console (F12) for details.');
+            setStatusMessage('No USDCx record with sufficient balance.');
+            setLoading(false);
+            return;
+          }
+          if (!tokenRecord.plaintext && decrypt) {
+            const cipher = tokenRecord.recordCiphertext ?? tokenRecord.record_ciphertext ?? tokenRecord.ciphertext;
+            if (typeof cipher === 'string') {
+              try {
+                const plain = await decrypt(cipher);
+                if (plain) tokenRecord = { ...tokenRecord, plaintext: plain };
+              } catch (e) {
+                console.warn('[USDC Repay] Decrypt failed, using ciphertext:', e);
+              }
+            }
+          }
+          tx = await lendingRepayUsdc(executeTransaction, amountUsdc, tokenRecord);
+          break;
+        }
+        case 'withdraw': {
+          tx = await lendingWithdrawUsdc(executeTransaction, amountUsdc);
+          break;
+        }
+        case 'borrow': {
+          tx = await lendingBorrowUsdc(executeTransaction, amountUsdc);
+          break;
+        }
+        default:
+          throw new Error(`Unknown action: ${action}`);
+      }
+      if (tx === '__CANCELLED__') {
+        setStatusMessage('Transaction cancelled by user.');
+        if (!isDevAppEnv) setTimeout(() => setStatusMessage(''), 2500);
+        setLoading(false);
+        return;
+      }
+      setTxId(tx);
+      setTxFinalized(false);
+      setStatusMessage(`USDC ${action} submitted. Waiting for transaction to finalize...`);
+      let finalized = false;
+      let txFailed = false;
+      for (let attempt = 1; attempt <= 45; attempt++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        if (transactionStatus) {
+          try {
+            const statusResult = await transactionStatus(tx);
+            const statusText = typeof statusResult === 'string' ? statusResult : (statusResult as any)?.status ?? '';
+            const statusLower = (statusText || '').toLowerCase();
+            if (statusLower === 'finalized' || statusLower === 'accepted') {
+              finalized = true;
+              break;
+            }
+            if (statusLower === 'rejected' || statusLower === 'failed' || statusLower === 'dropped') {
+              txFailed = true;
+              setStatusMessage(`Transaction ${statusLower}. Vault transfer was not requested.`);
+              setLoading(false);
+              return;
+            }
+          } catch {
+            // continue polling
+          }
+        }
+      }
+      if (txFailed) {
+        setLoading(false);
+        return;
+      }
+      if (!finalized) {
+        setStatusMessage('Transaction not finalized in time. Please check the explorer. Vault transfer was not requested.');
+        setLoading(false);
+        return;
+      }
+      setTxFinalized(true);
+      if (action === 'withdraw' || action === 'borrow') {
+        setStatusMessage('Transaction finalized. Requesting USDC from vault...');
+        try {
+          const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:4000';
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 120_000);
+          const endpoint = action === 'withdraw' ? '/withdraw-usdc' : '/borrow-usdc';
+          const resp = await fetch(`${backendUrl}${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userAddress: publicKey, amountUsdc }),
+            signal: controller.signal,
+          });
+          clearTimeout(timeoutId);
+          const data = await resp.json().catch(() => ({}));
+          if (resp.ok && data?.transactionId) {
+            if (action === 'withdraw') setVaultWithdrawTxId(data.transactionId);
+            else setVaultBorrowTxId(data.transactionId);
+            setStatusMessage(`Vault transfer submitted. ${data.transactionId ? `Tx: ${data.transactionId}` : ''}`);
+          } else {
+            const errMsg = (data?.error as string) || resp.statusText || 'Vault transfer failed';
+            setStatusMessage(errMsg);
+          }
+        } catch (e: any) {
+          setStatusMessage(e?.name === 'AbortError' ? 'Vault request timed out.' : (e?.message || 'Vault request failed.'));
+        }
+      }
+      setAmountUsdc(0);
+      try {
+        await refreshUsdcPoolState(true);
+        setStatusMessage('USDC flow complete. Pool refreshed.');
+        if (!isDevAppEnv) setTimeout(() => setStatusMessage(''), 2500);
+      } catch {
+        setStatusMessage('USDC flow complete. Click Refresh to update pool.');
+      }
+    } catch (e: any) {
+      setStatusMessage(e?.message || `USDC ${action} failed.`);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -755,7 +1282,8 @@ const DashboardPage: NextPageWithLayout = () => {
       setLoading(true);
       setStatusMessage('Accruing interest...');
 
-      const tx = await lendingAccrueInterest(executeTransaction, deltaIndex);
+      const currentBlock = await getLatestBlockHeight();
+      const tx = await lendingAccrueInterest(executeTransaction, currentBlock);
       
       setTxId(tx);
       setTxFinalized(false);
@@ -806,8 +1334,6 @@ const DashboardPage: NextPageWithLayout = () => {
 
       if (finalized) {
         setTxFinalized(true);
-        // Clear amount input after successful interest accrual
-        setDeltaIndex(0);
         // Refresh pool + user data once interest accrual is finalized
         try {
           console.log('📋 Interest accrual finalized - refreshing pool and user position...');
@@ -842,6 +1368,59 @@ const DashboardPage: NextPageWithLayout = () => {
       } else {
         setStatusMessage(e?.message || 'Failed to accrue interest. Check console for details.');
       }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAccrueInterestUsdc = async () => {
+    if (!connected || !executeTransaction) {
+      setStatusMessage('Please connect your wallet first.');
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setStatusMessage('Accruing USDC interest...');
+
+      const currentBlock = await getLatestBlockHeight();
+      const tx = await lendingAccrueInterestUsdc(executeTransaction, currentBlock);
+
+      setTxId(tx);
+      setTxFinalized(false);
+      setStatusMessage(`USDC interest accrual submitted: ${tx.substring(0, 20)}... Waiting for finalization...`);
+
+      let finalized = false;
+      const maxAttempts = 30;
+      const delayMs = 2000;
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (transactionStatus) {
+          try {
+            const statusResult = await transactionStatus(tx);
+            const statusText =
+              typeof statusResult === 'string'
+                ? statusResult
+                : (statusResult as any)?.status ?? '';
+            const statusLower = (statusText || '').toLowerCase();
+            if (statusLower === 'finalized' || statusLower === 'accepted') {
+              finalized = true;
+              break;
+            }
+          } catch {
+            // continue polling
+          }
+        }
+      }
+
+      if (!finalized) {
+        setStatusMessage('USDC interest accrual submitted but not finalized in time. Please check the explorer.');
+      } else {
+        setStatusMessage('USDC interest accrued successfully.');
+      }
+    } catch (e: any) {
+      setStatusMessage(e?.message || 'USDC accrue interest failed.');
     } finally {
       setLoading(false);
     }
@@ -909,12 +1488,12 @@ const DashboardPage: NextPageWithLayout = () => {
                 <p className="text-xs opacity-70">
                   Aleo pool program:{' '}
                   <a
-                    href="https://testnet.explorer.provable.com/program/lending_pool_v8.aleo"
+                    href="https://testnet.explorer.provable.com/program/lending_pool_v86.aleo"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="font-mono text-[11px] text-base-content underline decoration-dotted underline-offset-2 hover:decoration-solid"
                   >
-                    lending_pool_v8.aleo
+                    lending_pool_v86.aleo
                   </a>
                 </p>
               </div>
@@ -956,7 +1535,9 @@ const DashboardPage: NextPageWithLayout = () => {
                     </svg>
                   </div>
                 </div>
-                <p className="text-lg font-semibold">{totalSupplied ?? '0'}</p>
+                <p className="text-lg font-semibold">
+                  {((Number(totalSupplied) || 0) / 1_000_000).toFixed(2)}
+                </p>
               </div>
               <div className="p-3 rounded-lg bg-base-300">
                 <div className="flex items-center gap-1">
@@ -967,7 +1548,9 @@ const DashboardPage: NextPageWithLayout = () => {
                     </svg>
                   </div>
                 </div>
-                <p className="text-lg font-semibold">{totalBorrowed ?? '0'}</p>
+                <p className="text-lg font-semibold">
+                  {((Number(totalBorrowed) || 0) / 1_000_000).toFixed(2)}
+                </p>
               </div>
               <div className="p-3 rounded-lg bg-base-300">
                 <div className="flex items-center gap-1">
@@ -979,7 +1562,12 @@ const DashboardPage: NextPageWithLayout = () => {
                   </div>
                 </div>
                 <p className="text-lg font-semibold">
-                  {Math.max(0, (Number(totalSupplied) || 0) - (Number(totalBorrowed) || 0))}
+                  {(
+                    Math.max(
+                      0,
+                      (Number(totalSupplied) || 0) - (Number(totalBorrowed) || 0),
+                    ) / 1_000_000
+                  ).toFixed(2)}
                 </p>
               </div>
               <div className="p-3 rounded-lg bg-base-300">
@@ -991,33 +1579,71 @@ const DashboardPage: NextPageWithLayout = () => {
                     </svg>
                   </div>
                 </div>
-                <p className="text-lg font-semibold">{formatScaled(utilizationIndex, 4)}%</p>
+                <p className="text-lg font-semibold">
+                  {totalSupplied && Number(totalSupplied) > 0
+                    ? ((Number(totalBorrowed) / Number(totalSupplied)) * 100).toFixed(2)
+                    : formatScaled(utilizationIndex, 4)}%
+                </p>
                 {isDevAppEnv && (
                   <p className="text-[10px] opacity-60 mt-1">raw: {utilizationIndex ?? '0'}</p>
                 )}
               </div>
               <div className="p-3 rounded-lg bg-base-300">
                 <div className="flex items-center gap-1">
-                  <p className="opacity-70 text-xs">Interest Index</p>
-                  <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip="Cumulative interest rate index tracking interest accrual over time (scaled by 1,000,000)">
+                  <p className="opacity-70 text-xs">Liquidity Index</p>
+                  <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip="Starts at 1.0 when the pool has no interest yet. It grows over time as the pool earns interest — the higher it is, the more you can withdraw from your deposits.">
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
                       <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
                     </svg>
                   </div>
                 </div>
-                <p className="text-lg font-semibold">{formatScaled(interestIndex, 6)}</p>
+                <p className="text-lg font-semibold">
+                  {liquidityIndex != null && Number(liquidityIndex) > 0
+                    ? (Number(liquidityIndex) / 1_000_000_000_000).toFixed(6)
+                    : interestIndex != null && Number(interestIndex) > 0
+                      ? formatScaled(interestIndex, 6)
+                      : '1.000000'}
+                </p>
                 {isDevAppEnv && (
-                  <p className="text-[10px] opacity-60 mt-1">raw: {interestIndex ?? '0'}</p>
+                  <p className="text-[10px] opacity-60 mt-1">raw: {liquidityIndex ?? interestIndex ?? '0'}</p>
                 )}
+              </div>
+              <div className="p-3 rounded-lg bg-base-300">
+                <div className="flex items-center gap-1">
+                  <p className="opacity-70 text-xs">Supply APY</p>
+                  <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip="Current supply APY from utilization and rate model (v85)">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
+                    </svg>
+                  </div>
+                </div>
+                <p className="text-lg font-semibold text-success">{(supplyAPY * 100).toFixed(2)}%</p>
+              </div>
+              <div className="p-3 rounded-lg bg-base-300">
+                <div className="flex items-center gap-1">
+                  <p className="opacity-70 text-xs">Borrow APY</p>
+                  <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip="Current borrow APY from utilization and rate model (v85)">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
+                    </svg>
+                  </div>
+                </div>
+                <p className="text-lg font-semibold text-warning">{(borrowAPY * 100).toFixed(2)}%</p>
               </div>
             </div>
             </div>
-            {/* In production, embed Actions + Your Position inside this Aleo Pool card */}
+            {/* In production, embed Actions + Your Position + Interest Management inside this Aleo Pool card */}
             {!isDevAppEnv && connected && (
-              <div className="mt-6 grid gap-6 md:grid-cols-2">
+              <div className="mt-6 space-y-6">
+                <div className="grid gap-6 md:grid-cols-2">
                 {/* Inline Lending Actions */}
                 <div className="space-y-3">
                   <h3 className="font-semibold text-sm">Lending/Borrowing Actions</h3>
+                  <p className="text-xs opacity-70">
+                    <span className="inline-block tooltip tooltip-right before:max-w-xs before:whitespace-normal" data-tip="Deposit and Repay use private credits.aleo records. Shown after you connect and refresh.">
+                      Private Aleo balance: <strong>{privateAleoBalance != null ? `${(Math.floor(Number(privateAleoBalance) * 100) / 100).toFixed(2)} credits` : '—'}</strong>
+                    </span>
+                  </p>
                   <label className="form-control w-full">
                     <span className="label-text">Amount</span>
                     <input
@@ -1111,24 +1737,58 @@ const DashboardPage: NextPageWithLayout = () => {
                     <div className="p-3 rounded-lg bg-base-300">
                       <div className="flex items-center gap-1">
                         <p className="opacity-70 text-xs">Net Supplied</p>
-                        <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip={`Your current net supplied Aleo tokens (Total Deposits - Total Withdrawals = ${totalDeposits} - ${totalWithdrawals}). This is the amount you can withdraw, subject to pool liquidity.`}>
+                        <div
+                          className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal"
+                          data-tip={
+                            effectiveUserSupplied != null
+                              ? `Effective supply balance (with interest): ${formatAleoAmount(
+                                  effectiveUserSupplied,
+                                )} ALEO. You can withdraw up to this amount (subject to pool liquidity).`
+                              : `Your net supplied (Total Deposits - Total Withdrawals = ${
+                                  numericTotalDeposits / 1_000_000
+                                } - ${
+                                  numericTotalWithdrawals / 1_000_000
+                                }). You can withdraw up to this amount, subject to pool liquidity.`
+                          }
+                        >
                           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
                             <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
                           </svg>
                         </div>
                       </div>
-                      <p className="text-lg font-semibold text-success">{userSupplied}</p>
+                      <p className="text-lg font-semibold text-success">
+                        {effectiveUserSupplied != null
+                          ? formatAleoAmount(effectiveUserSupplied)
+                          : formatAleoAmount(userSupplied)}
+                      </p>
                     </div>
                     <div className="p-3 rounded-lg bg-base-300">
                       <div className="flex items-center gap-1">
                         <p className="opacity-70 text-xs">Net Borrowed</p>
-                        <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip={`Your current net borrowed Aleo tokens (Total Borrows - Total Repayments = ${totalBorrows} - ${totalRepayments}). This is the amount you need to repay to fully clear your debt.`}>
+                        <div
+                          className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal"
+                          data-tip={
+                            effectiveUserBorrowed != null
+                              ? `Effective borrow debt (with interest): ${formatAleoAmount(
+                                  effectiveUserBorrowed,
+                                )} ALEO. This is what you owe.`
+                              : `Your net borrowed (Total Borrows - Total Repayments = ${
+                                  numericTotalBorrows / 1_000_000
+                                } - ${
+                                  numericTotalRepayments / 1_000_000
+                                }). This is the amount you need to repay.`
+                          }
+                        >
                           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
                             <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
                           </svg>
                         </div>
                       </div>
-                      <p className="text-lg font-semibold text-error">{userBorrowed}</p>
+                      <p className="text-lg font-semibold text-error">
+                        {effectiveUserBorrowed != null
+                          ? formatAleoAmount(effectiveUserBorrowed)
+                          : formatAleoAmount(userBorrowed)}
+                      </p>
                     </div>
                     <div className="p-3 rounded-lg bg-base-300">
                       <div className="flex items-center gap-1">
@@ -1139,7 +1799,9 @@ const DashboardPage: NextPageWithLayout = () => {
                           </svg>
                         </div>
                       </div>
-                      <p className="text-lg font-semibold">{totalDeposits}</p>
+                      <p className="text-lg font-semibold">
+                        {formatAleoAmount(totalDeposits)}
+                      </p>
                     </div>
                     <div className="p-3 rounded-lg bg-base-300">
                       <div className="flex items-center gap-1">
@@ -1150,29 +1812,321 @@ const DashboardPage: NextPageWithLayout = () => {
                           </svg>
                         </div>
                       </div>
-                      <p className="text-lg font-semibold">{totalBorrows}</p>
+                      <p className="text-lg font-semibold">
+                        {formatAleoAmount(totalBorrows)}
+                      </p>
                     </div>
                   </div>
-                  {/* How much user can withdraw / needs to repay */}
-                  {Number(userSupplied) > 0 && (
+
+                  {/* Interest breakdown (Aleo) */}
+                  <div className="mt-2 grid grid-cols-2 gap-3 text-xs">
+                    <div className="p-2 rounded-lg bg-base-300/60">
+                      <p className="opacity-70">Interest earned (Aleo)</p>
+                      <p className="font-semibold text-success">
+                        {formatAleoAmount(interestEarnedAleo, 6)}
+                      </p>
+                    </div>
+                    <div className="p-2 rounded-lg bg-base-300/60">
+                      <p className="opacity-70">Interest owed (Aleo)</p>
+                      <p className="font-semibold text-error">
+                        {formatAleoAmount(interestOwedAleo, 6)}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* How much user can withdraw / needs to repay (use effective balance when available, in ALEO) */}
+                  {(effectiveUserSupplied ?? (Number(userSupplied) || 0)) > 0 && (
                     <p className="text-xs opacity-80">
-                      You can withdraw up to <strong>{userSupplied}</strong> from this pool (subject
-                      to available liquidity).
+                      You can withdraw up to{' '}
+                      <strong>
+                        {formatAleoAmount(
+                          Math.min(
+                            effectiveUserSupplied ?? (Number(userSupplied) || 0),
+                            Math.max(
+                              0,
+                              (Number(totalSupplied) || 0) - (Number(totalBorrowed) || 0),
+                            ),
+                          ),
+                        )}{' '}
+                        ALEO
+                      </strong>{' '}
+                      from this pool (limited by your position and available liquidity).
                     </p>
                   )}
-                  {Number(userBorrowed) > 0 && (
+                  {(effectiveUserBorrowed ?? (Number(userBorrowed) || 0)) > 0 && (
                     <p className="text-xs opacity-80">
-                      You need to repay <strong>{userBorrowed}</strong> to fully clear your debt.
+                      You need to repay{' '}
+                      <strong>
+                        {formatAleoAmount(
+                          effectiveUserBorrowed != null ? effectiveUserBorrowed : userBorrowed,
+                        )}{' '}
+                        ALEO
+                      </strong>{' '}
+                      to fully clear your debt.
                     </p>
                   )}
-                  {Number(userSupplied) === 0 &&
-                    Number(userBorrowed) === 0 &&
+                  {(effectiveUserSupplied ?? (Number(userSupplied) || 0)) === 0 &&
+                    (effectiveUserBorrowed ?? (Number(userBorrowed) || 0)) === 0 &&
                     Number(totalDeposits) === 0 && (
                       <p className="text-xs opacity-70">
                         No activity yet. Make a deposit or borrow to open a position.
                       </p>
                     )}
                 </div>
+                </div>
+
+                {/* Interest Management — sync pool indices to current block (optional) */}
+                <div className="space-y-3">
+                  <h3 className="font-semibold text-sm">Interest Management</h3>
+                  <p className="text-xs opacity-70">
+                    Sync pool indices to the current block. Optional — they also update when anyone deposits, borrows, repays, or withdraws.
+                  </p>
+                  <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Update liquidity and borrow indices to the current block. Optional — they also update on every deposit, borrow, repay, and withdraw.">
+                    <button
+                      type="button"
+                      onClick={handleAccrueInterest}
+                      disabled={loading || !connected}
+                      className="btn btn-outline border-2 min-h-10"
+                      title="Sync pool interest indices to the current block."
+                    >
+                      {loading ? 'Processing...' : 'Accrue Interest'}
+                    </button>
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* USDC Pool (lending_pool_usdce_v86.aleo) — v86 interest/APY; deposit/repay with USDCx; withdraw/borrow state-only */}
+          <div className="rounded-xl bg-base-200 p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-xl font-semibold">USDC Pool</h2>
+                <p className="text-xs opacity-70">
+                  USDC pool program:{' '}
+                  <a
+                    href="https://testnet.explorer.provable.com/program/lending_pool_usdce_v86.aleo"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-mono text-[11px] text-base-content underline decoration-dotted underline-offset-2 hover:decoration-solid"
+                  >
+                    lending_pool_usdce_v86.aleo
+                  </a>
+                </p>
+              </div>
+              <button
+                onClick={() => refreshUsdcPoolState(true)}
+                className="btn btn-sm btn-outline"
+                disabled={loading || isRefreshingUsdcState}
+              >
+                {isRefreshingUsdcState ? (
+                  <>
+                    <span className="loading loading-spinner loading-xs mr-1" />
+                    Refreshing
+                  </>
+                ) : (
+                  'Refresh'
+                )}
+              </button>
+            </div>
+
+            <div className="rounded-lg border border-info/30 bg-info/5 p-3 text-sm">
+              <p className="font-medium text-info mb-1">Deposit / Repay use private USDCx</p>
+              <p className="opacity-90 text-xs">
+                This pool uses <code className="text-[11px]">test_usdcx_stablecoin.aleo/transfer_private</code> (token record + proofs). You need a <strong>private</strong> USDCx Token record. If you received USDC via a <strong>public</strong> transfer (e.g.{' '}
+                <a href="https://testnet.explorer.provable.com/transaction/at103unknystlnafaudl4hvuu54am0a3mjdj42tl9450s9jlwqrwcpquqjeel" target="_blank" rel="noopener noreferrer" className="underline">transfer_public</a>), convert it to private first (e.g. <code className="text-[11px]">transfer_public_to_private</code> in your wallet) so you have a Token record to deposit.
+              </p>
+            </div>
+
+            <div className="rounded-lg border-l-4 border-info/50 pl-3 py-1">
+              <div className="flex flex-wrap items-center gap-2 mb-2">
+                <span className="badge badge-sm badge-info gap-1">Public</span>
+                <span className="text-xs opacity-70">Pool Overview — USDC supplied/borrowed.</span>
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-6 gap-4 text-sm">
+                <div className="p-3 rounded-lg bg-base-300">
+                  <p className="opacity-70 text-xs">Total USDC Supplied</p>
+                  <p className="text-lg font-semibold">{((Number(totalSuppliedUsdc) || 0) / 1_000_000).toFixed(2)}</p>
+                </div>
+                <div className="p-3 rounded-lg bg-base-300">
+                  <p className="opacity-70 text-xs">Total USDC Borrowed</p>
+                  <p className="text-lg font-semibold">{((Number(totalBorrowedUsdc) || 0) / 1_000_000).toFixed(2)}</p>
+                </div>
+                <div className="p-3 rounded-lg bg-base-300">
+                  <p className="opacity-70 text-xs">Available Liquidity</p>
+                  <p className="text-lg font-semibold">
+                    {(Math.max(0, (Number(totalSuppliedUsdc) || 0) - (Number(totalBorrowedUsdc) || 0)) / 1_000_000).toFixed(2)}
+                  </p>
+                </div>
+                <div className="p-3 rounded-lg bg-base-300">
+                  <p className="opacity-70 text-xs">Utilization</p>
+                  <p className="text-lg font-semibold">{formatScaled(utilizationIndexUsdc, 4)}%</p>
+                </div>
+                <div className="p-3 rounded-lg bg-base-300">
+                  <p className="opacity-70 text-xs">Liquidity Index</p>
+                  <p className="text-lg font-semibold">
+                    {liquidityIndexUsdc != null && Number(liquidityIndexUsdc) > 0
+                      ? (Number(liquidityIndexUsdc) / 1_000_000_000_000).toFixed(6)
+                      : '1.000000'}
+                  </p>
+                </div>
+                <div className="p-3 rounded-lg bg-base-300">
+                  <p className="opacity-70 text-xs">Supply APY</p>
+                  <p className="text-lg font-semibold text-success">{(supplyAPYUsdc * 100).toFixed(2)}%</p>
+                </div>
+                <div className="p-3 rounded-lg bg-base-300">
+                  <p className="opacity-70 text-xs">Borrow APY</p>
+                  <p className="text-lg font-semibold text-error">{(borrowAPYUsdc * 100).toFixed(2)}%</p>
+                </div>
+              </div>
+            </div>
+
+            {connected && (
+              <div className="mt-6 grid gap-6 md:grid-cols-2">
+                <div className="space-y-3">
+                  <h3 className="font-semibold text-sm">USDC Lending/Borrowing</h3>
+                  <p className="text-xs opacity-70">
+                    Private USDC balance: <strong>{privateUsdcBalance != null ? `${(Math.floor(Number(privateUsdcBalance) * 100) / 100).toFixed(2)} USDC` : '—'}</strong>
+                  </p>
+                  <label className="form-control w-full">
+                    <span className="label-text">Amount (USDC)</span>
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      placeholder="0"
+                      className={`input input-bordered w-full [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none ${amountErrorUsdc ? 'input-error' : ''}`}
+                      value={amountUsdc === 0 ? '' : amountUsdc}
+                      onChange={(e) => {
+                        setAmountErrorUsdc(null);
+                        const raw = e.target.value;
+                        if (raw === '' || raw === undefined) {
+                          setAmountUsdc(0);
+                          return;
+                        }
+                        const n = Number(raw);
+                        if (!Number.isNaN(n) && n >= 0) setAmountUsdc(n);
+                      }}
+                      onKeyDown={(e) => {
+                        if (['e', 'E', '+', '-'].includes(e.key)) e.preventDefault();
+                      }}
+                      disabled={loading || !connected}
+                      min={0}
+                    />
+                    {amountErrorUsdc && (
+                      <p className="mt-1 text-xs text-error">{amountErrorUsdc}</p>
+                    )}
+                  </label>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleActionUsdc('deposit')}
+                      disabled={loading || !connected || amountUsdc <= 0}
+                      className="btn btn-outline border-2 min-h-10"
+                      title="Deposit USDC into the pool."
+                    >
+                      {loading ? 'Processing...' : 'Deposit'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleActionUsdc('borrow')}
+                      disabled={loading || !connected || amountUsdc <= 0}
+                      className="btn btn-outline border-2 min-h-10"
+                      title="Borrow USDC from the pool."
+                    >
+                      Borrow
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleActionUsdc('repay')}
+                      disabled={loading || !connected || amountUsdc <= 0}
+                      className="btn btn-outline border-2 min-h-10"
+                      title="Repay borrowed USDC."
+                    >
+                      Repay
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleActionUsdc('withdraw')}
+                      disabled={loading || !connected || amountUsdc <= 0}
+                      className="btn btn-outline border-2 min-h-10"
+                      title="Withdraw your supplied USDC."
+                    >
+                      Withdraw
+                    </button>
+                  </div>
+                </div>
+                <div className="space-y-3 rounded-lg border-l-4 border-warning/50 pl-3 py-2">
+                  <h3 className="font-semibold text-sm">Your USDC Position</h3>
+                  <p className="text-xs opacity-70">From lending_pool_usdce_v86.aleo (effective = scaled × index).</p>
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div className="p-3 rounded-lg bg-base-300">
+                      <p className="opacity-70 text-xs">Effective Supplied</p>
+                      <p className="text-lg font-semibold text-success">
+                        {effectiveUserSuppliedUsdc != null
+                          ? (effectiveUserSuppliedUsdc / 1_000_000).toFixed(2)
+                          : (Number(userSuppliedUsdc) / 1_000_000).toFixed(2)}
+                      </p>
+                    </div>
+                    <div className="p-3 rounded-lg bg-base-300">
+                      <p className="opacity-70 text-xs">Effective Borrowed</p>
+                      <p className="text-lg font-semibold text-error">
+                        {effectiveUserBorrowedUsdc != null
+                          ? (effectiveUserBorrowedUsdc / 1_000_000).toFixed(2)
+                          : (Number(userBorrowedUsdc) / 1_000_000).toFixed(2)}
+                      </p>
+                    </div>
+                    <div className="p-3 rounded-lg bg-base-300">
+                      <p className="opacity-70 text-xs">Total Deposits</p>
+                      <p className="text-lg font-semibold">{(Number(totalDepositsUsdc) / 1_000_000).toFixed(2)}</p>
+                    </div>
+                    <div className="p-3 rounded-lg bg-base-300">
+                      <p className="opacity-70 text-xs">Total Borrows</p>
+                      <p className="text-lg font-semibold">{(Number(totalBorrowsUsdc) / 1_000_000).toFixed(2)}</p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div className="p-3 rounded-lg bg-base-300">
+                      <p className="opacity-70 text-xs">Interest Earned</p>
+                      <p className="text-lg font-semibold text-success">
+                        {interestEarnedUsdc.toFixed(6)} USDC
+                      </p>
+                    </div>
+                    <div className="p-3 rounded-lg bg-base-300">
+                      <p className="opacity-70 text-xs">Interest Owed</p>
+                      <p className="text-lg font-semibold text-error">
+                        {interestOwedUsdc.toFixed(6)} USDC
+                      </p>
+                    </div>
+                  </div>
+                  {(effectiveUserSuppliedUsdc ?? Number(userSuppliedUsdc)) > 0 && (
+                    <p className="text-xs opacity-80">
+                      You can withdraw up to <strong>{((effectiveUserSuppliedUsdc ?? Number(userSuppliedUsdc)) / 1_000_000).toFixed(2)}</strong> USDC.
+                    </p>
+                  )}
+                  {(effectiveUserBorrowedUsdc ?? Number(userBorrowedUsdc)) > 0 && (
+                    <p className="text-xs opacity-80">
+                      Repay <strong>{((effectiveUserBorrowedUsdc ?? Number(userBorrowedUsdc)) / 1_000_000).toFixed(2)}</strong> USDC to clear debt.
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {connected && (
+              <div className="mt-4 space-y-3">
+                <h3 className="font-semibold text-sm">USDC Interest Management</h3>
+                <p className="text-xs opacity-70">
+                  Sync USDC pool indices (liquidity and borrow) to the current block. Optional — they also update when anyone deposits, borrows, repays, or withdraws.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleAccrueInterestUsdc}
+                  disabled={loading || !connected}
+                  className="btn btn-outline border-2 min-h-10"
+                  title="Sync USDC pool interest indices to the current block."
+                >
+                  {loading ? 'Processing...' : 'Accrue Interest (USDC)'}
+                </button>
               </div>
             )}
           </div>
@@ -1191,6 +2145,9 @@ const DashboardPage: NextPageWithLayout = () => {
                 {/* Lending Actions */}
                 <div className="space-y-3">
                   <h3 className="font-semibold text-sm">Lending/Borrowing Actions</h3>
+                  <p className="text-xs opacity-70">
+                    Private Aleo balance: <strong>{privateAleoBalance != null ? `${(Math.floor(Number(privateAleoBalance) * 100) / 100).toFixed(2)} credits` : '—'}</strong>
+                  </p>
                   <label className="form-control w-full">
                     <span className="label-text">Amount</span>
                     <input
@@ -1268,28 +2225,23 @@ const DashboardPage: NextPageWithLayout = () => {
                   </div>
                 </div>
 
-                {/* Interest Management */}
+                {/* Interest Management (v85: optional — indices also update on deposit/borrow/repay/withdraw) */}
                 <div className="space-y-3">
                   <h3 className="font-semibold text-sm">Interest Management</h3>
-                  <label className="form-control w-full">
-                    <span className="label-text">Delta Index</span>
-                    <input
-                      type="number"
-                      className="input input-bordered w-full"
-                      value={deltaIndex}
-                      onChange={(e) => setDeltaIndex(Number(e.target.value || 0))}
+                  <p className="text-xs opacity-70">
+                    Sync pool indices to the current block. Optional — they also update when anyone deposits, borrows, repays, or withdraws.
+                  </p>
+                  <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Update liquidity and borrow indices to the current block. Optional — they also update on every deposit, borrow, repay, and withdraw.">
+                    <button
+                      type="button"
+                      onClick={handleAccrueInterest}
                       disabled={loading || !connected}
-                      min="0"
-                    />
-                  </label>
-
-                  <Button
-                    onClick={handleAccrueInterest}
-                    disabled={loading || !connected}
-                    variant="ghost"
-                  >
-                    {loading ? 'Processing...' : 'Accrue Interest'}
-                  </Button>
+                      className="btn btn-outline border-2 min-h-10"
+                      title="Sync pool interest indices to the current block."
+                    >
+                      {loading ? 'Processing...' : 'Accrue Interest'}
+                    </button>
+                  </span>
                 </div>
               </div>
             </div>
@@ -1455,6 +2407,46 @@ const DashboardPage: NextPageWithLayout = () => {
                   Waiting for transaction to finalize... The explorer link will appear once confirmed.
                 </p>
               )}
+            </div>
+          )}
+
+          {vaultWithdrawTxId && (
+            <div className="rounded-xl bg-base-200 p-4 max-w-xl border-l-4 border-success">
+              <h3 className="font-semibold mb-2">Vault transfer (credits to your wallet)</h3>
+              <p className="text-xs opacity-80 mb-2">
+                Backend sent ALEO from the pool vault to your wallet. Transaction:
+              </p>
+              <pre className="text-xs whitespace-pre-wrap break-all bg-base-300 p-2 rounded mb-2">
+                {vaultWithdrawTxId}
+              </pre>
+              <a
+                href={getProvableExplorerTxUrl(vaultWithdrawTxId)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="link link-primary text-sm inline-block"
+              >
+                View on Provable Explorer →
+              </a>
+            </div>
+          )}
+
+          {vaultBorrowTxId && (
+            <div className="rounded-xl bg-base-200 p-4 max-w-xl border-l-4 border-info">
+              <h3 className="font-semibold mb-2">Vault borrow (credits to your wallet)</h3>
+              <p className="text-xs opacity-80 mb-2">
+                Backend sent borrowed ALEO from the pool vault to your wallet. Transaction:
+              </p>
+              <pre className="text-xs whitespace-pre-wrap break-all bg-base-300 p-2 rounded mb-2">
+                {vaultBorrowTxId}
+              </pre>
+              <a
+                href={getProvableExplorerTxUrl(vaultBorrowTxId)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="link link-primary text-sm inline-block"
+              >
+                View on Provable Explorer →
+              </a>
             </div>
           )}
         </>
