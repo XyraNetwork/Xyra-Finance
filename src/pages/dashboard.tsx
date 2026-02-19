@@ -143,6 +143,7 @@ const DashboardPage: NextPageWithLayout = () => {
   const [totalRepaymentsUsdc, setTotalRepaymentsUsdc] = useState<string>('0');
   const [isRefreshingUsdcState, setIsRefreshingUsdcState] = useState<boolean>(false);
   const [amountUsdc, setAmountUsdc] = useState<number>(0);
+  const [modalAmountInput, setModalAmountInput] = useState<string>('');
   const [amountErrorUsdc, setAmountErrorUsdc] = useState<string | null>(null);
   const [privateUsdcBalance, setPrivateUsdcBalance] = useState<number | null>(null);
 
@@ -413,8 +414,11 @@ const DashboardPage: NextPageWithLayout = () => {
     setVaultWithdrawTxId(null);
     setVaultBorrowTxId(null);
     if (prefilledAmount != null) {
+      setModalAmountInput(String(prefilledAmount));
       if (asset === 'usdc') setAmountUsdc(prefilledAmount);
       else setAmount(prefilledAmount);
+    } else {
+      setModalAmountInput('');
     }
     setActionModalOpen(true);
   };
@@ -1689,6 +1693,22 @@ const DashboardPage: NextPageWithLayout = () => {
   const totalSupplyBalance = supplyBalanceAleo + supplyBalanceUsdc; // mixed units for count only
   const totalBorrowDebt = borrowDebtAleo + borrowDebtUsdc;
 
+  // Simple loading flags for balances
+  const walletBalancesLoading = connected && !userPositionInitialized;
+  const availableAleo = Math.max(
+    0,
+    ((Number(totalSupplied) || 0) - (Number(totalBorrowed) || 0)) / 1_000_000,
+  );
+  const availableUsdc = Math.max(
+    0,
+    ((Number(totalSuppliedUsdc) || 0) - (Number(totalBorrowedUsdc) || 0)) / 1_000_000,
+  );
+
+  const modalAmount = (() => {
+    const n = Number(modalAmountInput);
+    return Number.isNaN(n) ? 0 : n;
+  })();
+
   const actionModalTitle =
     actionModalMode === 'withdraw'
       ? `Withdraw ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}`
@@ -1698,11 +1718,19 @@ const DashboardPage: NextPageWithLayout = () => {
           ? `Borrow ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}`
           : `Repay ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}`;
 
-  const modalAmount = actionModalAsset === 'usdc' ? amountUsdc : amount;
-  const setModalAmount = actionModalAsset === 'usdc' ? setAmountUsdc : setAmount;
   const supplyBalanceModal = actionModalAsset === 'aleo' ? supplyBalanceAleo : supplyBalanceUsdc;
   const debtBalanceModal = actionModalAsset === 'aleo' ? borrowDebtAleo : borrowDebtUsdc;
   const privateBalanceModal = actionModalAsset === 'aleo' ? (privateAleoBalance ?? 0) : (privateUsdcBalance ?? 0);
+  // Max amount constraints per action type (used to disable action button)
+  const modalMaxAmount =
+    actionModalMode === 'deposit'
+      ? privateBalanceModal
+      : actionModalMode === 'withdraw'
+        ? supplyBalanceModal
+        : actionModalMode === 'borrow'
+          ? (actionModalAsset === 'aleo' ? availableAleo : availableUsdc)
+          : debtBalanceModal;
+
   const remainingSupply = actionModalMode === 'withdraw'
     ? Math.max(0, supplyBalanceModal - modalAmount)
     : actionModalMode === 'deposit'
@@ -1749,9 +1777,20 @@ const DashboardPage: NextPageWithLayout = () => {
                       <input
                         type="number"
                         min={0}
-                        step={actionModalAsset === 'usdc' ? 0.000001 : 0.01}
-                        value={modalAmount || ''}
-                        onChange={(e) => setModalAmount(Number(e.target.value) || 0)}
+                        step="any"
+                        value={modalAmountInput}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setModalAmountInput(val);
+                          const n = Number(val);
+                          if (!Number.isNaN(n)) {
+                            if (actionModalAsset === 'usdc') {
+                              setAmountUsdc(n);
+                            } else {
+                              setAmount(n);
+                            }
+                          }
+                        }}
                         placeholder="0.00"
                         className="input input-bordered flex-1 bg-transparent border-0 focus:outline-none"
                       />
@@ -1769,7 +1808,20 @@ const DashboardPage: NextPageWithLayout = () => {
                         <button
                           type="button"
                           className="link link-primary text-xs"
-                          onClick={() => setModalAmount(actionModalMode === 'withdraw' || actionModalMode === 'repay' ? (actionModalMode === 'withdraw' ? supplyBalanceModal : debtBalanceModal) : privateBalanceModal)}
+                          onClick={() => {
+                            const maxVal =
+                              actionModalMode === 'withdraw' || actionModalMode === 'repay'
+                                ? actionModalMode === 'withdraw'
+                                  ? supplyBalanceModal
+                                  : debtBalanceModal
+                                : privateBalanceModal;
+                            setModalAmountInput(String(maxVal));
+                            if (actionModalAsset === 'usdc') {
+                              setAmountUsdc(maxVal);
+                            } else {
+                              setAmount(maxVal);
+                            }
+                          }}
                         >
                           MAX
                         </button>
@@ -1789,7 +1841,12 @@ const DashboardPage: NextPageWithLayout = () => {
                   <button
                     type="button"
                     className="btn btn-primary w-full"
-                    disabled={loading || !modalAmount || modalAmount <= 0}
+                    disabled={
+                      loading ||
+                      !modalAmount ||
+                      modalAmount <= 0 ||
+                      modalAmount > modalMaxAmount
+                    }
                     onClick={async () => {
                       setActionModalSubmitted(true);
                       if (actionModalAsset === 'usdc') {
@@ -1800,7 +1857,11 @@ const DashboardPage: NextPageWithLayout = () => {
                     }}
                   >
                     {loading ? <span className="loading loading-spinner loading-sm" /> : null}
-                    {!modalAmount || modalAmount <= 0 ? 'Enter an amount' : actionModalTitle}
+                    {!modalAmount || modalAmount <= 0
+                      ? 'Enter an amount'
+                      : modalAmount > modalMaxAmount
+                        ? 'Amount too high'
+                        : actionModalTitle}
                   </button>
                 </>
               ) : (
@@ -1928,18 +1989,66 @@ const DashboardPage: NextPageWithLayout = () => {
                     <tbody>
                       <tr>
                         <td><span className="font-medium">ALEO</span></td>
-                        <td className="text-base-content/90">{privateAleoBalance != null ? privateAleoBalance.toFixed(4) : '—'}</td>
-                        <td className="text-base-content">{(supplyAPY * 100).toFixed(2)}%</td>
+                        <td className="text-base-content/90">
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : privateAleoBalance != null ? (
+                            privateAleoBalance.toFixed(4)
+                          ) : (
+                            '—'
+                          )}
+                        </td>
+                        <td className="text-base-content">
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            (supplyAPY * 100).toFixed(2) + '%'
+                          )}
+                        </td>
                         <td>
-                          <PrivateActionButton onClick={() => openActionModal('deposit', 'aleo')} disabled={loading || !connected}>Supply</PrivateActionButton>
+                          <PrivateActionButton
+                            onClick={() => openActionModal('deposit', 'aleo')}
+                            disabled={
+                              loading ||
+                              !connected ||
+                              walletBalancesLoading ||
+                              (privateAleoBalance ?? 0) <= 0
+                            }
+                          >
+                            Supply
+                          </PrivateActionButton>
                         </td>
                       </tr>
                       <tr>
                         <td><span className="font-medium">USDC</span></td>
-                        <td className="text-base-content/90">{privateUsdcBalance != null ? privateUsdcBalance.toFixed(4) : '—'}</td>
-                        <td className="text-base-content">{(supplyAPYUsdc * 100).toFixed(2)}%</td>
+                        <td className="text-base-content/90">
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : privateUsdcBalance != null ? (
+                            privateUsdcBalance.toFixed(4)
+                          ) : (
+                            '—'
+                          )}
+                        </td>
+                        <td className="text-base-content">
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            (supplyAPYUsdc * 100).toFixed(2) + '%'
+                          )}
+                        </td>
                         <td>
-                          <PrivateActionButton onClick={() => openActionModal('deposit', 'usdc')} disabled={loading || !connected}>Supply</PrivateActionButton>
+                          <PrivateActionButton
+                            onClick={() => openActionModal('deposit', 'usdc')}
+                            disabled={
+                              loading ||
+                              !connected ||
+                              walletBalancesLoading ||
+                              (privateUsdcBalance ?? 0) <= 0
+                            }
+                          >
+                            Supply
+                          </PrivateActionButton>
                         </td>
                       </tr>
                     </tbody>
@@ -1970,18 +2079,52 @@ const DashboardPage: NextPageWithLayout = () => {
                     <tbody>
                       <tr>
                         <td><span className="font-medium">ALEO</span></td>
-                        <td className="text-base-content/90">{Math.max(0, ((Number(totalSupplied) || 0) - (Number(totalBorrowed) || 0)) / 1_000_000).toFixed(4)}</td>
-                        <td className="text-base-content">{(borrowAPY * 100).toFixed(2)}%</td>
+                        <td className="text-base-content/90">
+                          {isRefreshingState ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            availableAleo.toFixed(4)
+                          )}
+                        </td>
+                        <td className="text-base-content">
+                          {isRefreshingState ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            (borrowAPY * 100).toFixed(2) + '%'
+                          )}
+                        </td>
                         <td>
-                          <PrivateActionButton onClick={() => openActionModal('borrow', 'aleo')} disabled={loading || !connected}>Borrow</PrivateActionButton>
+                          <PrivateActionButton
+                            onClick={() => openActionModal('borrow', 'aleo')}
+                            disabled={loading || !connected || isRefreshingState || availableAleo <= 0}
+                          >
+                            Borrow
+                          </PrivateActionButton>
                         </td>
                       </tr>
                       <tr>
                         <td><span className="font-medium">USDC</span></td>
-                        <td className="text-base-content/90">{Math.max(0, ((Number(totalSuppliedUsdc) || 0) - (Number(totalBorrowedUsdc) || 0)) / 1_000_000).toFixed(4)}</td>
-                        <td className="text-base-content">{(borrowAPYUsdc * 100).toFixed(2)}%</td>
+                        <td className="text-base-content/90">
+                          {isRefreshingUsdcState ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            availableUsdc.toFixed(4)
+                          )}
+                        </td>
+                        <td className="text-base-content">
+                          {isRefreshingUsdcState ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            (borrowAPYUsdc * 100).toFixed(2) + '%'
+                          )}
+                        </td>
                         <td>
-                          <PrivateActionButton onClick={() => openActionModal('borrow', 'usdc')} disabled={loading || !connected}>Borrow</PrivateActionButton>
+                          <PrivateActionButton
+                            onClick={() => openActionModal('borrow', 'usdc')}
+                            disabled={loading || !connected || isRefreshingUsdcState || availableUsdc <= 0}
+                          >
+                            Borrow
+                          </PrivateActionButton>
                         </td>
                       </tr>
                     </tbody>
@@ -2004,14 +2147,27 @@ const DashboardPage: NextPageWithLayout = () => {
                     <tbody>
                       <tr>
                         <td><span className="font-medium">ALEO</span></td>
-                        <td className="text-base-content/90">{supplyBalanceAleo.toFixed(4)}</td>
+                        <td className="text-base-content/90">
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            supplyBalanceAleo.toFixed(4)
+                          )}
+                        </td>
                         <td className="text-base-content">
-                          <span className="inline-flex items-center">{(supplyAPY * 100).toFixed(2)}%<InfoTooltip tip={tooltipInterestEarnedAleo} /></span>
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            <span className="inline-flex items-center">
+                              {(supplyAPY * 100).toFixed(2)}%
+                              <InfoTooltip tip={tooltipInterestEarnedAleo} />
+                            </span>
+                          )}
                         </td>
                         <td>
                           <PrivateActionButton
                             onClick={() => openActionModal('withdraw', 'aleo', supplyBalanceAleo)}
-                            disabled={loading || !connected || supplyBalanceAleo <= 0}
+                            disabled={loading || !connected || walletBalancesLoading || supplyBalanceAleo <= 0}
                           >
                             Withdraw
                           </PrivateActionButton>
@@ -2019,14 +2175,27 @@ const DashboardPage: NextPageWithLayout = () => {
                       </tr>
                       <tr>
                         <td><span className="font-medium">USDC</span></td>
-                        <td className="text-base-content/90">{supplyBalanceUsdc.toFixed(4)}</td>
+                        <td className="text-base-content/90">
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            supplyBalanceUsdc.toFixed(4)
+                          )}
+                        </td>
                         <td className="text-base-content">
-                          <span className="inline-flex items-center">{(supplyAPYUsdc * 100).toFixed(2)}%<InfoTooltip tip={tooltipInterestEarnedUsdc} /></span>
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            <span className="inline-flex items-center">
+                              {(supplyAPYUsdc * 100).toFixed(2)}%
+                              <InfoTooltip tip={tooltipInterestEarnedUsdc} />
+                            </span>
+                          )}
                         </td>
                         <td>
                           <PrivateActionButton
                             onClick={() => openActionModal('withdraw', 'usdc', supplyBalanceUsdc)}
-                            disabled={loading || !connected || supplyBalanceUsdc <= 0}
+                            disabled={loading || !connected || walletBalancesLoading || supplyBalanceUsdc <= 0}
                           >
                             Withdraw
                           </PrivateActionButton>
@@ -2053,22 +2222,58 @@ const DashboardPage: NextPageWithLayout = () => {
                     <tbody>
                       <tr>
                         <td><span className="font-medium">ALEO</span></td>
-                        <td className="text-base-content/90">{borrowDebtAleo.toFixed(4)}</td>
+                        <td className="text-base-content/90">
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            borrowDebtAleo.toFixed(4)
+                          )}
+                        </td>
                         <td className="text-base-content">
-                          <span className="inline-flex items-center">{(borrowAPY * 100).toFixed(2)}%<InfoTooltip tip={tooltipInterestOwedAleo} /></span>
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            <span className="inline-flex items-center">
+                              {(borrowAPY * 100).toFixed(2)}%
+                              <InfoTooltip tip={tooltipInterestOwedAleo} />
+                            </span>
+                          )}
                         </td>
                         <td>
-                          <PrivateActionButton onClick={() => openActionModal('repay', 'aleo', borrowDebtAleo)} disabled={loading || !connected || borrowDebtAleo <= 0}>Repay</PrivateActionButton>
+                          <PrivateActionButton
+                            onClick={() => openActionModal('repay', 'aleo', borrowDebtAleo)}
+                            disabled={loading || !connected || walletBalancesLoading || borrowDebtAleo <= 0}
+                          >
+                            Repay
+                          </PrivateActionButton>
                         </td>
                       </tr>
                       <tr>
                         <td><span className="font-medium">USDC</span></td>
-                        <td className="text-base-content/90">{borrowDebtUsdc.toFixed(4)}</td>
+                        <td className="text-base-content/90">
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            borrowDebtUsdc.toFixed(4)
+                          )}
+                        </td>
                         <td className="text-base-content">
-                          <span className="inline-flex items-center">{(borrowAPYUsdc * 100).toFixed(2)}%<InfoTooltip tip={tooltipInterestOwedUsdc} /></span>
+                          {walletBalancesLoading ? (
+                            <span className="loading loading-spinner loading-xs text-base-content/60" />
+                          ) : (
+                            <span className="inline-flex items-center">
+                              {(borrowAPYUsdc * 100).toFixed(2)}%
+                              <InfoTooltip tip={tooltipInterestOwedUsdc} />
+                            </span>
+                          )}
                         </td>
                         <td>
-                          <PrivateActionButton onClick={() => openActionModal('repay', 'usdc', borrowDebtUsdc)} disabled={loading || !connected || borrowDebtUsdc <= 0}>Repay</PrivateActionButton>
+                          <PrivateActionButton
+                            onClick={() => openActionModal('repay', 'usdc', borrowDebtUsdc)}
+                            disabled={loading || !connected || walletBalancesLoading || borrowDebtUsdc <= 0}
+                          >
+                            Repay
+                          </PrivateActionButton>
                         </td>
                       </tr>
                     </tbody>
