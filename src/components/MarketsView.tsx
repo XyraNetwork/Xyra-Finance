@@ -125,7 +125,7 @@ export function MarketsView() {
                   </tr>
                   <tr className="border-base-300">
                     <td>
-                      <span className="font-medium">USDC</span>
+                      <span className="font-medium">USDCx</span>
                     </td>
                     <td>{usdcTotalSupplied.toFixed(4)}</td>
                     <td>{usdcTotalBorrowed.toFixed(4)}</td>

@@ -36,7 +36,7 @@ const DocsPage: NextPageWithLayout = () => {
               wallets using the Provable wallet adaptor.
             </li>
             <li>
-              <span className="font-semibold">Lending pool actions</span> for ALEO and USDC test
+              <span className="font-semibold">Lending pool actions</span> for ALEO and USDCx test
               pools: deposit, withdraw, borrow, repay and interest accrual.
             </li>
             <li>
@@ -98,7 +98,7 @@ const DocsPage: NextPageWithLayout = () => {
             <li>
               <span className="font-semibold">Markets</span> shows:
               <ul className="list-disc list-inside ml-4 space-y-1">
-                <li>Public market data for ALEO and USDC pools.</li>
+                <li>Public market data for ALEO and USDCx pools.</li>
                 <li>No wallet connect button and no “no wallet required” copy.</li>
               </ul>
             </li>
@@ -123,9 +123,9 @@ const DocsPage: NextPageWithLayout = () => {
               <span className="font-mono">program/src/main.leo</span>.
             </li>
             <li>
-              <span className="font-semibold">USDC pool program</span>{' '}
+              <span className="font-semibold">USDCx pool program</span>{' '}
               (<span className="font-mono">lending_pool_usdce_v86.aleo</span>): mirrors the same logic for the
-              USDC test token, with scaled balances. Its id is{' '}
+              USDCx test token, with scaled balances. Its id is{' '}
               <span className="font-mono">USDC_POOL_PROGRAM_ID</span> in{' '}
               <span className="font-mono">src/types/index.ts</span>, with Leo code in{' '}
               <span className="font-mono">programusdc/src/main.leo</span>.
@@ -246,7 +246,7 @@ const DocsPage: NextPageWithLayout = () => {
             <li><span className="font-mono">wallet_address</span> – Aleo address (used for queries).</li>
             <li><span className="font-mono">tx_id</span> – main lending pool tx hash.</li>
             <li><span className="font-mono">type</span> – one of <span className="font-mono">'deposit' | 'withdraw' | 'borrow' | 'repay'</span>.</li>
-            <li><span className="font-mono">asset</span> – <span className="font-mono">'aleo'</span> or <span className="font-mono">'usdc'</span>.</li>
+            <li><span className="font-mono">asset</span> – <span className="font-mono">'aleo'</span> or <span className="font-mono">'usdcx'</span>.</li>
             <li><span className="font-mono">amount</span> – numeric amount (up to 6 decimals).</li>
             <li><span className="font-mono">explorer_url</span> – Provable explorer URL for the main tx.</li>
             <li><span className="font-mono">vault_tx_id</span> – (optional) vault/backend tx id for withdraw/borrow.</li>

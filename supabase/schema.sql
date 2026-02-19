@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS transaction_history (
   wallet_address TEXT NOT NULL,
   tx_id TEXT NOT NULL,
   type TEXT NOT NULL CHECK (type IN ('deposit', 'withdraw', 'borrow', 'repay')),
-  asset TEXT NOT NULL CHECK (asset IN ('aleo', 'usdc')),
+  asset TEXT NOT NULL CHECK (asset IN ('aleo', 'usdcx')),
   amount NUMERIC(20, 6) NOT NULL,
   program_id TEXT,
   explorer_url TEXT,
@@ -21,6 +21,11 @@ CREATE TABLE IF NOT EXISTS transaction_history (
 -- If table already exists, add vault columns (run once)
 ALTER TABLE transaction_history ADD COLUMN IF NOT EXISTS vault_tx_id TEXT;
 ALTER TABLE transaction_history ADD COLUMN IF NOT EXISTS vault_explorer_url TEXT;
+
+-- If you already had asset CHECK (asset IN ('aleo', 'usdc')), run this to allow only usdcx:
+-- ALTER TABLE transaction_history DROP CONSTRAINT IF EXISTS transaction_history_asset_check;
+-- ALTER TABLE transaction_history ADD CONSTRAINT transaction_history_asset_check CHECK (asset IN ('aleo', 'usdcx'));
+-- Optional: migrate old rows: UPDATE transaction_history SET asset = 'usdcx' WHERE asset = 'usdc';
 
 -- Index: fetch transactions by user wallet (used by GET /api/transactions?wallet=...)
 CREATE INDEX IF NOT EXISTS idx_transaction_history_wallet_address
@@ -46,4 +51,4 @@ CREATE POLICY "transaction_history_publishable_insert"
   ON transaction_history FOR INSERT TO anon
   WITH CHECK (true);
 
-COMMENT ON TABLE transaction_history IS 'Stores transaction history per user wallet for deposit, withdraw, borrow, repay (ALEO and USDC). Fetched by wallet_address in the app.';
+COMMENT ON TABLE transaction_history IS 'Stores transaction history per user wallet for deposit, withdraw, borrow, repay (ALEO and USDCx). Fetched by wallet_address in the app.';

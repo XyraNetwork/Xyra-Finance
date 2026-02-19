@@ -42,7 +42,7 @@ export type TransactionRow = {
   wallet_address: string;
   tx_id: string;
   type: 'deposit' | 'withdraw' | 'borrow' | 'repay';
-  asset: 'aleo' | 'usdc';
+  asset: 'aleo' | 'usdcx';
   amount: number;
   program_id: string | null;
   explorer_url: string | null;

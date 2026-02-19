@@ -1031,7 +1031,16 @@ const DashboardPage: NextPageWithLayout = () => {
 
       if (action === 'deposit' || action === 'repay') {
         if (publicKey) {
-          saveTransactionToSupabase(publicKey, finalTxId, action, 'aleo', amount, LENDING_POOL_PROGRAM_ID).then(() => fetchTransactionHistory()).catch(() => {});
+          saveTransactionToSupabase(
+            publicKey,
+            finalTxId,
+            action,
+            'aleo',
+            amount,
+            LENDING_POOL_PROGRAM_ID
+          )
+            .then(() => fetchTransactionHistory())
+            .catch(() => {});
         }
       }
 
@@ -1060,11 +1069,30 @@ const DashboardPage: NextPageWithLayout = () => {
               else setVaultBorrowTxId(vaultTxId);
               setStatusMessage(vaultTxId ? `Vault ${action} submitted.` : `Vault ${action} complete.`);
             }
-            saveTransactionToSupabase(publicKey, finalTxId, action, 'aleo', amount, LENDING_POOL_PROGRAM_ID, vaultTxId).then(() => fetchTransactionHistory()).catch(() => {});
+            saveTransactionToSupabase(
+              publicKey,
+              finalTxId,
+              action,
+              'aleo',
+              amount,
+              LENDING_POOL_PROGRAM_ID,
+              vaultTxId
+            )
+              .then(() => fetchTransactionHistory())
+              .catch(() => {});
           } catch (e: any) {
             const msg = e?.name === 'AbortError' ? 'Request timed out' : (e?.message || 'Network error');
             setStatusMessage(`Vault ${action}: ${msg}`);
-            saveTransactionToSupabase(publicKey, finalTxId, action, 'aleo', amount, LENDING_POOL_PROGRAM_ID).then(() => fetchTransactionHistory()).catch(() => {});
+            saveTransactionToSupabase(
+              publicKey,
+              finalTxId,
+              action,
+              'aleo',
+              amount,
+              LENDING_POOL_PROGRAM_ID
+            )
+              .then(() => fetchTransactionHistory())
+              .catch(() => {});
           }
         }
       }
@@ -1269,7 +1297,16 @@ const DashboardPage: NextPageWithLayout = () => {
       setTxFinalized(true);
       if (action === 'deposit' || action === 'repay') {
         if (publicKey) {
-          saveTransactionToSupabase(publicKey, finalTxId, action, 'usdc', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID).then(() => fetchTransactionHistory()).catch(() => {});
+          saveTransactionToSupabase(
+            publicKey,
+            finalTxId,
+            action,
+            'usdcx',
+            amountUsdc,
+            USDC_LENDING_POOL_PROGRAM_ID
+          )
+            .then(() => fetchTransactionHistory())
+            .catch(() => {});
         }
       }
       if (action === 'withdraw' || action === 'borrow') {
@@ -1297,10 +1334,10 @@ const DashboardPage: NextPageWithLayout = () => {
               const errMsg = (data?.error as string) || resp.statusText || 'Vault transfer failed';
               setStatusMessage(errMsg);
             }
-            saveTransactionToSupabase(publicKey, finalTxId, action, 'usdc', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID, vaultTxId).then(() => fetchTransactionHistory()).catch(() => {});
+            saveTransactionToSupabase(publicKey, finalTxId, action, 'usdcx', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID, vaultTxId).then(() => fetchTransactionHistory()).catch(() => {});
           } catch (e: any) {
             setStatusMessage(e?.name === 'AbortError' ? 'Vault request timed out.' : (e?.message || 'Vault request failed.'));
-            saveTransactionToSupabase(publicKey, finalTxId, action, 'usdc', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID).then(() => fetchTransactionHistory()).catch(() => {});
+            saveTransactionToSupabase(publicKey, finalTxId, action, 'usdcx', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID).then(() => fetchTransactionHistory()).catch(() => {});
           }
         }
       }
@@ -1711,12 +1748,12 @@ const DashboardPage: NextPageWithLayout = () => {
 
   const actionModalTitle =
     actionModalMode === 'withdraw'
-      ? `Withdraw ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}`
+      ? `Withdraw ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDCx'}`
       : actionModalMode === 'deposit'
-        ? `Deposit ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}`
+        ? `Deposit ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDCx'}`
         : actionModalMode === 'borrow'
-          ? `Borrow ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}`
-          : `Repay ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}`;
+          ? `Borrow ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDCx'}`
+          : `Repay ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDCx'}`;
 
   const supplyBalanceModal = actionModalAsset === 'aleo' ? supplyBalanceAleo : supplyBalanceUsdc;
   const debtBalanceModal = actionModalAsset === 'aleo' ? borrowDebtAleo : borrowDebtUsdc;
@@ -1794,27 +1831,37 @@ const DashboardPage: NextPageWithLayout = () => {
                         placeholder="0.00"
                         className="input input-bordered flex-1 bg-transparent border-0 focus:outline-none"
                       />
-                      <span className="font-medium">{actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}</span>
+                      <span className="font-medium">{actionModalAsset === 'aleo' ? 'ALEO' : 'USDCx'}</span>
                     </div>
                     <div className="flex items-center justify-between mt-1 text-sm text-base-content/70">
                       <span>
-                        {(actionModalMode === 'withdraw' || actionModalMode === 'repay')
-                          ? (actionModalMode === 'withdraw' ? 'Supply balance ' : 'Debt ')
-                          : 'Balance '}
-                        {(actionModalMode === 'withdraw' || actionModalMode === 'repay')
-                          ? (actionModalMode === 'withdraw' ? supplyBalanceModal.toFixed(7) : debtBalanceModal.toFixed(7))
-                          : privateBalanceModal.toFixed(7)}
+                      {actionModalMode === 'withdraw'
+                        ? 'Supply balance '
+                        : actionModalMode === 'deposit'
+                          ? 'Wallet balance '
+                          : actionModalMode === 'borrow'
+                            ? 'Available to borrow '
+                            : 'Debt '}
+                      {actionModalMode === 'withdraw'
+                        ? supplyBalanceModal.toFixed(7)
+                        : actionModalMode === 'deposit'
+                          ? privateBalanceModal.toFixed(7)
+                          : actionModalMode === 'borrow'
+                            ? (actionModalAsset === 'aleo' ? availableAleo : availableUsdc).toFixed(7)
+                            : debtBalanceModal.toFixed(7)}
                         {' '}
                         <button
                           type="button"
                           className="link link-primary text-xs"
                           onClick={() => {
                             const maxVal =
-                              actionModalMode === 'withdraw' || actionModalMode === 'repay'
-                                ? actionModalMode === 'withdraw'
-                                  ? supplyBalanceModal
-                                  : debtBalanceModal
-                                : privateBalanceModal;
+                              actionModalMode === 'withdraw'
+                                ? supplyBalanceModal
+                                : actionModalMode === 'deposit'
+                                  ? privateBalanceModal
+                                  : actionModalMode === 'borrow'
+                                    ? (actionModalAsset === 'aleo' ? availableAleo : availableUsdc)
+                                    : debtBalanceModal;
                             setModalAmountInput(String(maxVal));
                             if (actionModalAsset === 'usdc') {
                               setAmountUsdc(maxVal);
@@ -1834,7 +1881,7 @@ const DashboardPage: NextPageWithLayout = () => {
                       <span className="text-base-content/70">
                         {actionModalMode === 'withdraw' ? 'Remaining supply' : actionModalMode === 'deposit' ? 'Supply after' : actionModalMode === 'borrow' ? 'Debt after' : 'Remaining debt'}
                       </span>
-                      <span>{remainingSupply.toFixed(7)} {actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}</span>
+                      <span>{remainingSupply.toFixed(7)} {actionModalAsset === 'aleo' ? 'ALEO' : 'USDCx'}</span>
                     </div>
                   </div>
                   {statusMessage && <p className="text-sm text-error">{statusMessage}</p>}
@@ -2022,7 +2069,7 @@ const DashboardPage: NextPageWithLayout = () => {
                         </td>
                       </tr>
                       <tr>
-                        <td><span className="font-medium">USDC</span></td>
+                        <td><span className="font-medium">USDCx</span></td>
                         <td className="text-base-content/90">
                           {walletBalancesLoading ? (
                             <span className="loading loading-spinner loading-xs text-base-content/60" />
@@ -2105,7 +2152,7 @@ const DashboardPage: NextPageWithLayout = () => {
                         </td>
                       </tr>
                       <tr>
-                        <td><span className="font-medium">USDC</span></td>
+                        <td><span className="font-medium">USDCx</span></td>
                         <td className="text-base-content/90">
                           {isRefreshingUsdcState ? (
                             <span className="loading loading-spinner loading-xs text-base-content/60" />
@@ -2176,7 +2223,7 @@ const DashboardPage: NextPageWithLayout = () => {
                         </td>
                       </tr>
                       <tr>
-                        <td><span className="font-medium">USDC</span></td>
+                        <td><span className="font-medium">USDCx</span></td>
                         <td className="text-base-content/90">
                           {walletBalancesLoading ? (
                             <span className="loading loading-spinner loading-xs text-base-content/60" />
@@ -2251,7 +2298,7 @@ const DashboardPage: NextPageWithLayout = () => {
                         </td>
                       </tr>
                       <tr>
-                        <td><span className="font-medium">USDC</span></td>
+                        <td><span className="font-medium">USDCx</span></td>
                         <td className="text-base-content/90">
                           {walletBalancesLoading ? (
                             <span className="loading loading-spinner loading-xs text-base-content/60" />
@@ -2336,7 +2383,7 @@ const DashboardPage: NextPageWithLayout = () => {
                             {new Date(row.created_at).toLocaleString()}
                           </td>
                           <td className="capitalize">{row.type}</td>
-                          <td className="uppercase">{row.asset}</td>
+                          <td>{row.asset === 'usdcx' ? 'USDCx' : (row.asset === 'aleo' ? 'ALEO' : String(row.asset).toUpperCase())}</td>
                           <td>
                             {Number(row.amount).toLocaleString(undefined, {
                               minimumFractionDigits: 2,
