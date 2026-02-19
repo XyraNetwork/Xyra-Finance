@@ -1,8 +1,17 @@
 import { useEffect, useState, useCallback } from 'react';
+import { useRouter } from 'next/router';
 import type { NextPageWithLayout } from '@/types';
 import Layout from '@/layouts/_layout';
+import Link from 'next/link';
+import { MarketsView } from '@/components/MarketsView';
+import DocsPage from '@/pages/docs';
+import { useDashboardView } from '@/contexts/DashboardViewContext';
 import Button from '@/components/ui/button';
+import { InfoTooltip } from '@/components/ui/InfoTooltip';
+import { PrivateDataColumnHeader } from '@/components/ui/PrivateDataColumnHeader';
+import { PrivateActionButton } from '@/components/ui/PrivateActionButton';
 import { useWallet } from '@provablehq/aleo-wallet-adaptor-react';
+import { WalletMultiButton } from '@provablehq/aleo-wallet-adaptor-react-ui';
 import { Network } from '@provablehq/aleo-types';
 import {
   getLendingPoolState,
@@ -30,15 +39,31 @@ import {
 } from '@/components/aleo/rpc';
 import { frontendLogger } from '@/utils/logger';
 import { CURRENT_NETWORK } from '@/types';
+import { getSupabaseBrowserClient } from '@/utils/supabase/client';
 
 // Frontend app environment: 'dev' or 'prod' (default to dev for non-production NODE_ENV)
 const APP_ENV = process.env.NEXT_PUBLIC_APP_ENV;
 const isDevAppEnv = APP_ENV ? APP_ENV === 'dev' : process.env.NODE_ENV !== 'production';
 
 const DashboardPage: NextPageWithLayout = () => {
+  const router = useRouter();
+  const { view, setView } = useDashboardView();
+
+  // Sync URL to context when landing on /dashboard?view=markets or /dashboard?view=docs
+  useEffect(() => {
+    if (router.query.view === 'markets') {
+      setView('markets');
+    } else if (router.query.view === 'docs') {
+      setView('docs');
+    } else {
+      setView('dashboard');
+    }
+  }, [router.query.view, setView]);
+
   const {
     address,
     connected,
+    connecting,
     executeTransaction,
     transactionStatus,
     requestRecords,
@@ -46,6 +71,26 @@ const DashboardPage: NextPageWithLayout = () => {
     decrypt,
   } = useWallet();
   const publicKey = address; // Use address as publicKey for compatibility
+
+  // Avoid showing "Connect wallet" immediately after nav from Markets when already connected (adapter may restore state shortly)
+  const [allowShowConnectCTA, setAllowShowConnectCTA] = useState(true);
+  useEffect(() => {
+    if (connected) {
+      if (typeof sessionStorage !== 'undefined') sessionStorage.setItem('wallet_connected', '1');
+      setAllowShowConnectCTA(true);
+      return;
+    }
+    const hadConnection = typeof sessionStorage !== 'undefined' && sessionStorage.getItem('wallet_connected');
+    if (hadConnection) {
+      setAllowShowConnectCTA(false);
+      const t = setTimeout(() => {
+        setAllowShowConnectCTA(true);
+        if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem('wallet_connected');
+      }, 600);
+      return () => clearTimeout(t);
+    }
+    setAllowShowConnectCTA(true);
+  }, [connected]);
 
   const [amount, setAmount] = useState<number>(0);
   const [statusMessage, setStatusMessage] = useState<string>('');
@@ -101,10 +146,32 @@ const DashboardPage: NextPageWithLayout = () => {
   const [amountErrorUsdc, setAmountErrorUsdc] = useState<string | null>(null);
   const [privateUsdcBalance, setPrivateUsdcBalance] = useState<number | null>(null);
 
+  // Action modal (Aave-style: withdraw/deposit/borrow/repay with overview + tx status)
+  const [actionModalOpen, setActionModalOpen] = useState(false);
+  const [actionModalMode, setActionModalMode] = useState<'withdraw' | 'deposit' | 'borrow' | 'repay'>('withdraw');
+  const [actionModalAsset, setActionModalAsset] = useState<'aleo' | 'usdc'>('aleo');
+  const [actionModalSubmitted, setActionModalSubmitted] = useState(false);
+
   // Track if we've already triggered a one-time records permission request for this connection
   const [walletPermissionsInitialized, setWalletPermissionsInitialized] = useState<boolean>(false);
   // Track if we've already loaded the user's position once after wallet connect
   const [userPositionInitialized, setUserPositionInitialized] = useState<boolean>(false);
+
+  // Transaction history from Supabase (by wallet address)
+  type TxHistoryRow = {
+    id: string;
+    tx_id: string;
+    type: string;
+    asset: string;
+    amount: number;
+    explorer_url: string | null;
+    vault_tx_id: string | null;
+    vault_explorer_url: string | null;
+    created_at: string;
+  };
+  const [txHistory, setTxHistory] = useState<TxHistoryRow[]>([]);
+  const [txHistoryLoading, setTxHistoryLoading] = useState(false);
+  const [txHistoryPage, setTxHistoryPage] = useState(1);
 
   // Helper to extract a ciphertext string from a generic record object.
   const extractCiphertext = (record: any): string | null => {
@@ -338,6 +405,25 @@ const DashboardPage: NextPageWithLayout = () => {
 
   const isExplorerHash = (id: string | null) => !!id && id.length >= 61;
 
+  const openActionModal = (mode: 'withdraw' | 'deposit' | 'borrow' | 'repay', asset: 'aleo' | 'usdc', prefilledAmount?: number) => {
+    setActionModalMode(mode);
+    setActionModalAsset(asset);
+    setActionModalSubmitted(false);
+    setStatusMessage('');
+    setVaultWithdrawTxId(null);
+    setVaultBorrowTxId(null);
+    if (prefilledAmount != null) {
+      if (asset === 'usdc') setAmountUsdc(prefilledAmount);
+      else setAmount(prefilledAmount);
+    }
+    setActionModalOpen(true);
+  };
+
+  const closeActionModal = () => {
+    setActionModalOpen(false);
+    setActionModalSubmitted(false);
+  };
+
   // Derived user metrics for interest display (Aleo pool)
   const INDEX_SCALE_ALEO = 1_000_000_000_000;
   const numericTotalDeposits = Number(totalDeposits) || 0;
@@ -407,6 +493,12 @@ const DashboardPage: NextPageWithLayout = () => {
   const interestOwedUsdc =
     interestOwedUsdcMicro > 0 ? interestOwedUsdcMicro / USDC_SCALE : 0;
 
+  // Per-asset tooltips: supply = interest earned, borrow = interest owed (real calculated values)
+  const tooltipInterestEarnedAleo = `Interest earned (ALEO): ${formatAleoAmount(interestEarnedAleo, 6)}`;
+  const tooltipInterestEarnedUsdc = `Interest earned (USDC): ${interestEarnedUsdc.toFixed(6)} USDC`;
+  const tooltipInterestOwedAleo = `Interest owed (ALEO): ${formatAleoAmount(interestOwedAleo, 6)}`;
+  const tooltipInterestOwedUsdc = `Interest owed (USDC): ${interestOwedUsdc.toFixed(6)} USDC`;
+
   const getExplorerTxUrl = (id: string) => {
     let base = 'https://explorer.aleo.org/transaction';
 
@@ -419,7 +511,76 @@ const DashboardPage: NextPageWithLayout = () => {
   };
 
   const getProvableExplorerTxUrl = (id: string) =>
-    `https://testnet.explorer.provable.com/transaction?id=${encodeURIComponent(id)}`;
+    `https://testnet.explorer.provable.com/transaction/${id}`;
+
+  const [txHistoryError, setTxHistoryError] = useState<string | null>(null);
+
+  const fetchTransactionHistory = useCallback(async () => {
+    if (!address?.trim()) return;
+    const supabase = getSupabaseBrowserClient();
+    if (!supabase) {
+      setTxHistoryError('Supabase not configured. Add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUB_KEY to .env');
+      setTxHistory([]);
+      return;
+    }
+    setTxHistoryLoading(true);
+    setTxHistoryError(null);
+    try {
+      const { data, error } = await supabase
+        .from('transaction_history')
+        .select('id, wallet_address, tx_id, type, asset, amount, program_id, explorer_url, vault_tx_id, vault_explorer_url, created_at')
+        .eq('wallet_address', address)
+        .order('created_at', { ascending: false })
+        .limit(100);
+      if (error) {
+        setTxHistoryError(error.message);
+        setTxHistory([]);
+        return;
+      }
+      setTxHistory(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      console.warn('Failed to fetch transaction history:', e);
+      setTxHistoryError(e?.message || 'Network error');
+      setTxHistory([]);
+    } finally {
+      setTxHistoryLoading(false);
+    }
+  }, [address]);
+
+  const saveTransactionToSupabase = async (
+    walletAddress: string,
+    txId: string,
+    type: 'deposit' | 'withdraw' | 'borrow' | 'repay',
+    asset: 'aleo' | 'usdc',
+    amount: number,
+    programId?: string,
+    vaultTxId?: string | null,
+  ) => {
+    const supabase = getSupabaseBrowserClient();
+    if (!supabase) return;
+    try {
+      const explorerUrl = getProvableExplorerTxUrl(txId);
+      const vaultExplorerUrl = vaultTxId ? getProvableExplorerTxUrl(vaultTxId) : null;
+      const { error } = await supabase.from('transaction_history').insert({
+        wallet_address: walletAddress,
+        tx_id: txId,
+        type,
+        asset,
+        amount,
+        program_id: programId ?? null,
+        explorer_url: explorerUrl,
+        vault_tx_id: vaultTxId ?? null,
+        vault_explorer_url: vaultExplorerUrl,
+      });
+      if (error) {
+        console.warn('Supabase save failed:', error.message);
+        return;
+      }
+      await fetchTransactionHistory();
+    } catch (e) {
+      console.warn('Failed to save transaction to Supabase:', e);
+    }
+  };
 
   const refreshPoolState = async (includeUserPosition: boolean = false) => {
     try {
@@ -612,6 +773,15 @@ const DashboardPage: NextPageWithLayout = () => {
     })();
   }, [connected, publicKey, requestRecords, walletPermissionsInitialized, userPositionInitialized]);
 
+  // Load transaction history from Supabase when wallet address is available
+  useEffect(() => {
+    if (address?.trim()) {
+      fetchTransactionHistory();
+    } else {
+      setTxHistory([]);
+    }
+  }, [address, fetchTransactionHistory]);
+
   const handleAction = async (action: 'deposit' | 'borrow' | 'repay' | 'withdraw') => {
     console.log('========================================');
     console.log(`🚀 BUTTON CLICKED: ${action.toUpperCase()}`);
@@ -680,10 +850,14 @@ const DashboardPage: NextPageWithLayout = () => {
         0,
         (poolSuppliedMicro - poolBorrowedMicro) / 1_000_000,
       ); // ALEO
+      // When pool state is not loaded (totalSupplied 0), allow withdraw up to user position; program will enforce liquidity
+      const poolStateLoaded = poolSuppliedMicro > 0 || poolBorrowedMicro > 0;
+      const maxWithdrawable = poolStateLoaded
+        ? Math.min(netSupplied, availableLiquidity)
+        : netSupplied;
 
-      const maxWithdrawable = Math.min(netSupplied, availableLiquidity);
       if (action === 'withdraw' && amount > maxWithdrawable) {
-        const msg = availableLiquidity < netSupplied
+        const msg = poolStateLoaded && availableLiquidity < netSupplied
           ? `You can withdraw at most ${maxWithdrawable.toFixed(
               2,
             )} ALEO (available pool liquidity). Your position is ${netSupplied.toFixed(
@@ -708,8 +882,8 @@ const DashboardPage: NextPageWithLayout = () => {
         return;
       }
 
-      if (action === 'borrow' && amount > availableLiquidity) {
-        const msg = `Borrow amount exceeds available pool liquidity (${availableLiquidity}). Please reduce the amount.`;
+      if (action === 'borrow' && poolStateLoaded && amount > availableLiquidity) {
+        const msg = `Borrow amount exceeds available pool liquidity (${availableLiquidity.toFixed(2)} ALEO). Please reduce the amount.`;
         setAmountError(msg);
         console.warn(msg);
         setLoading(false);
@@ -777,9 +951,9 @@ const DashboardPage: NextPageWithLayout = () => {
       const transactionTime = Date.now() - startTime;
       console.log(`⏱️ Transaction submitted in ${transactionTime}ms`);
 
-      setTxId(tx);
+      setTxId(null);
       setTxFinalized(false);
-      setStatusMessage(`Transaction submitted: ${tx.substring(0, 20)}... Waiting for finalization...`);
+      setStatusMessage('Transaction submitted. Waiting for finalization…');
       
       console.log('📤 Transaction ID:', tx);
       console.log('⏳ Starting finalization polling...');
@@ -787,6 +961,7 @@ const DashboardPage: NextPageWithLayout = () => {
       // Poll for transaction finalization; only then call backend for withdraw/borrow (same as USDC pool).
       let finalized = false;
       let txFailed = false;
+      let finalTxId = tx; // use final on-chain id (at1...) for explorer and Supabase, not the initial shield id
       const maxAttempts = 45;
       const delayMs = 2000;
 
@@ -808,9 +983,10 @@ const DashboardPage: NextPageWithLayout = () => {
             if (statusLower === 'finalized' || statusLower === 'accepted') {
               finalized = true;
               console.log('✅ Transaction finalized!', statusResult);
-              const finalId =
+              const resolvedId =
                 (typeof statusResult === 'object' && (statusResult as any).transactionId) || tx;
-              setTxId(finalId);
+              finalTxId = resolvedId;
+              setTxId(isExplorerHash(resolvedId) ? resolvedId : null);
               break;
             }
             if (statusLower === 'rejected' || statusLower === 'failed' || statusLower === 'dropped') {
@@ -849,6 +1025,12 @@ const DashboardPage: NextPageWithLayout = () => {
       setTxFinalized(true);
       console.log('✅ Transaction finalized successfully!');
 
+      if (action === 'deposit' || action === 'repay') {
+        if (publicKey) {
+          saveTransactionToSupabase(publicKey, finalTxId, action, 'aleo', amount, LENDING_POOL_PROGRAM_ID).then(() => fetchTransactionHistory()).catch(() => {});
+        }
+      }
+
       // Only after finalization: call backend for withdraw/borrow (vault sends credits to user).
       if (action === 'withdraw' || action === 'borrow') {
         setStatusMessage('Transaction finalized. Requesting credits from vault...');
@@ -866,17 +1048,19 @@ const DashboardPage: NextPageWithLayout = () => {
             });
             clearTimeout(timeoutId);
             const data = await resp.json().catch(() => ({}));
+            const vaultTxId = resp.ok ? (data?.transactionId ?? null) : null;
             if (!resp.ok) {
-              const msg = (data?.error as string) || resp.statusText || 'Backend error';
-              setStatusMessage(`Vault ${action} failed: ${msg}`);
+              setStatusMessage(`Vault ${action} failed: ${(data?.error as string) || resp.statusText || 'Backend error'}`);
             } else {
-              if (action === 'withdraw') setVaultWithdrawTxId(data?.transactionId ?? null);
-              else setVaultBorrowTxId(data?.transactionId ?? null);
-              setStatusMessage(data?.transactionId ? `Vault ${action} submitted.` : `Vault ${action} complete.`);
+              if (action === 'withdraw') setVaultWithdrawTxId(vaultTxId);
+              else setVaultBorrowTxId(vaultTxId);
+              setStatusMessage(vaultTxId ? `Vault ${action} submitted.` : `Vault ${action} complete.`);
             }
+            saveTransactionToSupabase(publicKey, finalTxId, action, 'aleo', amount, LENDING_POOL_PROGRAM_ID, vaultTxId).then(() => fetchTransactionHistory()).catch(() => {});
           } catch (e: any) {
             const msg = e?.name === 'AbortError' ? 'Request timed out' : (e?.message || 'Network error');
             setStatusMessage(`Vault ${action}: ${msg}`);
+            saveTransactionToSupabase(publicKey, finalTxId, action, 'aleo', amount, LENDING_POOL_PROGRAM_ID).then(() => fetchTransactionHistory()).catch(() => {});
           }
         }
       }
@@ -1039,11 +1223,12 @@ const DashboardPage: NextPageWithLayout = () => {
         setLoading(false);
         return;
       }
-      setTxId(tx);
+      setTxId(null);
       setTxFinalized(false);
-      setStatusMessage(`USDC ${action} submitted. Waiting for transaction to finalize...`);
+      setStatusMessage('Transaction submitted. Waiting for finalization…');
       let finalized = false;
       let txFailed = false;
+      let finalTxId = tx;
       for (let attempt = 1; attempt <= 45; attempt++) {
         await new Promise((r) => setTimeout(r, 2000));
         if (transactionStatus) {
@@ -1053,6 +1238,8 @@ const DashboardPage: NextPageWithLayout = () => {
             const statusLower = (statusText || '').toLowerCase();
             if (statusLower === 'finalized' || statusLower === 'accepted') {
               finalized = true;
+              finalTxId = (typeof statusResult === 'object' && (statusResult as any).transactionId) || tx;
+              setTxId(isExplorerHash(finalTxId) ? finalTxId : null);
               break;
             }
             if (statusLower === 'rejected' || statusLower === 'failed' || statusLower === 'dropped') {
@@ -1076,31 +1263,41 @@ const DashboardPage: NextPageWithLayout = () => {
         return;
       }
       setTxFinalized(true);
+      if (action === 'deposit' || action === 'repay') {
+        if (publicKey) {
+          saveTransactionToSupabase(publicKey, finalTxId, action, 'usdc', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID).then(() => fetchTransactionHistory()).catch(() => {});
+        }
+      }
       if (action === 'withdraw' || action === 'borrow') {
         setStatusMessage('Transaction finalized. Requesting USDC from vault...');
-        try {
-          const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:4000';
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 120_000);
-          const endpoint = action === 'withdraw' ? '/withdraw-usdc' : '/borrow-usdc';
-          const resp = await fetch(`${backendUrl}${endpoint}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ userAddress: publicKey, amountUsdc }),
-            signal: controller.signal,
-          });
-          clearTimeout(timeoutId);
-          const data = await resp.json().catch(() => ({}));
-          if (resp.ok && data?.transactionId) {
-            if (action === 'withdraw') setVaultWithdrawTxId(data.transactionId);
-            else setVaultBorrowTxId(data.transactionId);
-            setStatusMessage(`Vault transfer submitted. ${data.transactionId ? `Tx: ${data.transactionId}` : ''}`);
-          } else {
-            const errMsg = (data?.error as string) || resp.statusText || 'Vault transfer failed';
-            setStatusMessage(errMsg);
+        if (publicKey) {
+          try {
+            const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:4000';
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 120_000);
+            const endpoint = action === 'withdraw' ? '/withdraw-usdc' : '/borrow-usdc';
+            const resp = await fetch(`${backendUrl}${endpoint}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ userAddress: publicKey, amountUsdc }),
+              signal: controller.signal,
+            });
+            clearTimeout(timeoutId);
+            const data = await resp.json().catch(() => ({}));
+            const vaultTxId = resp.ok ? (data?.transactionId ?? null) : null;
+            if (vaultTxId) {
+              if (action === 'withdraw') setVaultWithdrawTxId(vaultTxId);
+              else setVaultBorrowTxId(vaultTxId);
+              setStatusMessage(`Vault transfer submitted.`);
+            } else {
+              const errMsg = (data?.error as string) || resp.statusText || 'Vault transfer failed';
+              setStatusMessage(errMsg);
+            }
+            saveTransactionToSupabase(publicKey, finalTxId, action, 'usdc', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID, vaultTxId).then(() => fetchTransactionHistory()).catch(() => {});
+          } catch (e: any) {
+            setStatusMessage(e?.name === 'AbortError' ? 'Vault request timed out.' : (e?.message || 'Vault request failed.'));
+            saveTransactionToSupabase(publicKey, finalTxId, action, 'usdc', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID).then(() => fetchTransactionHistory()).catch(() => {});
           }
-        } catch (e: any) {
-          setStatusMessage(e?.name === 'AbortError' ? 'Vault request timed out.' : (e?.message || 'Vault request failed.'));
         }
       }
       setAmountUsdc(0);
@@ -1135,9 +1332,9 @@ const DashboardPage: NextPageWithLayout = () => {
 
       const tx = await createTestCredits(requestTransaction, publicKey, testCreditsAmount);
       
-      setTxId(tx);
+      setTxId(null);
       setTxFinalized(false);
-      setStatusMessage(`Test credits creation submitted: ${tx.substring(0, 20)}... Waiting for finalization...`);
+      setStatusMessage('Test credits creation submitted. Waiting for finalization…');
 
       // Poll for transaction finalization using wallet's transactionStatus
       let finalized = false;
@@ -1154,6 +1351,8 @@ const DashboardPage: NextPageWithLayout = () => {
             
             if (status && (status.status === 'Finalized' || status.finalized)) {
               finalized = true;
+              const resolvedId = (typeof status === 'object' && (status as any).transactionId) || tx;
+              setTxId(isExplorerHash(resolvedId) ? resolvedId : null);
               setTxFinalized(true);
               setStatusMessage(`✅ Test credits created successfully! You should now have a Credits record with ${testCreditsAmount} credits (${testCreditsAmount * 1_000_000} microcredits) in your wallet.`);
               
@@ -1212,9 +1411,9 @@ const DashboardPage: NextPageWithLayout = () => {
 
       const tx = await depositTestReal(requestTransaction, publicKey, amount, requestRecords);
       
-      setTxId(tx);
+      setTxId(null);
       setTxFinalized(false);
-      setStatusMessage(`Deposit test submitted: ${tx.substring(0, 20)}... Waiting for finalization...`);
+      setStatusMessage('Deposit test submitted. Waiting for finalization…');
 
       // Poll for transaction finalization using wallet's transactionStatus
       let finalized = false;
@@ -1231,6 +1430,8 @@ const DashboardPage: NextPageWithLayout = () => {
             
             if (status && (status.status === 'Finalized' || status.finalized)) {
               finalized = true;
+              const resolvedId = (typeof status === 'object' && (status as any).transactionId) || tx;
+              setTxId(isExplorerHash(resolvedId) ? resolvedId : null);
               setTxFinalized(true);
               setStatusMessage(`✅ Deposit test completed successfully! The test validates that real Aleo credits records work correctly. If this succeeded, your Credits record format is correct.`);
               
@@ -1285,9 +1486,9 @@ const DashboardPage: NextPageWithLayout = () => {
       const currentBlock = await getLatestBlockHeight();
       const tx = await lendingAccrueInterest(executeTransaction, currentBlock);
       
-      setTxId(tx);
+      setTxId(null);
       setTxFinalized(false);
-      setStatusMessage(`Interest accrual submitted: ${tx.substring(0, 20)}... Waiting for finalization...`);
+      setStatusMessage('Interest accrual submitted. Waiting for finalization…');
 
       // Poll for transaction finalization using wallet's transactionStatus
       let finalized = false;
@@ -1310,8 +1511,11 @@ const DashboardPage: NextPageWithLayout = () => {
 
             if (statusLower === 'finalized' || statusLower === 'accepted') {
               finalized = true;
+              const resolvedId = (typeof statusResult === 'object' && (statusResult as any).transactionId) || tx;
+              setTxId(isExplorerHash(resolvedId) ? resolvedId : null);
+              setTxFinalized(true);
               // Fetch records in background after interest accrual finalizes
-              if (finalized && requestRecords && publicKey) {
+              if (requestRecords && publicKey) {
                 console.log('📋 Interest accrual finalized - fetching records in background...');
                 fetchRecordsInBackground(LENDING_POOL_PROGRAM_ID);
               }
@@ -1386,9 +1590,9 @@ const DashboardPage: NextPageWithLayout = () => {
       const currentBlock = await getLatestBlockHeight();
       const tx = await lendingAccrueInterestUsdc(executeTransaction, currentBlock);
 
-      setTxId(tx);
+      setTxId(null);
       setTxFinalized(false);
-      setStatusMessage(`USDC interest accrual submitted: ${tx.substring(0, 20)}... Waiting for finalization...`);
+      setStatusMessage('USDC interest accrual submitted. Waiting for finalization…');
 
       let finalized = false;
       const maxAttempts = 30;
@@ -1406,6 +1610,9 @@ const DashboardPage: NextPageWithLayout = () => {
             const statusLower = (statusText || '').toLowerCase();
             if (statusLower === 'finalized' || statusLower === 'accepted') {
               finalized = true;
+              const resolvedId = (typeof statusResult === 'object' && (statusResult as any).transactionId) || tx;
+              setTxId(isExplorerHash(resolvedId) ? resolvedId : null);
+              setTxFinalized(true);
               break;
             }
           } catch {
@@ -1474,783 +1681,542 @@ const DashboardPage: NextPageWithLayout = () => {
     };
   }, [isDevAppEnv]);
 
+  // Display values for merged Aave-style view (human units)
+  const supplyBalanceAleo = ((effectiveUserSupplied ?? Number(userSupplied)) || 0) / 1_000_000;
+  const supplyBalanceUsdc = ((effectiveUserSuppliedUsdc ?? Number(userSuppliedUsdc)) || 0) / 1_000_000;
+  const borrowDebtAleo = ((effectiveUserBorrowed ?? Number(userBorrowed)) || 0) / 1_000_000;
+  const borrowDebtUsdc = ((effectiveUserBorrowedUsdc ?? Number(userBorrowedUsdc)) || 0) / 1_000_000;
+  const totalSupplyBalance = supplyBalanceAleo + supplyBalanceUsdc; // mixed units for count only
+  const totalBorrowDebt = borrowDebtAleo + borrowDebtUsdc;
+
+  const actionModalTitle =
+    actionModalMode === 'withdraw'
+      ? `Withdraw ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}`
+      : actionModalMode === 'deposit'
+        ? `Deposit ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}`
+        : actionModalMode === 'borrow'
+          ? `Borrow ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}`
+          : `Repay ${actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}`;
+
+  const modalAmount = actionModalAsset === 'usdc' ? amountUsdc : amount;
+  const setModalAmount = actionModalAsset === 'usdc' ? setAmountUsdc : setAmount;
+  const supplyBalanceModal = actionModalAsset === 'aleo' ? supplyBalanceAleo : supplyBalanceUsdc;
+  const debtBalanceModal = actionModalAsset === 'aleo' ? borrowDebtAleo : borrowDebtUsdc;
+  const privateBalanceModal = actionModalAsset === 'aleo' ? (privateAleoBalance ?? 0) : (privateUsdcBalance ?? 0);
+  const remainingSupply = actionModalMode === 'withdraw'
+    ? Math.max(0, supplyBalanceModal - modalAmount)
+    : actionModalMode === 'deposit'
+      ? supplyBalanceModal + modalAmount
+      : actionModalMode === 'borrow'
+        ? debtBalanceModal + modalAmount
+        : Math.max(0, debtBalanceModal - modalAmount);
+
+  if (view === 'markets') {
+    return <MarketsView />;
+  }
+
+  if (view === 'docs') {
+    // Reuse the docs page content inside the dashboard layout so wallet state is shared
+    return <DocsPage />;
+  }
+
   return (
     <div className="flex justify-center pt-16 sm:pt-20">
-      <div className="space-y-6 w-full max-w-6xl">
-        {/* Main content */}
-        {/* Aleo Pool + inline actions & position */}
-        <div className="space-y-6">
-          {/* Pool overview */}
-          <div className="rounded-xl bg-base-200 p-6 space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-xl font-semibold">Aleo Pool</h2>
-                <p className="text-xs opacity-70">
-                  Aleo pool program:{' '}
-                  <a
-                    href="https://testnet.explorer.provable.com/program/lending_pool_v86.aleo"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="font-mono text-[11px] text-base-content underline decoration-dotted underline-offset-2 hover:decoration-solid"
+      {/* Aave-style action modal (withdraw/deposit/borrow/repay) */}
+      {actionModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={(e) => {
+            const canClose = !actionModalSubmitted || (!loading && txFinalized);
+            if (e.target === e.currentTarget && canClose) closeActionModal();
+          }}
+        >
+          <div className="bg-base-200 rounded-xl shadow-xl w-full max-w-md border border-base-300" onClick={(e) => e.stopPropagation()}>
+            <div className="p-4 border-b border-base-300 flex items-center justify-between">
+              <h2 className="text-xl font-bold">{actionModalTitle}</h2>
+              {(!actionModalSubmitted || (!loading && txFinalized)) ? (
+                <button type="button" className="btn btn-ghost btn-sm btn-circle" onClick={closeActionModal} aria-label="Close">×</button>
+              ) : null}
+            </div>
+            <div className="p-4 space-y-4">
+              {!actionModalSubmitted ? (
+                <>
+                  <div>
+                    <label className="label">
+                      <span className="label-text">Amount</span>
+                    </label>
+                    <div className="flex items-center gap-2 rounded-lg bg-base-300/50 p-2">
+                      <input
+                        type="number"
+                        min={0}
+                        step={actionModalAsset === 'usdc' ? 0.000001 : 0.01}
+                        value={modalAmount || ''}
+                        onChange={(e) => setModalAmount(Number(e.target.value) || 0)}
+                        placeholder="0.00"
+                        className="input input-bordered flex-1 bg-transparent border-0 focus:outline-none"
+                      />
+                      <span className="font-medium">{actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}</span>
+                    </div>
+                    <div className="flex items-center justify-between mt-1 text-sm text-base-content/70">
+                      <span>
+                        {(actionModalMode === 'withdraw' || actionModalMode === 'repay')
+                          ? (actionModalMode === 'withdraw' ? 'Supply balance ' : 'Debt ')
+                          : 'Balance '}
+                        {(actionModalMode === 'withdraw' || actionModalMode === 'repay')
+                          ? (actionModalMode === 'withdraw' ? supplyBalanceModal.toFixed(7) : debtBalanceModal.toFixed(7))
+                          : privateBalanceModal.toFixed(7)}
+                        {' '}
+                        <button
+                          type="button"
+                          className="link link-primary text-xs"
+                          onClick={() => setModalAmount(actionModalMode === 'withdraw' || actionModalMode === 'repay' ? (actionModalMode === 'withdraw' ? supplyBalanceModal : debtBalanceModal) : privateBalanceModal)}
+                        >
+                          MAX
+                        </button>
+                      </span>
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-base-300/30 p-3 space-y-2">
+                    <div className="font-medium text-sm">Transaction overview</div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-base-content/70">
+                        {actionModalMode === 'withdraw' ? 'Remaining supply' : actionModalMode === 'deposit' ? 'Supply after' : actionModalMode === 'borrow' ? 'Debt after' : 'Remaining debt'}
+                      </span>
+                      <span>{remainingSupply.toFixed(7)} {actionModalAsset === 'aleo' ? 'ALEO' : 'USDC'}</span>
+                    </div>
+                  </div>
+                  {statusMessage && <p className="text-sm text-error">{statusMessage}</p>}
+                  <button
+                    type="button"
+                    className="btn btn-primary w-full"
+                    disabled={loading || !modalAmount || modalAmount <= 0}
+                    onClick={async () => {
+                      setActionModalSubmitted(true);
+                      if (actionModalAsset === 'usdc') {
+                        await handleActionUsdc(actionModalMode);
+                      } else {
+                        await handleAction(actionModalMode);
+                      }
+                    }}
                   >
-                    lending_pool_v86.aleo
-                  </a>
-                </p>
-              </div>
-              <button
-                onClick={() => refreshPoolState(true)}
-                className="btn btn-sm btn-outline"
-                disabled={loading || isRefreshingState}
-              >
-                {isRefreshingState ? (
-                  <>
-                    <span className="loading loading-spinner loading-xs mr-1" />
-                    Refreshing
-                  </>
-                ) : (
-                  'Refresh'
-                )}
-              </button>
-            </div>
-
-            {/* Public data: on-chain mappings visible to everyone */}
-            <div className="rounded-lg border-l-4 border-info/50 pl-3 py-1">
-            <div className="flex flex-wrap items-center gap-2 mb-2">
-              <span className="badge badge-sm badge-info gap-1">
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3.5 h-3.5" aria-hidden>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 0 1 0-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178Z" />
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
-                </svg>
-                Public
-              </span>
-              <span className="text-xs opacity-70">Pool Overview — read from public on-chain mappings; visible to everyone.</span>
-            </div>
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
-              <div className="p-3 rounded-lg bg-base-300">
-                <div className="flex items-center gap-1">
-                  <p className="opacity-70 text-xs">Total Aleo Supplied</p>
-                  <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip="Total amount of Aleo tokens deposited into the pool by all users">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
-                    </svg>
-                  </div>
-                </div>
-                <p className="text-lg font-semibold">
-                  {((Number(totalSupplied) || 0) / 1_000_000).toFixed(2)}
-                </p>
-              </div>
-              <div className="p-3 rounded-lg bg-base-300">
-                <div className="flex items-center gap-1">
-                  <p className="opacity-70 text-xs">Total Aleo Borrowed</p>
-                  <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip="Total amount of Aleo tokens currently borrowed from the pool by all users">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
-                    </svg>
-                  </div>
-                </div>
-                <p className="text-lg font-semibold">
-                  {((Number(totalBorrowed) || 0) / 1_000_000).toFixed(2)}
-                </p>
-              </div>
-              <div className="p-3 rounded-lg bg-base-300">
-                <div className="flex items-center gap-1">
-                  <p className="opacity-70 text-xs">Available Liquidity</p>
-                  <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip="Amount of Aleo tokens available for borrowing (Total Supplied - Total Borrowed)">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
-                    </svg>
-                  </div>
-                </div>
-                <p className="text-lg font-semibold">
-                  {(
-                    Math.max(
-                      0,
-                      (Number(totalSupplied) || 0) - (Number(totalBorrowed) || 0),
-                    ) / 1_000_000
-                  ).toFixed(2)}
-                </p>
-              </div>
-              <div className="p-3 rounded-lg bg-base-300">
-                <div className="flex items-center gap-1">
-                  <p className="opacity-70 text-xs">Utilization</p>
-                  <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip="Percentage of total supplied tokens that are currently borrowed (Total Borrowed / Total Supplied × 100)">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
-                    </svg>
-                  </div>
-                </div>
-                <p className="text-lg font-semibold">
-                  {totalSupplied && Number(totalSupplied) > 0
-                    ? ((Number(totalBorrowed) / Number(totalSupplied)) * 100).toFixed(2)
-                    : formatScaled(utilizationIndex, 4)}%
-                </p>
-                {isDevAppEnv && (
-                  <p className="text-[10px] opacity-60 mt-1">raw: {utilizationIndex ?? '0'}</p>
-                )}
-              </div>
-              <div className="p-3 rounded-lg bg-base-300">
-                <div className="flex items-center gap-1">
-                  <p className="opacity-70 text-xs">Liquidity Index</p>
-                  <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip="Starts at 1.0 when the pool has no interest yet. It grows over time as the pool earns interest — the higher it is, the more you can withdraw from your deposits.">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
-                    </svg>
-                  </div>
-                </div>
-                <p className="text-lg font-semibold">
-                  {liquidityIndex != null && Number(liquidityIndex) > 0
-                    ? (Number(liquidityIndex) / 1_000_000_000_000).toFixed(6)
-                    : interestIndex != null && Number(interestIndex) > 0
-                      ? formatScaled(interestIndex, 6)
-                      : '1.000000'}
-                </p>
-                {isDevAppEnv && (
-                  <p className="text-[10px] opacity-60 mt-1">raw: {liquidityIndex ?? interestIndex ?? '0'}</p>
-                )}
-              </div>
-              <div className="p-3 rounded-lg bg-base-300">
-                <div className="flex items-center gap-1">
-                  <p className="opacity-70 text-xs">Supply APY</p>
-                  <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip="Current supply APY from utilization and rate model (v85)">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
-                    </svg>
-                  </div>
-                </div>
-                <p className="text-lg font-semibold text-success">{(supplyAPY * 100).toFixed(2)}%</p>
-              </div>
-              <div className="p-3 rounded-lg bg-base-300">
-                <div className="flex items-center gap-1">
-                  <p className="opacity-70 text-xs">Borrow APY</p>
-                  <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip="Current borrow APY from utilization and rate model (v85)">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
-                    </svg>
-                  </div>
-                </div>
-                <p className="text-lg font-semibold text-warning">{(borrowAPY * 100).toFixed(2)}%</p>
-              </div>
-            </div>
-            </div>
-            {/* In production, embed Actions + Your Position + Interest Management inside this Aleo Pool card */}
-            {!isDevAppEnv && connected && (
-              <div className="mt-6 space-y-6">
-                <div className="grid gap-6 md:grid-cols-2">
-                {/* Inline Lending Actions */}
-                <div className="space-y-3">
-                  <h3 className="font-semibold text-sm">Lending/Borrowing Actions</h3>
-                  <p className="text-xs opacity-70">
-                    <span className="inline-block tooltip tooltip-right before:max-w-xs before:whitespace-normal" data-tip="Deposit and Repay use private credits.aleo records. Shown after you connect and refresh.">
-                      Private Aleo balance: <strong>{privateAleoBalance != null ? `${(Math.floor(Number(privateAleoBalance) * 100) / 100).toFixed(2)} credits` : '—'}</strong>
-                    </span>
-                  </p>
-                  <label className="form-control w-full">
-                    <span className="label-text">Amount</span>
-                    <input
-                      type="number"
-                      inputMode="decimal"
-                      placeholder="0"
-                      className={`input input-bordered w-full [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none ${amountError ? 'input-error' : ''}`}
-                      value={amount === 0 ? '' : amount}
-                      onChange={(e) => {
-                        const raw = e.target.value;
-                        setAmountError(null);
-                        if (raw === '' || raw === undefined) {
-                          setAmount(0);
-                          return;
-                        }
-                        const n = Number(raw);
-                        if (!Number.isNaN(n) && n >= 0) setAmount(n);
-                      }}
-                      onKeyDown={(e) => {
-                        if (['e', 'E', '+', '-'].includes(e.key)) e.preventDefault();
-                      }}
-                      disabled={loading || !connected}
-                      min={0}
-                    />
-                    {amountError && (
-                      <p className="mt-1 text-xs text-error">{amountError}</p>
-                    )}
-                  </label>
-
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Deposit Aleo tokens into the pool to earn interest. Your tokens become available for others to borrow.">
-                      <button
-                        type="button"
-                        onClick={() => handleAction('deposit')}
-                        disabled={loading || !connected || amount <= 0}
-                        className="btn btn-outline border-2 min-h-10"
-                        title="Deposit Aleo tokens into the pool to earn interest."
-                      >
-                        {loading ? 'Processing...' : 'Deposit'}
-                      </button>
-                    </span>
-                    <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Borrow Aleo tokens from the pool using your supplied tokens as collateral. You'll pay interest on borrowed amount.">
-                      <button
-                        type="button"
-                        onClick={() => handleAction('borrow')}
-                        disabled={loading || !connected || amount <= 0}
-                        className="btn btn-outline border-2 min-h-10"
-                        title="Borrow Aleo from the pool using your supplied tokens as collateral."
-                      >
-                        Borrow
-                      </button>
-                    </span>
-                    <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Repay borrowed Aleo tokens to reduce your debt. This decreases your total borrowed amount.">
-                      <button
-                        type="button"
-                        onClick={() => handleAction('repay')}
-                        disabled={loading || !connected || amount <= 0}
-                        className="btn btn-outline border-2 min-h-10"
-                        title="Repay borrowed Aleo to reduce your debt."
-                      >
-                        Repay
-                      </button>
-                    </span>
-                    <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Withdraw your supplied Aleo tokens from the pool. You can withdraw up to your net supplied amount (subject to pool liquidity).">
-                      <button
-                        type="button"
-                        onClick={() => handleAction('withdraw')}
-                        disabled={loading || !connected || amount <= 0}
-                        className="btn btn-outline border-2 min-h-10"
-                        title="Withdraw your supplied Aleo from the pool."
-                      >
-                        Withdraw
-                      </button>
-                    </span>
-                  </div>
-                </div>
-
-                {/* Inline Your Position summary — private data from decrypted records */}
-                <div className="space-y-3 rounded-lg border-l-4 border-warning/50 pl-3 py-2">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="font-semibold text-sm">Your Position</h3>
-                    <span className="badge badge-sm badge-warning gap-1">
-                      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3.5 h-3.5" aria-hidden>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
-                      </svg>
-                      Private
-                    </span>
-                  </div>
-                  <p className="text-xs opacity-70">Decrypted from your wallet records — only you see this.</p>
-                  <div className="grid grid-cols-2 gap-3 text-sm">
-                    <div className="p-3 rounded-lg bg-base-300">
-                      <div className="flex items-center gap-1">
-                        <p className="opacity-70 text-xs">Net Supplied</p>
-                        <div
-                          className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal"
-                          data-tip={
-                            effectiveUserSupplied != null
-                              ? `Effective supply balance (with interest): ${formatAleoAmount(
-                                  effectiveUserSupplied,
-                                )} ALEO. You can withdraw up to this amount (subject to pool liquidity).`
-                              : `Your net supplied (Total Deposits - Total Withdrawals = ${
-                                  numericTotalDeposits / 1_000_000
-                                } - ${
-                                  numericTotalWithdrawals / 1_000_000
-                                }). You can withdraw up to this amount, subject to pool liquidity.`
-                          }
+                    {loading ? <span className="loading loading-spinner loading-sm" /> : null}
+                    {!modalAmount || modalAmount <= 0 ? 'Enter an amount' : actionModalTitle}
+                  </button>
+                </>
+              ) : (
+                <div className="space-y-4">
+                  {loading || (txId && !txFinalized) ? (
+                    <div className="flex flex-col items-center justify-center py-8 gap-3">
+                      <span className="loading loading-spinner loading-lg" />
+                      <p className="text-sm text-base-content/70">Processing…</p>
+                    </div>
+                  ) : (
+                    <>
+                      {txFinalized && txId ? (
+                        <a
+                          href={getProvableExplorerTxUrl(txId)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="link link-primary text-base font-medium block text-center py-2"
                         >
-                          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
-                          </svg>
-                        </div>
-                      </div>
-                      <p className="text-lg font-semibold text-success">
-                        {effectiveUserSupplied != null
-                          ? formatAleoAmount(effectiveUserSupplied)
-                          : formatAleoAmount(userSupplied)}
-                      </p>
-                    </div>
-                    <div className="p-3 rounded-lg bg-base-300">
-                      <div className="flex items-center gap-1">
-                        <p className="opacity-70 text-xs">Net Borrowed</p>
-                        <div
-                          className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal"
-                          data-tip={
-                            effectiveUserBorrowed != null
-                              ? `Effective borrow debt (with interest): ${formatAleoAmount(
-                                  effectiveUserBorrowed,
-                                )} ALEO. This is what you owe.`
-                              : `Your net borrowed (Total Borrows - Total Repayments = ${
-                                  numericTotalBorrows / 1_000_000
-                                } - ${
-                                  numericTotalRepayments / 1_000_000
-                                }). This is the amount you need to repay.`
-                          }
+                          View in explorer
+                        </a>
+                      ) : txFinalized ? (
+                        <p className="text-sm text-base-content/70 text-center">Transaction finalized.</p>
+                      ) : null}
+                      {txFinalized && (actionModalMode === 'withdraw' || actionModalMode === 'borrow') && (vaultWithdrawTxId || vaultBorrowTxId) ? (
+                        <a
+                          href={getProvableExplorerTxUrl(vaultWithdrawTxId || vaultBorrowTxId!)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="link link-primary text-base font-medium block text-center py-2"
                         >
-                          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
-                          </svg>
-                        </div>
-                      </div>
-                      <p className="text-lg font-semibold text-error">
-                        {effectiveUserBorrowed != null
-                          ? formatAleoAmount(effectiveUserBorrowed)
-                          : formatAleoAmount(userBorrowed)}
-                      </p>
-                    </div>
-                    <div className="p-3 rounded-lg bg-base-300">
-                      <div className="flex items-center gap-1">
-                        <p className="opacity-70 text-xs">Total Deposits</p>
-                        <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip={`Cumulative total of all Aleo tokens you've deposited into the pool. This is tracked on-chain in the user_total_deposits mapping.`}>
-                          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
-                          </svg>
-                        </div>
-                      </div>
-                      <p className="text-lg font-semibold">
-                        {formatAleoAmount(totalDeposits)}
-                      </p>
-                    </div>
-                    <div className="p-3 rounded-lg bg-base-300">
-                      <div className="flex items-center gap-1">
-                        <p className="opacity-70 text-xs">Total Borrows</p>
-                        <div className="inline-block tooltip tooltip-top before:max-w-xs before:whitespace-normal" data-tip={`Cumulative total of all Aleo tokens you've borrowed from the pool. This is tracked on-chain in the user_total_borrows mapping.`}>
-                          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-3 h-3 opacity-60 cursor-help">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
-                          </svg>
-                        </div>
-                      </div>
-                      <p className="text-lg font-semibold">
-                        {formatAleoAmount(totalBorrows)}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Interest breakdown (Aleo) */}
-                  <div className="mt-2 grid grid-cols-2 gap-3 text-xs">
-                    <div className="p-2 rounded-lg bg-base-300/60">
-                      <p className="opacity-70">Interest earned (Aleo)</p>
-                      <p className="font-semibold text-success">
-                        {formatAleoAmount(interestEarnedAleo, 6)}
-                      </p>
-                    </div>
-                    <div className="p-2 rounded-lg bg-base-300/60">
-                      <p className="opacity-70">Interest owed (Aleo)</p>
-                      <p className="font-semibold text-error">
-                        {formatAleoAmount(interestOwedAleo, 6)}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* How much user can withdraw / needs to repay (use effective balance when available, in ALEO) */}
-                  {(effectiveUserSupplied ?? (Number(userSupplied) || 0)) > 0 && (
-                    <p className="text-xs opacity-80">
-                      You can withdraw up to{' '}
-                      <strong>
-                        {formatAleoAmount(
-                          Math.min(
-                            effectiveUserSupplied ?? (Number(userSupplied) || 0),
-                            Math.max(
-                              0,
-                              (Number(totalSupplied) || 0) - (Number(totalBorrowed) || 0),
-                            ),
-                          ),
-                        )}{' '}
-                        ALEO
-                      </strong>{' '}
-                      from this pool (limited by your position and available liquidity).
-                    </p>
+                          View vault transfer in explorer
+                        </a>
+                      ) : null}
+                      {statusMessage ? <p className="text-sm text-error text-center">{statusMessage}</p> : null}
+                      <button type="button" className="btn btn-primary w-full mt-2" onClick={closeActionModal}>
+                        Close
+                      </button>
+                    </>
                   )}
-                  {(effectiveUserBorrowed ?? (Number(userBorrowed) || 0)) > 0 && (
-                    <p className="text-xs opacity-80">
-                      You need to repay{' '}
-                      <strong>
-                        {formatAleoAmount(
-                          effectiveUserBorrowed != null ? effectiveUserBorrowed : userBorrowed,
-                        )}{' '}
-                        ALEO
-                      </strong>{' '}
-                      to fully clear your debt.
-                    </p>
-                  )}
-                  {(effectiveUserSupplied ?? (Number(userSupplied) || 0)) === 0 &&
-                    (effectiveUserBorrowed ?? (Number(userBorrowed) || 0)) === 0 &&
-                    Number(totalDeposits) === 0 && (
-                      <p className="text-xs opacity-70">
-                        No activity yet. Make a deposit or borrow to open a position.
-                      </p>
-                    )}
                 </div>
-                </div>
-
-                {/* Interest Management — sync pool indices to current block (optional) */}
-                <div className="space-y-3">
-                  <h3 className="font-semibold text-sm">Interest Management</h3>
-                  <p className="text-xs opacity-70">
-                    Sync pool indices to the current block. Optional — they also update when anyone deposits, borrows, repays, or withdraws.
-                  </p>
-                  <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Update liquidity and borrow indices to the current block. Optional — they also update on every deposit, borrow, repay, and withdraw.">
-                    <button
-                      type="button"
-                      onClick={handleAccrueInterest}
-                      disabled={loading || !connected}
-                      className="btn btn-outline border-2 min-h-10"
-                      title="Sync pool interest indices to the current block."
-                    >
-                      {loading ? 'Processing...' : 'Accrue Interest'}
-                    </button>
-                  </span>
-                </div>
-              </div>
-            )}
+              )}
+            </div>
           </div>
+        </div>
+      )}
 
-          {/* USDC Pool (lending_pool_usdce_v86.aleo) — v86 interest/APY; deposit/repay with USDCx; withdraw/borrow state-only */}
-          <div className="rounded-xl bg-base-200 p-6 space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-xl font-semibold">USDC Pool</h2>
-                <p className="text-xs opacity-70">
-                  USDC pool program:{' '}
-                  <a
-                    href="https://testnet.explorer.provable.com/program/lending_pool_usdce_v86.aleo"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="font-mono text-[11px] text-base-content underline decoration-dotted underline-offset-2 hover:decoration-solid"
-                  >
-                    lending_pool_usdce_v86.aleo
-                  </a>
-                </p>
-              </div>
+      <div className="space-y-6 w-full max-w-6xl px-4">
+        {/* Brief loading when wallet state may be restoring after nav (e.g. from Markets) */}
+        {!connected && (connecting || !allowShowConnectCTA) && (
+          <div className="rounded-xl bg-base-200 border border-base-300 flex flex-col items-center justify-center py-16 px-6">
+            <span className="loading loading-spinner loading-lg text-primary" />
+            <p className="text-sm text-base-content/70 mt-3">Loading wallet…</p>
+          </div>
+        )}
+        {/* Aave-style: connect wallet CTA when not connected */}
+        {!connected && !connecting && allowShowConnectCTA && (
+          <div className="rounded-xl bg-base-200 border border-base-300 flex flex-col items-center justify-center py-16 px-6 text-center">
+            <div className="w-24 h-24 rounded-full bg-base-300 flex items-center justify-center mb-4 text-4xl opacity-80" aria-hidden>
+              👻
+            </div>
+            <h2 className="text-xl font-bold mb-2">Please, connect your wallet</h2>
+            <p className="text-base-content/70 text-sm max-w-md mb-6">
+              Connect your wallet to see your supplies, borrowings, and open positions.
+            </p>
+            <div className="wallet-button-wrapper">
+              <WalletMultiButton className="!bg-gradient-to-r !from-primary !to-secondary !border-0 !text-primary-content !font-semibold !px-6 !py-3 !rounded-lg !min-h-0 !h-auto" />
+            </div>
+            <p className="text-xs text-base-content/60 mt-4">
+              Market data is public — view <Link href="/markets" className="link link-primary">Markets</Link> without connecting.
+            </p>
+          </div>
+        )}
+
+        {/* Aave-style merged view when connected */}
+        {connected && (
+          <div className="space-y-4">
+            <div className="flex justify-end">
               <button
-                onClick={() => refreshUsdcPoolState(true)}
-                className="btn btn-sm btn-outline"
-                disabled={loading || isRefreshingUsdcState}
+                type="button"
+                onClick={() => { refreshPoolState(true); refreshUsdcPoolState(true); }}
+                disabled={loading || isRefreshingState || isRefreshingUsdcState}
+                className={`btn btn-sm btn-primary gap-2 text-primary-content border-0 transition-all duration-200 ${
+                  isRefreshingState || isRefreshingUsdcState ? 'cursor-wait opacity-90' : 'hover:opacity-90 active:scale-[0.98]'
+                }`}
+                title={isRefreshingState || isRefreshingUsdcState ? 'Updating pool data…' : 'Reload pool and position data'}
+                aria-busy={isRefreshingState || isRefreshingUsdcState}
               >
-                {isRefreshingUsdcState ? (
+                {(isRefreshingState || isRefreshingUsdcState) ? (
                   <>
-                    <span className="loading loading-spinner loading-xs mr-1" />
-                    Refreshing
+                    <span className="loading loading-spinner loading-sm text-primary-content" />
+                    <span className="text-primary-content">Refreshing…</span>
                   </>
                 ) : (
-                  'Refresh'
+                  <>
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4 text-primary-content" aria-hidden>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+                    </svg>
+                    <span className="text-primary-content">Refresh</span>
+                  </>
                 )}
               </button>
             </div>
 
-            <div className="rounded-lg border border-info/30 bg-info/5 p-3 text-sm">
-              <p className="font-medium text-info mb-1">Deposit / Repay use private USDCx</p>
-              <p className="opacity-90 text-xs">
-                This pool uses <code className="text-[11px]">test_usdcx_stablecoin.aleo/transfer_private</code> (token record + proofs). You need a <strong>private</strong> USDCx Token record. If you received USDC via a <strong>public</strong> transfer (e.g.{' '}
-                <a href="https://testnet.explorer.provable.com/transaction/at103unknystlnafaudl4hvuu54am0a3mjdj42tl9450s9jlwqrwcpquqjeel" target="_blank" rel="noopener noreferrer" className="underline">transfer_public</a>), convert it to private first (e.g. <code className="text-[11px]">transfer_public_to_private</code> in your wallet) so you have a Token record to deposit.
+            <div className="grid gap-6 md:grid-cols-2">
+              {/* Assets to supply — same design as Your supplies */}
+              <div className="rounded-xl bg-base-200 p-5 space-y-4 border border-base-300">
+                <h2 className="text-lg font-semibold text-base-content">Assets to supply</h2>
+                <div className="overflow-x-auto">
+                  <table className="table table-sm">
+                    <thead>
+                      <tr>
+                        <th className="text-base-content/70 font-medium">Asset</th>
+                        <th className="text-base-content/70 font-medium"><PrivateDataColumnHeader label="Wallet balance" /></th>
+                        <th className="text-base-content/70 font-medium">
+                          <span className="inline-flex items-center">
+                            APY
+                            <InfoTooltip
+                              tip="Supply APY is the yearly interest you earn for supplying to this pool. It is based on utilization (total borrowed divided by total supplied) and a reserve factor that keeps a small share of interest in the protocol."
+                            />
+                          </span>
+                        </th>
+                        <th className="text-base-content/70 font-medium">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td><span className="font-medium">ALEO</span></td>
+                        <td className="text-base-content/90">{privateAleoBalance != null ? privateAleoBalance.toFixed(4) : '—'}</td>
+                        <td className="text-base-content">{(supplyAPY * 100).toFixed(2)}%</td>
+                        <td>
+                          <PrivateActionButton onClick={() => openActionModal('deposit', 'aleo')} disabled={loading || !connected}>Supply</PrivateActionButton>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td><span className="font-medium">USDC</span></td>
+                        <td className="text-base-content/90">{privateUsdcBalance != null ? privateUsdcBalance.toFixed(4) : '—'}</td>
+                        <td className="text-base-content">{(supplyAPYUsdc * 100).toFixed(2)}%</td>
+                        <td>
+                          <PrivateActionButton onClick={() => openActionModal('deposit', 'usdc')} disabled={loading || !connected}>Supply</PrivateActionButton>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Assets to borrow — same design as Your borrows */}
+              <div className="rounded-xl bg-base-200 p-5 space-y-4 border border-base-300">
+                <h2 className="text-lg font-semibold text-base-content">Assets to borrow</h2>
+                <div className="overflow-x-auto">
+                  <table className="table table-sm">
+                    <thead>
+                      <tr>
+                        <th className="text-base-content/70 font-medium">Asset</th>
+                        <th className="text-base-content/70 font-medium"><PrivateDataColumnHeader label="Available" /></th>
+                        <th className="text-base-content/70 font-medium">
+                          <span className="inline-flex items-center">
+                            APY
+                            <InfoTooltip
+                              tip="Borrow APY is the yearly interest you pay when borrowing from this pool. The rate increases as utilization (total borrowed divided by total supplied) goes up."
+                            />
+                          </span>
+                        </th>
+                        <th className="text-base-content/70 font-medium">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td><span className="font-medium">ALEO</span></td>
+                        <td className="text-base-content/90">{Math.max(0, ((Number(totalSupplied) || 0) - (Number(totalBorrowed) || 0)) / 1_000_000).toFixed(4)}</td>
+                        <td className="text-base-content">{(borrowAPY * 100).toFixed(2)}%</td>
+                        <td>
+                          <PrivateActionButton onClick={() => openActionModal('borrow', 'aleo')} disabled={loading || !connected}>Borrow</PrivateActionButton>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td><span className="font-medium">USDC</span></td>
+                        <td className="text-base-content/90">{Math.max(0, ((Number(totalSuppliedUsdc) || 0) - (Number(totalBorrowedUsdc) || 0)) / 1_000_000).toFixed(4)}</td>
+                        <td className="text-base-content">{(borrowAPYUsdc * 100).toFixed(2)}%</td>
+                        <td>
+                          <PrivateActionButton onClick={() => openActionModal('borrow', 'usdc')} disabled={loading || !connected}>Borrow</PrivateActionButton>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              {/* Your supplies */}
+              <div className="rounded-xl bg-base-200 p-5 space-y-4 border border-base-300">
+                <h2 className="text-lg font-semibold text-base-content">Your supplies</h2>
+                <div className="overflow-x-auto">
+                  <table className="table table-sm">
+                    <thead>
+                      <tr>
+                        <th className="text-base-content/70 font-medium">Asset</th>
+                        <th className="text-base-content/70 font-medium"><PrivateDataColumnHeader label="Balance" /></th>
+                        <th className="text-base-content/70 font-medium">APY</th>
+                        <th className="text-base-content/70 font-medium">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td><span className="font-medium">ALEO</span></td>
+                        <td className="text-base-content/90">{supplyBalanceAleo.toFixed(4)}</td>
+                        <td className="text-base-content">
+                          <span className="inline-flex items-center">{(supplyAPY * 100).toFixed(2)}%<InfoTooltip tip={tooltipInterestEarnedAleo} /></span>
+                        </td>
+                        <td>
+                          <PrivateActionButton
+                            onClick={() => openActionModal('withdraw', 'aleo', supplyBalanceAleo)}
+                            disabled={loading || !connected || supplyBalanceAleo <= 0}
+                          >
+                            Withdraw
+                          </PrivateActionButton>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td><span className="font-medium">USDC</span></td>
+                        <td className="text-base-content/90">{supplyBalanceUsdc.toFixed(4)}</td>
+                        <td className="text-base-content">
+                          <span className="inline-flex items-center">{(supplyAPYUsdc * 100).toFixed(2)}%<InfoTooltip tip={tooltipInterestEarnedUsdc} /></span>
+                        </td>
+                        <td>
+                          <PrivateActionButton
+                            onClick={() => openActionModal('withdraw', 'usdc', supplyBalanceUsdc)}
+                            disabled={loading || !connected || supplyBalanceUsdc <= 0}
+                          >
+                            Withdraw
+                          </PrivateActionButton>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Your borrows */}
+              <div className="rounded-xl bg-base-200 p-5 space-y-4 border border-base-300">
+                <h2 className="text-lg font-semibold text-base-content">Your borrows</h2>
+                <div className="overflow-x-auto">
+                  <table className="table table-sm">
+                    <thead>
+                      <tr>
+                        <th className="text-base-content/70 font-medium">Asset</th>
+                        <th className="text-base-content/70 font-medium"><PrivateDataColumnHeader label="Debt" /></th>
+                        <th className="text-base-content/70 font-medium">APY</th>
+                        <th className="text-base-content/70 font-medium">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td><span className="font-medium">ALEO</span></td>
+                        <td className="text-base-content/90">{borrowDebtAleo.toFixed(4)}</td>
+                        <td className="text-base-content">
+                          <span className="inline-flex items-center">{(borrowAPY * 100).toFixed(2)}%<InfoTooltip tip={tooltipInterestOwedAleo} /></span>
+                        </td>
+                        <td>
+                          <PrivateActionButton onClick={() => openActionModal('repay', 'aleo', borrowDebtAleo)} disabled={loading || !connected || borrowDebtAleo <= 0}>Repay</PrivateActionButton>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td><span className="font-medium">USDC</span></td>
+                        <td className="text-base-content/90">{borrowDebtUsdc.toFixed(4)}</td>
+                        <td className="text-base-content">
+                          <span className="inline-flex items-center">{(borrowAPYUsdc * 100).toFixed(2)}%<InfoTooltip tip={tooltipInterestOwedUsdc} /></span>
+                        </td>
+                        <td>
+                          <PrivateActionButton onClick={() => openActionModal('repay', 'usdc', borrowDebtUsdc)} disabled={loading || !connected || borrowDebtUsdc <= 0}>Repay</PrivateActionButton>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Transaction history (Supabase – fetched by wallet address) */}
+        <div className="rounded-xl bg-base-200 p-6 border border-base-300 mb-8 pb-2">
+          <div className="flex items-center justify-between gap-4 mb-2">
+            <h2 className="text-xl font-semibold text-base-content">Transaction history</h2>
+            <Button variant="ghost" size="small" onClick={fetchTransactionHistory} disabled={txHistoryLoading || !address}>
+              {txHistoryLoading ? 'Loading…' : 'Refresh'}
+            </Button>
+          </div>
+          <p className="text-sm text-base-content/70 mb-4">Fetched by your connected wallet address. All deposit, withdraw, borrow, and repay transactions are stored and listed here.</p>
+          {txHistoryError ? (
+            <div className="rounded-lg bg-warning/10 border border-warning/30 p-4 text-sm text-warning">
+              <p className="font-medium">Could not load transaction history</p>
+              <p className="mt-1">{txHistoryError}</p>
+              <p className="mt-2 text-base-content/70">
+                Ensure you ran <code className="text-xs bg-base-300 px-1 rounded">supabase/schema.sql</code> in Supabase SQL Editor and that{' '}
+                <code className="text-xs bg-base-300 px-1 rounded">.env</code> has NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUB_KEY (Publishable key).
               </p>
             </div>
-
-            <div className="rounded-lg border-l-4 border-info/50 pl-3 py-1">
-              <div className="flex flex-wrap items-center gap-2 mb-2">
-                <span className="badge badge-sm badge-info gap-1">Public</span>
-                <span className="text-xs opacity-70">Pool Overview — USDC supplied/borrowed.</span>
+          ) : txHistoryLoading && txHistory.length === 0 ? (
+            <p className="text-base-content/70">Loading transactions…</p>
+          ) : txHistory.length === 0 ? (
+            <p className="text-base-content/70">
+              No transactions yet. Deposit, withdraw, borrow, or repay to see history here.
+            </p>
+          ) : (
+            <>
+              <div className="overflow-x-auto">
+                <table className="table table-zebra w-full">
+                  <thead>
+                    <tr>
+                      <th className="text-base-content/70 font-medium">Date</th>
+                      <th className="text-base-content/70 font-medium">Type</th>
+                      <th className="text-base-content/70 font-medium">Asset</th>
+                      <th className="text-base-content/70 font-medium">Amount</th>
+                      <th className="text-base-content/70 font-medium">Transaction</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(() => {
+                      const pageSize = 10;
+                      const totalPages = Math.max(1, Math.ceil(txHistory.length / pageSize));
+                      const currentPage = Math.min(txHistoryPage, totalPages);
+                      const startIndex = (currentPage - 1) * pageSize;
+                      const pageItems = txHistory.slice(startIndex, startIndex + pageSize);
+                      return pageItems.map((row) => (
+                        <tr key={row.id}>
+                          <td className="text-base-content/90">
+                            {new Date(row.created_at).toLocaleString()}
+                          </td>
+                          <td className="capitalize">{row.type}</td>
+                          <td className="uppercase">{row.asset}</td>
+                          <td>
+                            {Number(row.amount).toLocaleString(undefined, {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 6,
+                            })}
+                          </td>
+                          <td className="space-y-1">
+                            {row.explorer_url ? (
+                              <a
+                                href={row.explorer_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="link link-primary block"
+                              >
+                                View on Explorer
+                              </a>
+                            ) : (
+                              <span
+                                className="font-mono text-sm truncate max-w-[120px] inline-block"
+                                title={row.tx_id}
+                              >
+                                {row.tx_id}
+                              </span>
+                            )}
+                            {row.vault_explorer_url ? (
+                              <a
+                                href={row.vault_explorer_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="link link-secondary block text-sm"
+                              >
+                                Vault transfer
+                              </a>
+                            ) : null}
+                          </td>
+                        </tr>
+                      ));
+                    })()}
+                  </tbody>
+                </table>
               </div>
-              <div className="grid grid-cols-2 md:grid-cols-6 gap-4 text-sm">
-                <div className="p-3 rounded-lg bg-base-300">
-                  <p className="opacity-70 text-xs">Total USDC Supplied</p>
-                  <p className="text-lg font-semibold">{((Number(totalSuppliedUsdc) || 0) / 1_000_000).toFixed(2)}</p>
+              {txHistory.length > 10 && (
+                <div className="flex items-center justify-between mt-3 text-xs text-base-content/70">
+                  {(() => {
+                    const pageSize = 10;
+                    const totalPages = Math.max(1, Math.ceil(txHistory.length / pageSize));
+                    const currentPage = Math.min(txHistoryPage, totalPages);
+                    const startIndex = (currentPage - 1) * pageSize;
+                    const endIndex = Math.min(startIndex + pageSize, txHistory.length);
+                    return (
+                      <>
+                        <span>
+                          Showing {startIndex + 1}–{endIndex} of {txHistory.length} transactions
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <Button
+                            variant="ghost"
+                            size="small"
+                            disabled={currentPage === 1}
+                            onClick={() => setTxHistoryPage((p) => Math.max(1, p - 1))}
+                          >
+                            Previous
+                          </Button>
+                          <span>
+                            Page {currentPage} of {totalPages}
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="small"
+                            disabled={currentPage === totalPages}
+                            onClick={() =>
+                              setTxHistoryPage((p) => Math.min(totalPages, p + 1))
+                            }
+                          >
+                            Next
+                          </Button>
+                        </div>
+                      </>
+                    );
+                  })()}
                 </div>
-                <div className="p-3 rounded-lg bg-base-300">
-                  <p className="opacity-70 text-xs">Total USDC Borrowed</p>
-                  <p className="text-lg font-semibold">{((Number(totalBorrowedUsdc) || 0) / 1_000_000).toFixed(2)}</p>
-                </div>
-                <div className="p-3 rounded-lg bg-base-300">
-                  <p className="opacity-70 text-xs">Available Liquidity</p>
-                  <p className="text-lg font-semibold">
-                    {(Math.max(0, (Number(totalSuppliedUsdc) || 0) - (Number(totalBorrowedUsdc) || 0)) / 1_000_000).toFixed(2)}
-                  </p>
-                </div>
-                <div className="p-3 rounded-lg bg-base-300">
-                  <p className="opacity-70 text-xs">Utilization</p>
-                  <p className="text-lg font-semibold">{formatScaled(utilizationIndexUsdc, 4)}%</p>
-                </div>
-                <div className="p-3 rounded-lg bg-base-300">
-                  <p className="opacity-70 text-xs">Liquidity Index</p>
-                  <p className="text-lg font-semibold">
-                    {liquidityIndexUsdc != null && Number(liquidityIndexUsdc) > 0
-                      ? (Number(liquidityIndexUsdc) / 1_000_000_000_000).toFixed(6)
-                      : '1.000000'}
-                  </p>
-                </div>
-                <div className="p-3 rounded-lg bg-base-300">
-                  <p className="opacity-70 text-xs">Supply APY</p>
-                  <p className="text-lg font-semibold text-success">{(supplyAPYUsdc * 100).toFixed(2)}%</p>
-                </div>
-                <div className="p-3 rounded-lg bg-base-300">
-                  <p className="opacity-70 text-xs">Borrow APY</p>
-                  <p className="text-lg font-semibold text-error">{(borrowAPYUsdc * 100).toFixed(2)}%</p>
-                </div>
-              </div>
-            </div>
-
-            {connected && (
-              <div className="mt-6 grid gap-6 md:grid-cols-2">
-                <div className="space-y-3">
-                  <h3 className="font-semibold text-sm">USDC Lending/Borrowing</h3>
-                  <p className="text-xs opacity-70">
-                    Private USDC balance: <strong>{privateUsdcBalance != null ? `${(Math.floor(Number(privateUsdcBalance) * 100) / 100).toFixed(2)} USDC` : '—'}</strong>
-                  </p>
-                  <label className="form-control w-full">
-                    <span className="label-text">Amount (USDC)</span>
-                    <input
-                      type="number"
-                      inputMode="decimal"
-                      placeholder="0"
-                      className={`input input-bordered w-full [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none ${amountErrorUsdc ? 'input-error' : ''}`}
-                      value={amountUsdc === 0 ? '' : amountUsdc}
-                      onChange={(e) => {
-                        setAmountErrorUsdc(null);
-                        const raw = e.target.value;
-                        if (raw === '' || raw === undefined) {
-                          setAmountUsdc(0);
-                          return;
-                        }
-                        const n = Number(raw);
-                        if (!Number.isNaN(n) && n >= 0) setAmountUsdc(n);
-                      }}
-                      onKeyDown={(e) => {
-                        if (['e', 'E', '+', '-'].includes(e.key)) e.preventDefault();
-                      }}
-                      disabled={loading || !connected}
-                      min={0}
-                    />
-                    {amountErrorUsdc && (
-                      <p className="mt-1 text-xs text-error">{amountErrorUsdc}</p>
-                    )}
-                  </label>
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => handleActionUsdc('deposit')}
-                      disabled={loading || !connected || amountUsdc <= 0}
-                      className="btn btn-outline border-2 min-h-10"
-                      title="Deposit USDC into the pool."
-                    >
-                      {loading ? 'Processing...' : 'Deposit'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleActionUsdc('borrow')}
-                      disabled={loading || !connected || amountUsdc <= 0}
-                      className="btn btn-outline border-2 min-h-10"
-                      title="Borrow USDC from the pool."
-                    >
-                      Borrow
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleActionUsdc('repay')}
-                      disabled={loading || !connected || amountUsdc <= 0}
-                      className="btn btn-outline border-2 min-h-10"
-                      title="Repay borrowed USDC."
-                    >
-                      Repay
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleActionUsdc('withdraw')}
-                      disabled={loading || !connected || amountUsdc <= 0}
-                      className="btn btn-outline border-2 min-h-10"
-                      title="Withdraw your supplied USDC."
-                    >
-                      Withdraw
-                    </button>
-                  </div>
-                </div>
-                <div className="space-y-3 rounded-lg border-l-4 border-warning/50 pl-3 py-2">
-                  <h3 className="font-semibold text-sm">Your USDC Position</h3>
-                  <p className="text-xs opacity-70">From lending_pool_usdce_v86.aleo (effective = scaled × index).</p>
-                  <div className="grid grid-cols-2 gap-3 text-sm">
-                    <div className="p-3 rounded-lg bg-base-300">
-                      <p className="opacity-70 text-xs">Effective Supplied</p>
-                      <p className="text-lg font-semibold text-success">
-                        {effectiveUserSuppliedUsdc != null
-                          ? (effectiveUserSuppliedUsdc / 1_000_000).toFixed(2)
-                          : (Number(userSuppliedUsdc) / 1_000_000).toFixed(2)}
-                      </p>
-                    </div>
-                    <div className="p-3 rounded-lg bg-base-300">
-                      <p className="opacity-70 text-xs">Effective Borrowed</p>
-                      <p className="text-lg font-semibold text-error">
-                        {effectiveUserBorrowedUsdc != null
-                          ? (effectiveUserBorrowedUsdc / 1_000_000).toFixed(2)
-                          : (Number(userBorrowedUsdc) / 1_000_000).toFixed(2)}
-                      </p>
-                    </div>
-                    <div className="p-3 rounded-lg bg-base-300">
-                      <p className="opacity-70 text-xs">Total Deposits</p>
-                      <p className="text-lg font-semibold">{(Number(totalDepositsUsdc) / 1_000_000).toFixed(2)}</p>
-                    </div>
-                    <div className="p-3 rounded-lg bg-base-300">
-                      <p className="opacity-70 text-xs">Total Borrows</p>
-                      <p className="text-lg font-semibold">{(Number(totalBorrowsUsdc) / 1_000_000).toFixed(2)}</p>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-3 text-sm">
-                    <div className="p-3 rounded-lg bg-base-300">
-                      <p className="opacity-70 text-xs">Interest Earned</p>
-                      <p className="text-lg font-semibold text-success">
-                        {interestEarnedUsdc.toFixed(6)} USDC
-                      </p>
-                    </div>
-                    <div className="p-3 rounded-lg bg-base-300">
-                      <p className="opacity-70 text-xs">Interest Owed</p>
-                      <p className="text-lg font-semibold text-error">
-                        {interestOwedUsdc.toFixed(6)} USDC
-                      </p>
-                    </div>
-                  </div>
-                  {(effectiveUserSuppliedUsdc ?? Number(userSuppliedUsdc)) > 0 && (
-                    <p className="text-xs opacity-80">
-                      You can withdraw up to <strong>{((effectiveUserSuppliedUsdc ?? Number(userSuppliedUsdc)) / 1_000_000).toFixed(2)}</strong> USDC.
-                    </p>
-                  )}
-                  {(effectiveUserBorrowedUsdc ?? Number(userBorrowedUsdc)) > 0 && (
-                    <p className="text-xs opacity-80">
-                      Repay <strong>{((effectiveUserBorrowedUsdc ?? Number(userBorrowedUsdc)) / 1_000_000).toFixed(2)}</strong> USDC to clear debt.
-                    </p>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {connected && (
-              <div className="mt-4 space-y-3">
-                <h3 className="font-semibold text-sm">USDC Interest Management</h3>
-                <p className="text-xs opacity-70">
-                  Sync USDC pool indices (liquidity and borrow) to the current block. Optional — they also update when anyone deposits, borrows, repays, or withdraws.
-                </p>
-                <button
-                  type="button"
-                  onClick={handleAccrueInterestUsdc}
-                  disabled={loading || !connected}
-                  className="btn btn-outline border-2 min-h-10"
-                  title="Sync USDC pool interest indices to the current block."
-                >
-                  {loading ? 'Processing...' : 'Accrue Interest (USDC)'}
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* Actions + Interest Management (dev-only full panel) */}
-          {isDevAppEnv && connected && (
-            <div className="rounded-xl bg-base-200 p-6 space-y-4">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-semibold">Actions</h2>
-                <span className="text-[11px] opacity-60">
-                  Interest controls are for operator / testing only.
-                </span>
-              </div>
-
-              <div className="grid gap-6 md:grid-cols-2">
-                {/* Lending Actions */}
-                <div className="space-y-3">
-                  <h3 className="font-semibold text-sm">Lending/Borrowing Actions</h3>
-                  <p className="text-xs opacity-70">
-                    Private Aleo balance: <strong>{privateAleoBalance != null ? `${(Math.floor(Number(privateAleoBalance) * 100) / 100).toFixed(2)} credits` : '—'}</strong>
-                  </p>
-                  <label className="form-control w-full">
-                    <span className="label-text">Amount</span>
-                    <input
-                      type="number"
-                      inputMode="decimal"
-                      placeholder="0"
-                      className={`input input-bordered w-full [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none ${amountError ? 'input-error' : ''}`}
-                      value={amount === 0 ? '' : amount}
-                      onChange={(e) => {
-                        const raw = e.target.value;
-                        setAmountError(null);
-                        if (raw === '' || raw === undefined) {
-                          setAmount(0);
-                          return;
-                        }
-                        const n = Number(raw);
-                        if (!Number.isNaN(n) && n >= 0) setAmount(n);
-                      }}
-                      onKeyDown={(e) => {
-                        if (['e', 'E', '+', '-'].includes(e.key)) e.preventDefault();
-                      }}
-                      disabled={loading || !connected}
-                      min={0}
-                    />
-                    {amountError && (
-                      <p className="mt-1 text-xs text-error">{amountError}</p>
-                    )}
-                  </label>
-
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Deposit Aleo tokens into the pool to earn interest. Your tokens become available for others to borrow.">
-                      <button
-                        type="button"
-                        onClick={() => handleAction('deposit')}
-                        disabled={loading || !connected || amount <= 0}
-                        className="btn btn-outline border-2 min-h-10"
-                        title="Deposit Aleo tokens into the pool to earn interest."
-                      >
-                        {loading ? 'Processing...' : 'Deposit'}
-                      </button>
-                    </span>
-                    <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Borrow Aleo tokens from the pool using your supplied tokens as collateral. You'll pay interest on borrowed amount.">
-                      <button
-                        type="button"
-                        onClick={() => handleAction('borrow')}
-                        disabled={loading || !connected || amount <= 0}
-                        className="btn btn-outline border-2 min-h-10"
-                        title="Borrow Aleo from the pool using your supplied tokens as collateral."
-                      >
-                        Borrow
-                      </button>
-                    </span>
-                    <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Repay borrowed Aleo tokens to reduce your debt. This decreases your total borrowed amount.">
-                      <button
-                        type="button"
-                        onClick={() => handleAction('repay')}
-                        disabled={loading || !connected || amount <= 0}
-                        className="btn btn-outline border-2 min-h-10"
-                        title="Repay borrowed Aleo to reduce your debt."
-                      >
-                        Repay
-                      </button>
-                    </span>
-                    <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Withdraw your supplied Aleo tokens from the pool. You can withdraw up to your net supplied amount (subject to pool liquidity).">
-                      <button
-                        type="button"
-                        onClick={() => handleAction('withdraw')}
-                        disabled={loading || !connected || amount <= 0}
-                        className="btn btn-outline border-2 min-h-10"
-                        title="Withdraw your supplied Aleo from the pool."
-                      >
-                        Withdraw
-                      </button>
-                    </span>
-                  </div>
-                </div>
-
-                {/* Interest Management (v85: optional — indices also update on deposit/borrow/repay/withdraw) */}
-                <div className="space-y-3">
-                  <h3 className="font-semibold text-sm">Interest Management</h3>
-                  <p className="text-xs opacity-70">
-                    Sync pool indices to the current block. Optional — they also update when anyone deposits, borrows, repays, or withdraws.
-                  </p>
-                  <span className="inline-block tooltip tooltip-bottom tooltip-button before:max-w-xs before:whitespace-normal" data-tip="Update liquidity and borrow indices to the current block. Optional — they also update on every deposit, borrow, repay, and withdraw.">
-                    <button
-                      type="button"
-                      onClick={handleAccrueInterest}
-                      disabled={loading || !connected}
-                      className="btn btn-outline border-2 min-h-10"
-                      title="Sync pool interest indices to the current block."
-                    >
-                      {loading ? 'Processing...' : 'Accrue Interest'}
-                    </button>
-                  </span>
-                </div>
-              </div>
-            </div>
+              )}
+            </>
           )}
         </div>
 
       </div>
-
-      {/* Testing tools removed: no direct credits.aleo wallet usage in UI now */}
 
       {isDevAppEnv && (
         <div className="rounded-xl bg-base-200 p-6 space-y-4 border-2 border-info">
@@ -2390,12 +2356,12 @@ const DashboardPage: NextPageWithLayout = () => {
               </pre>
               {txFinalized && isExplorerHash(txId) ? (
                 <a
-                  href={getExplorerTxUrl(txId)}
+                  href={getProvableExplorerTxUrl(txId)}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="link link-primary text-sm mt-2 inline-block"
                 >
-                  View on Explorer →
+                  View on Provable Explorer →
                 </a>
               ) : txFinalized ? (
                 <p className="text-xs opacity-70 mt-2">

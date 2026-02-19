@@ -21,6 +21,7 @@ import '@provablehq/aleo-wallet-adaptor-react-ui/dist/styles.css';
 import '@/assets/css/globals.css';
 
 import { CURRENT_NETWORK, CURRENT_RPC_URL } from '@/types';
+import { WalletPersistence } from '@/components/WalletPersistence';
 
 // Initialize the wallet adapters outside the component
 // Currently only Shield Wallet is enabled in the connect modal.
@@ -44,7 +45,6 @@ function CustomApp({ Component, pageProps }: AppPropsWithLayout) {
         <Hydrate state={pageProps.dehydratedState}>
           <AleoWalletProvider
             wallets={wallets}
-            // Keep autoConnect off to avoid infinite connecting loops
             autoConnect={false}
             network={Network.TESTNET}
             // Request AUTO_DECRYPT permission so the wallet can automatically
@@ -54,11 +54,13 @@ function CustomApp({ Component, pageProps }: AppPropsWithLayout) {
             programs={['lending_pool_v86.aleo', 'lending_pool_usdce_v86.aleo', 'test_usdcx_stablecoin.aleo', 'credits.aleo']}
             onError={(error) => console.error(error.message)}
           >
+            <WalletPersistence>
             <WalletModalProvider>
               <ThemeProvider attribute="data-theme" enableSystem={true} defaultTheme="dark">
                 {getLayout(<Component {...pageProps} />)}
               </ThemeProvider>
             </WalletModalProvider>
+            </WalletPersistence>
           </AleoWalletProvider>
         </Hydrate>
         <ReactQueryDevtools initialIsOpen={false} position="bottom-right" />
