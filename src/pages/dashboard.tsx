@@ -1895,7 +1895,9 @@ const DashboardPage: NextPageWithLayout = () => {
                           View vault transfer in explorer
                         </a>
                       ) : null}
-                      {statusMessage ? <p className="text-sm text-error text-center">{statusMessage}</p> : null}
+                      {statusMessage && !txFinalized ? (
+                        <p className="text-sm text-error text-center">{statusMessage}</p>
+                      ) : null}
                       <button type="button" className="btn btn-primary w-full mt-2" onClick={closeActionModal}>
                         Close
                       </button>
