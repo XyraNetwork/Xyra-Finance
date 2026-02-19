@@ -1,5 +1,5 @@
 import { JSONRPCClient } from 'json-rpc-2.0';
-import { BOUNTY_PROGRAM_ID, CURRENT_NETWORK, CURRENT_RPC_URL } from '@/types';
+import { BOUNTY_PROGRAM_ID, USDC_POOL_PROGRAM_ID, USDC_TOKEN_PROGRAM_ID, CURRENT_NETWORK, CURRENT_RPC_URL } from '@/types';
 import { Network } from '@provablehq/aleo-types';
 import { frontendLogger } from '@/utils/logger';
 import { TREASURY_ADDRESS, getTreasuryRequestMessage } from '@/config/treasury';
@@ -7,8 +7,10 @@ import { TREASURY_ADDRESS, getTreasuryRequestMessage } from '@/config/treasury';
 // Note: @aleohq/wasm is not imported directly due to WASM build issues in Next.js
 // We'll use dynamic import when needed, or fall back to contract call method
 
-// For clarity, alias the lending pool program ID.
+// For clarity, alias the lending pool program IDs.
 export const LENDING_POOL_PROGRAM_ID = BOUNTY_PROGRAM_ID;
+export const USDC_LENDING_POOL_PROGRAM_ID = USDC_POOL_PROGRAM_ID;
+export const CREDITS_PROGRAM_ID = 'credits.aleo';
 
 /**
  * Debug function to diagnose what records are available in the wallet
@@ -438,15 +440,73 @@ async function getOrCreateActivity(
 }
 
 /**
- * Deposit into the lending pool using executeTransaction (starter-style API).
- * v8 API: deposit(public amount: u64) -> (UserActivity, Future)
+ * Get total spendable private Aleo balance (credits.aleo records) in credits.
+ * Sums microcredits from all unspent credits.aleo records; uses decrypt for private records.
+ * Returns 0 if no records or on error.
+ */
+export async function getPrivateCreditsBalance(
+  requestRecords: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>
+): Promise<number> {
+  try {
+    const records = await requestRecords(CREDITS_PROGRAM_ID, false);
+    if (!records || !Array.isArray(records)) return 0;
+    const getMicrocredits = (r: any): number => {
+      try {
+        if (r.data?.microcredits) {
+          return parseInt(String(r.data.microcredits).replace(/\D/g, ''), 10) || 0;
+        }
+        if (r.plaintext) {
+          const m = String(r.plaintext).match(/microcredits:\s*([\d_]+)u64/);
+          return m ? parseInt(m[1].replace(/_/g, ''), 10) : 0;
+        }
+      } catch {
+        return 0;
+      }
+      return 0;
+    };
+    let totalMicro = 0;
+    for (const r of records as any[]) {
+      if (r.spent) continue;
+      let micro = getMicrocredits(r);
+      if (micro === 0 && (r.recordCiphertext || r.ciphertext) && decrypt) {
+        try {
+          const plain = await decrypt(r.recordCiphertext || r.ciphertext);
+          if (plain) {
+            const m = plain.match(/microcredits:\s*([\d_]+)u64/);
+            micro = m ? parseInt(m[1].replace(/_/g, ''), 10) : 0;
+          }
+        } catch {
+          // skip
+        }
+      }
+      totalMicro += micro;
+    }
+    return totalMicro / 1_000_000;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Deposit into the lending pool using a real `credits.aleo/credits` record.
+ *
+ * Contract: lending_pool_v86.aleo
+ *   async transition deposit_with_credits(
+ *     pay_record: credits.aleo/credits,
+ *     public amount: u64,
+ *     public current_block: u64
+ *   ) -> (UserActivity, credits.aleo/credits, Future)
  */
 export async function lendingDeposit(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
   amount: number,
+  publicKey?: string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
 ): Promise<string> {
   console.log('========================================');
-  console.log('💰 LENDING DEPOSIT FUNCTION CALLED (executeTransaction)');
+  console.log('💰 LENDING DEPOSIT (credits) CALLED');
   console.log('========================================');
   console.log('📥 Input Parameters:', {
     amount,
@@ -457,30 +517,128 @@ export async function lendingDeposit(
   if (!executeTransaction) {
     throw new Error('executeTransaction is not available from the connected wallet.');
   }
-
+  if (!publicKey || !requestRecords) {
+    throw new Error('Wallet not connected or record access (requestRecords) unavailable.');
+  }
   if (amount <= 0) {
     throw new Error('Deposit amount must be greater than 0');
   }
 
   try {
-    const inputs = [`${amount}u64`];
+    // Convert amount (credits) to microcredits. We allow decimals (up to 6 places),
+    // rounding to the nearest micro credit. Pool expects micro-ALEO as its `amount`.
+    const amountMicro = Math.round(amount * 1_000_000);
+    const requiredMicro = amountMicro;
 
-    // Optional: best-effort deploy check
-    try {
-      const poolState = await getLendingPoolState();
-      console.log('✅ Contract appears to be deployed (pool state accessible)', poolState);
-    } catch (deployError: any) {
-      console.warn('⚠️ Could not verify contract deployment:', deployError?.message);
+    console.log('🔍 Fetching credits.aleo records for deposit...', {
+      CREDITS_PROGRAM_ID,
+      requiredMicro,
+    });
+
+    let records = await requestRecords(CREDITS_PROGRAM_ID, false);
+    if (!records || !Array.isArray(records)) records = [];
+
+    console.log(`📋 Found ${records.length} credits.aleo records`);
+
+    // Helper similar to NullPay: extract microcredits from data or plaintext
+    const getMicrocredits = (record: any): number => {
+      try {
+        if (record.data && record.data.microcredits) {
+          return parseInt(String(record.data.microcredits).replace('u64', ''), 10);
+        }
+        if (record.plaintext) {
+          const match = String(record.plaintext).match(/microcredits:\s*([\d_]+)u64/);
+          if (match && match[1]) {
+            return parseInt(match[1].replace(/_/g, ''), 10);
+          }
+        }
+      } catch {
+        // ignore
+      }
+      return 0;
+    };
+
+    const processRecord = async (r: any): Promise<number> => {
+      let val = getMicrocredits(r);
+      if (val === 0 && r.recordCiphertext && !r.plaintext && decrypt) {
+        try {
+          const decrypted = await decrypt(r.recordCiphertext);
+          if (decrypted) {
+            r.plaintext = decrypted;
+            val = getMicrocredits(r);
+          }
+        } catch (e) {
+          console.warn('⚠️ Failed to decrypt credits record for deposit:', e);
+        }
+      }
+      return val;
+    };
+
+    let payRecord: any | null = null;
+    for (const r of records as any[]) {
+      if (r.spent) continue;
+      const val = await processRecord(r);
+      const isSpendable = !!(r.plaintext || r.nonce || r._nonce || r.data?._nonce || r.ciphertext);
+      if (isSpendable && val >= requiredMicro) {
+        payRecord = r;
+        break;
+      }
     }
 
-    console.log('🔍 Calling executeTransaction for deposit (public fee)...');
+    if (!payRecord) {
+      throw new Error(
+        `No credits.aleo record found with enough microcredits for amount ${amount}. ` +
+          `Make sure you have at least ${amount} private credits in one record.`,
+      );
+    }
+
+    console.log('✅ Selected credits.aleo record for deposit:', {
+      preview: JSON.stringify(payRecord).slice(0, 200),
+    });
+
+    // Build Leo-compatible record input (plaintext or ciphertext), like NullPay.
+    let recordInput: string | any = payRecord.plaintext;
+
+    if (!recordInput) {
+      console.warn('⚠️ Credits record missing plaintext. Attempting to reconstruct...');
+      const nonce = payRecord.nonce || payRecord._nonce || payRecord.data?._nonce;
+      const micro = getMicrocredits(payRecord);
+      const owner = payRecord.owner;
+
+      if (nonce && micro > 0 && owner) {
+        recordInput = `{ owner: ${owner}.private, microcredits: ${micro}u64.private, _nonce: ${nonce}.public }`;
+        console.log('✅ Reconstructed credits plaintext for deposit:', recordInput);
+      } else if (payRecord.ciphertext || payRecord.recordCiphertext) {
+        recordInput = payRecord.ciphertext || payRecord.recordCiphertext;
+        console.log('✅ Using credits ciphertext for deposit input.');
+      } else {
+        console.warn('⚠️ Could not reconstruct credits record; passing raw object (last resort).');
+        recordInput = payRecord;
+      }
+    }
+
+    const amountInput = `${amountMicro}u64`;
+    const currentBlock = await getLatestBlockHeight();
+    const currentBlockInput = `${Math.max(0, currentBlock)}u64`;
+    const inputs: any[] = [recordInput, amountInput, currentBlockInput];
+
+    console.log('🔍 Calling executeTransaction for deposit_with_credits...', {
+      program: LENDING_POOL_PROGRAM_ID,
+      function: 'deposit_with_credits',
+      inputsPreview: {
+        input0_len: recordInput.length,
+        input1: amountInput,
+        input2: currentBlockInput,
+      },
+    });
+
     const result = await executeTransaction({
       program: LENDING_POOL_PROGRAM_ID,
-      function: 'deposit',
+      function: 'deposit_with_credits',
       inputs,
       fee: DEFAULT_LENDING_FEE * 1_000_000,
-      // Match aleo-dev-toolkit's ExecuteTransaction example: `privateFee` controls fee privacy
       privateFee: false,
+      recordIndices: [0],
     });
 
     const tempId: string | undefined = result?.transactionId;
@@ -488,10 +646,10 @@ export async function lendingDeposit(
       throw new Error('Deposit failed: No temporary transactionId returned from wallet.');
     }
 
-    console.log('Temporary Transaction ID (deposit):', tempId);
+    console.log('Temporary Transaction ID (deposit_with_credits):', tempId);
     return tempId;
   } catch (error: any) {
-    console.error('❌ LENDING DEPOSIT FUNCTION FAILED:', error);
+    console.error('❌ LENDING DEPOSIT (credits) FAILED:', error);
 
     const rawMsg = String(error?.message || error || '').toLowerCase();
     const isCancelled =
@@ -505,7 +663,6 @@ export async function lendingDeposit(
 
     if (isCancelled) {
       console.warn('💡 Deposit transaction cancelled by user (handled gracefully).');
-      // Sentinel value for cancellation – caller should interpret and NOT treat as error.
       return '__CANCELLED__';
     }
 
@@ -533,22 +690,28 @@ export async function lendingBorrow(
   }
 
   try {
-    const inputs = [`${amount}u64`];
+    const amountMicro = Math.round(amount * 1_000_000);
+    const currentBlock = await getLatestBlockHeight();
+    const currentBlockInput = `${Math.max(0, currentBlock)}u64`;
+    const inputs = [`${amountMicro}u64`, currentBlockInput];
 
     // Check pool liquidity (same logic as before)
     try {
       const poolState = await getLendingPoolState();
-      const totalSupplied = poolState.totalSupplied ? Number(poolState.totalSupplied) : 0;
-      const totalBorrowed = poolState.totalBorrowed ? Number(poolState.totalBorrowed) : 0;
-      const availableLiquidity = totalSupplied - totalBorrowed;
+      const totalSuppliedMicro = poolState.totalSupplied ? Number(poolState.totalSupplied) : 0;
+      const totalBorrowedMicro = poolState.totalBorrowed ? Number(poolState.totalBorrowed) : 0;
+      const availableLiquidityCredits = Math.max(
+        0,
+        (totalSuppliedMicro - totalBorrowedMicro) / 1_000_000,
+      );
 
-      if (totalSupplied === 0) {
+      if (totalSuppliedMicro === 0) {
         throw new Error('Cannot borrow: No liquidity in the pool. Please deposit first.');
       }
 
-      if (amount > availableLiquidity) {
+      if (amount > availableLiquidityCredits) {
         throw new Error(
-          `Cannot borrow: Insufficient liquidity. Available: ${availableLiquidity}, Requested: ${amount}`,
+          `Cannot borrow: Insufficient liquidity. Available: ${availableLiquidityCredits}, Requested: ${amount}`,
         );
       }
     } catch (error: any) {
@@ -597,34 +760,148 @@ export async function lendingBorrow(
 }
 
 /**
- * Repay to the lending pool using wallet adapter (v8 - simplified API).
- * v8 API: repay(public amount: u64) -> (UserActivity, Future)
- * - Updates public pool state (total_borrowed, utilization_index)
- * - Updates private user mappings (increments total_repayments counter)
- * - No Credits record needed - just amount
+ * Repay to the lending pool using a real `credits.aleo/credits` record.
+ *
+ * Contract: lending_pool_v86.aleo
+ *   async transition repay_with_credits(
+ *     pay_record: credits.aleo/credits,
+ *     public amount: u64,
+ *     public current_block: u64
+ *   ) -> (UserActivity, credits.aleo/credits, Future)
+ *
+ * This mirrors `lendingDeposit` but calls `repay_with_credits` instead of `deposit_with_credits`.
  */
 export async function lendingRepay(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
   amount: number,
+  publicKey?: string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
 ): Promise<string> {
   if (!executeTransaction) {
     throw new Error('executeTransaction is not available from the connected wallet.');
   }
-
+  if (!publicKey || !requestRecords) {
+    throw new Error('Wallet not connected or record access (requestRecords) unavailable for repay.');
+  }
   if (amount <= 0) {
     throw new Error('Repay amount must be greater than 0');
   }
 
   try {
-    const inputs = [`${amount}u64`];
+    // Convert amount (credits) to microcredits. We allow decimals (up to 6 places),
+    // rounding to the nearest micro credit. Pool expects micro-ALEO as its `amount`.
+    const amountMicro = Math.round(amount * 1_000_000);
+    const requiredMicro = amountMicro;
 
-    console.log('🔍 Calling executeTransaction for repay (public fee)...');
+    console.log('🔍 Fetching credits.aleo records for repay...', {
+      CREDITS_PROGRAM_ID,
+      requiredMicro,
+    });
+
+    let records = await requestRecords(CREDITS_PROGRAM_ID, false);
+    if (!records || !Array.isArray(records)) records = [];
+
+    console.log(`📋 Found ${records.length} credits.aleo records (for repay)`);
+
+    const getMicrocredits = (record: any): number => {
+      try {
+        if (record.data && record.data.microcredits) {
+          return parseInt(String(record.data.microcredits).replace('u64', ''), 10);
+        }
+        if (record.plaintext) {
+          const match = String(record.plaintext).match(/microcredits:\s*([\d_]+)u64/);
+          if (match && match[1]) {
+            return parseInt(match[1].replace(/_/g, ''), 10);
+          }
+        }
+      } catch {
+        // ignore
+      }
+      return 0;
+    };
+
+    const processRecord = async (r: any): Promise<number> => {
+      let val = getMicrocredits(r);
+      if (val === 0 && r.recordCiphertext && !r.plaintext && decrypt) {
+        try {
+          const decrypted = await decrypt(r.recordCiphertext);
+          if (decrypted) {
+            r.plaintext = decrypted;
+            val = getMicrocredits(r);
+          }
+        } catch (e) {
+          console.warn('⚠️ Failed to decrypt credits record for repay:', e);
+        }
+      }
+      return val;
+    };
+
+    let payRecord: any | null = null;
+    for (const r of records as any[]) {
+      if (r.spent) continue;
+      const val = await processRecord(r);
+      const isSpendable = !!(r.plaintext || r.nonce || r._nonce || r.data?._nonce || r.ciphertext);
+      if (isSpendable && val >= requiredMicro) {
+        payRecord = r;
+        break;
+      }
+    }
+
+    if (!payRecord) {
+      throw new Error(
+        `No credits.aleo record found with enough microcredits for repay amount ${amount}. ` +
+          `Make sure you have at least ${amount} private credits in one record.`,
+      );
+    }
+
+    console.log('✅ Selected credits.aleo record for repay:', {
+      preview: JSON.stringify(payRecord).slice(0, 200),
+    });
+
+    // Build Leo-compatible record input (plaintext or ciphertext), like NullPay / deposit.
+    let recordInput: string | any = payRecord.plaintext;
+
+    if (!recordInput) {
+      console.warn('⚠️ Credits record missing plaintext (repay). Attempting to reconstruct...');
+      const nonce = payRecord.nonce || payRecord._nonce || payRecord.data?._nonce;
+      const micro = getMicrocredits(payRecord);
+      const owner = payRecord.owner;
+
+      if (nonce && micro > 0 && owner) {
+        recordInput = `{ owner: ${owner}.private, microcredits: ${micro}u64.private, _nonce: ${nonce}.public }`;
+        console.log('✅ Reconstructed credits plaintext for repay:', recordInput);
+      } else if (payRecord.ciphertext || payRecord.recordCiphertext) {
+        recordInput = payRecord.ciphertext || payRecord.recordCiphertext;
+        console.log('✅ Using credits ciphertext for repay input.');
+      } else {
+        console.warn('⚠️ Could not reconstruct credits record; passing raw object (last resort).');
+        recordInput = payRecord;
+      }
+    }
+
+    const amountInput = `${amountMicro}u64`;
+    const currentBlock = await getLatestBlockHeight();
+    const currentBlockInput = `${Math.max(0, currentBlock)}u64`;
+    const inputs: any[] = [recordInput, amountInput, currentBlockInput];
+
+    console.log('🔍 Calling executeTransaction for repay_with_credits...', {
+      program: LENDING_POOL_PROGRAM_ID,
+      function: 'repay_with_credits',
+      inputsPreview: {
+        input0_len: typeof recordInput === 'string' ? recordInput.length : 'object',
+        input1: amountInput,
+        input2: currentBlockInput,
+      },
+    });
+
     const result = await executeTransaction({
       program: LENDING_POOL_PROGRAM_ID,
-      function: 'repay',
+      function: 'repay_with_credits',
       inputs,
       fee: DEFAULT_LENDING_FEE * 1_000_000,
       privateFee: false,
+      recordIndices: [0],
     });
 
     const tempId: string | undefined = result?.transactionId;
@@ -632,10 +909,10 @@ export async function lendingRepay(
       throw new Error('Repay failed: No temporary transactionId returned from wallet.');
     }
 
-    console.log('Temporary Transaction ID (repay):', tempId);
+    console.log('Temporary Transaction ID (repay_with_credits):', tempId);
     return tempId;
   } catch (error: any) {
-    console.error('❌ LENDING REPAY FUNCTION FAILED:', error);
+    console.error('❌ LENDING REPAY (credits) FAILED:', error);
 
     const rawMsg = String(error?.message || error || '').toLowerCase();
     const isCancelled =
@@ -676,7 +953,10 @@ export async function lendingWithdraw(
   }
 
   try {
-    const inputs = [`${amount}u64`];
+    const amountMicro = Math.round(amount * 1_000_000);
+    const currentBlock = await getLatestBlockHeight();
+    const currentBlockInput = `${Math.max(0, currentBlock)}u64`;
+    const inputs = [`${amountMicro}u64`, currentBlockInput];
 
     console.log('🔍 Calling executeTransaction for withdraw (public fee)...');
     const result = await executeTransaction({
@@ -716,19 +996,525 @@ export async function lendingWithdraw(
   }
 }
 
+// --- USDC Pool (lending_pool_usdce_v86.aleo) ---
+// Contract: deposit(token, amount, current_block, proofs), repay(token, amount, current_block, proofs),
+//           withdraw(public amount, public current_block), borrow(public amount, public current_block).
+// - deposit/repay: 4 inputs — token, amount (micro-USDC), current_block (u64), proofs.
+// - withdraw/borrow: 2 inputs — amount (micro-USDC), current_block (u64). Backend sends USDCx from vault to user.
+// Amount in program is micro-USDC (1 USDC = 1_000_000). RPC accepts human USDC and converts to micro for transitions.
+const USDC_TOKEN_PROGRAM = USDC_TOKEN_PROGRAM_ID;
+
 /**
- * Accrue interest on the pool using wallet adapter.
- * Calls: lending_pool_v8.aleo/accrue_interest(public delta_index: u64) -> Future
+ * Placeholder [MerkleProof; 2] matching wallet format: leaf_index 1u32, 16 siblings per proof.
+ * Same shape as wallet: "[{ siblings: [0field,...], leaf_index: 1u32 }, { ... }]".
+ * Placeholder (all zeros) still causes "proving failed" on-chain; use wallet/API proofs when available.
+ */
+const DEFAULT_USDC_MERKLE_PROOFS =
+  '[{ siblings: [0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field], leaf_index: 1u32 }, { siblings: [0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field, 0field], leaf_index: 1u32 }]';
+
+/**
+ * USDCx private record format (from chain/wallet):
+ * { programName, recordName: "Token", recordCiphertext, spent, owner, commitment, tag, ... }
+ * Amount is inside recordCiphertext (encrypted); we accept unspent Token records and pass to program.
+ */
+function isUsdcTokenRecord(rec: any): boolean {
+  const programId = (rec?.program_id ?? rec?.programId ?? rec?.programName ?? '').toString();
+  const recordName = (rec?.recordName ?? rec?.record_name ?? rec?.data?.recordName ?? '').toString();
+  const isToken = recordName === 'Token' || (!recordName && (rec?.recordCiphertext ?? rec?.record_ciphertext));
+  return (programId === USDC_TOKEN_PROGRAM || programId.includes('test_usdcx_stablecoin')) && (isToken || !!rec?.recordCiphertext);
+}
+
+/**
+ * Returns the raw record ciphertext for use as transition input.
+ * Wallets typically expect the canonical Aleo record form (ciphertext string, e.g. "record1q..."),
+ * not JSON. Use this for deposit/repay input #0 to avoid "Failed to parse input #0 (Token.record)".
+ */
+export function getUsdcRecordCipher(record: any): string {
+  if (record == null) return '';
+  if (typeof record === 'string') {
+    const t = record.trim();
+    if (t.startsWith('record1')) return t;
+    if (t.startsWith('{')) {
+      try {
+        const o = JSON.parse(t);
+        return getUsdcRecordCipher(o);
+      } catch {
+        return '';
+      }
+    }
+    return t;
+  }
+  const ciphertext = record.recordCiphertext ?? record.record_ciphertext ?? record.ciphertext;
+  return typeof ciphertext === 'string' ? ciphertext.trim() : '';
+}
+
+/**
+ * Build the token record value for transition input #0 (deposit/repay).
+ * Prefer plaintext so the wallet can parse it as test_usdcx_stablecoin.aleo/Token.record (NullPay pattern).
+ * Ciphertext often fails with "Failed to parse input #0 (Token.record)".
+ */
+function getUsdcTokenInputForTransition(record: any): string | any {
+  if (record?.plaintext && typeof record.plaintext === 'string') {
+    const pt = record.plaintext.trim();
+    if (pt) return pt;
+  }
+  const cipher = getUsdcRecordCipher(record);
+  if (cipher) return cipher;
+  if (record && typeof record === 'object') return record;
+  return '';
+}
+
+/**
+ * Format USDC Token record for transition input #0.
+ * Prefer getUsdcRecordCipher(record) so the wallet receives raw ciphertext (canonical Token.record form).
+ * This helper can return JSON for wallets that expect it; currently we use ciphertext-only to fix parse errors.
+ */
+export function formatUsdcRecordForInput(record: any): string {
+  return getUsdcRecordCipher(record);
+}
+
+/**
+ * Parse amount from a record field (string like "100u128.private" or number).
+ */
+function parseUsdcAmount(amt: unknown): bigint | null {
+  if (amt === undefined || amt === null) return null;
+  if (typeof amt === 'number') return BigInt(amt);
+  if (typeof amt === 'string') {
+    const match = amt.match(/^(\d+)/);
+    return match ? BigInt(match[1]) : null;
+  }
+  return null;
+}
+
+/** Parse amount from Token record plaintext string (e.g. "amount: 0u128.private" or "amount: 100u128"). */
+export function parseUsdcAmountFromPlaintext(plaintext: string): bigint | null {
+  if (typeof plaintext !== 'string' || !plaintext) return null;
+  const match = plaintext.match(/amount:\s*(\d+)u128/);
+  return match ? BigInt(match[1]) : null;
+}
+
+/**
+ * Get total private USDC balance (test_usdcx_stablecoin.aleo Token records) in human USDC.
+ * Sums amount from all unspent Token records; uses decrypt for encrypted records.
+ * Returns 0 if no records or on error.
+ */
+export async function getPrivateUsdcBalance(
+  requestRecords: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>
+): Promise<number> {
+  try {
+    const records = await requestRecords(USDC_TOKEN_PROGRAM, false);
+    if (!records || !Array.isArray(records)) return 0;
+    let totalMicro = BigInt(0);
+    for (const rec of records as any[]) {
+      if (rec?.spent === true || rec?.data?.spent === true) continue;
+      if (!isUsdcTokenRecord(rec)) continue;
+      let val: bigint | null = parseUsdcAmount(
+        rec?.data?.amount ?? rec?.amount ?? (rec?.data && (rec.data as any).amount)
+      );
+      if (val === null && (rec.plaintext || (rec.recordCiphertext ?? rec.record_ciphertext)) && decrypt) {
+        try {
+          const plain = rec.plaintext || await decrypt(rec.recordCiphertext || rec.record_ciphertext);
+          if (plain) val = parseUsdcAmountFromPlaintext(plain);
+        } catch {
+          // skip
+        }
+      }
+      if (val != null && val > BigInt(0)) totalMicro += val;
+    }
+    return Number(totalMicro) / 1_000_000;
+  } catch {
+    return 0;
+  }
+}
+
+/** Get latest block height from chain (for USDC pool: prefer records from latest block). */
+export async function getLatestBlockHeight(): Promise<number> {
+  const toNum = (v: any): number => {
+    if (v === undefined || v === null) return 0;
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'object' && v !== null) {
+      const n = v.result ?? v.height ?? v.block_height ?? v.value;
+      return toNum(n);
+    }
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  };
+  try {
+    const h = await client.request('latest/height', {});
+    return toNum(h);
+  } catch (e) {
+    try {
+      const h = await client.request('getLatestBlockHeight', {});
+      return toNum(h);
+    } catch {
+      return 0;
+    }
+  }
+}
+
+/** Extract block height from a record if present (wallet/chain may provide height, block_height, etc.). */
+function getUsdcRecordBlockHeight(rec: any): number | null {
+  if (rec == null) return null;
+  const v =
+    rec.height ??
+    rec.block_height ??
+    rec.blockHeight ??
+    rec.block ??
+    (rec.data && typeof rec.data === 'object' && (rec.data as any).height) ??
+    (rec.data && typeof rec.data === 'object' && (rec.data as any).block_height);
+  if (v === undefined || v === null) return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Fetch a USDCx Token record from the wallet with balance >= amount.
+ * Supports chain format: { programName, recordName: "Token", recordCiphertext, spent, ... } (amount in ciphertext).
+ * Returns the record object; use formatUsdcRecordForInput(record) for the transition input if needed.
+ */
+export async function getSuitableUsdcTokenRecord(
+  requestRecords: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  amount: number,
+  _publicKey: string
+): Promise<any | null> {
+  const amountU128 = BigInt(amount);
+  const logPrefix = '[getSuitableUsdcTokenRecord]';
+
+  console.log(`${logPrefix} Requesting records for program: ${USDC_TOKEN_PROGRAM}, amount required: ${amount} (u64, record uses 6 decimals)`);
+
+  let records: any[];
+  try {
+    records = await requestRecords(USDC_TOKEN_PROGRAM, false);
+  } catch (e: any) {
+    console.error(`${logPrefix} requestRecords threw:`, e?.message ?? e);
+    throw e;
+  }
+
+  console.log(`${logPrefix} requestRecords("${USDC_TOKEN_PROGRAM}", false) returned:`, {
+    isArray: Array.isArray(records),
+    length: records?.length ?? 0,
+    raw: records,
+  });
+
+  if (!records || !Array.isArray(records)) {
+    console.warn(`${logPrefix} No records array (got ${records})`);
+    return null;
+  }
+
+  if (records.length === 0) {
+    console.warn(`${logPrefix} Zero records for "${USDC_TOKEN_PROGRAM}". Trying requestRecords("", false) to see all programs...`);
+    try {
+      const allRecords = await requestRecords('', false);
+      const allArr = Array.isArray(allRecords) ? allRecords : [];
+      const programKey = (r: any) => r?.program_id ?? r?.programId ?? r?.programName ?? '?';
+      console.log(`${logPrefix} requestRecords("") returned ${allArr.length} total records. Program IDs:`, allArr.map(programKey));
+      const usdcFromAll = allArr.filter((r: any) => {
+        const id = (r?.program_id ?? r?.programId ?? r?.programName ?? '').toString();
+        return id === USDC_TOKEN_PROGRAM || id.includes('test_usdcx_stablecoin');
+      });
+      console.log(`${logPrefix} Of those, ${usdcFromAll.length} are ${USDC_TOKEN_PROGRAM}`);
+      if (usdcFromAll.length > 0) {
+        console.log(`${logPrefix} Use program "${USDC_TOKEN_PROGRAM}" in wallet record permissions / reconnect with that program.`);
+      }
+    } catch (e2: any) {
+      console.warn(`${logPrefix} requestRecords("") failed:`, e2?.message ?? e2);
+    }
+    return null;
+  }
+
+  // USDC pool: prefer unspent records from the latest block — fetch latest height and sort by block height (latest first)
+  let latestBlockHeight = 0;
+  try {
+    latestBlockHeight = await getLatestBlockHeight();
+    if (latestBlockHeight > 0) {
+      console.log(`${logPrefix} Latest block height: ${latestBlockHeight}; sorting records by block height (latest first).`);
+    }
+  } catch (e: any) {
+    console.warn(`${logPrefix} Could not fetch latest block height:`, e?.message ?? e);
+  }
+  const sortedRecords = [...records].sort((a, b) => {
+    const ha = getUsdcRecordBlockHeight(a) ?? 0;
+    const hb = getUsdcRecordBlockHeight(b) ?? 0;
+    return hb - ha; // descending: latest block first
+  });
+  if (latestBlockHeight > 0 && sortedRecords.length > 0) {
+    const firstHeight = getUsdcRecordBlockHeight(sortedRecords[0]);
+    if (firstHeight != null) {
+      console.log(`${logPrefix} First record after sort has block height: ${firstHeight}`);
+    }
+  }
+
+  console.log(`${logPrefix} Inspecting ${sortedRecords.length} record(s)...`);
+
+  const unspentTokenRecords: any[] = [];
+
+  for (let i = 0; i < sortedRecords.length; i++) {
+    const rec = sortedRecords[i];
+    const spent = rec?.spent === true || rec?.data?.spent === true;
+    const isToken = isUsdcTokenRecord(rec);
+    const recHeight = getUsdcRecordBlockHeight(rec);
+    console.log(`${logPrefix} Record[${i}]:`, {
+      keys: rec ? Object.keys(rec) : [],
+      program_id: rec?.program_id ?? rec?.programId ?? rec?.programName,
+      recordName: rec?.recordName ?? rec?.record_name,
+      block_height: recHeight,
+      spent,
+      isUsdcToken: isToken,
+      hasRecordCiphertext: !!(rec?.recordCiphertext ?? rec?.record_ciphertext),
+      dataKeys: rec?.data ? Object.keys(rec.data) : [],
+      amount: rec?.data?.amount ?? rec?.amount,
+      owner: rec?.data?.owner ?? rec?.owner,
+    });
+
+    if (spent) {
+      console.log(`${logPrefix} Record[${i}] skipped (spent)`);
+      continue;
+    }
+
+    if (!isToken) {
+      console.log(`${logPrefix} Record[${i}] skipped (not a USDCx Token record)`);
+      continue;
+    }
+
+    // If we have plaintext amount, require sufficient balance and reject 0-balance records
+    const amt =
+      rec?.data?.amount ??
+      rec?.amount ??
+      rec?.data?.amount_ ??
+      (rec?.data && typeof rec.data === 'object' && (rec.data as any).amount);
+    const val = parseUsdcAmount(amt);
+
+    if (val !== null) {
+      if (val === BigInt(0)) {
+        console.log(`${logPrefix} Record[${i}] skipped (amount is 0; cannot use for deposit/repay)`);
+        continue;
+      }
+      console.log(`${logPrefix} Record[${i}] amount parsed: ${String(val)} (required >= ${amountU128}), sufficient: ${val >= amountU128}`);
+      if (val >= amountU128) {
+        console.log(`${logPrefix} Using record[${i}] for deposit/repay (has sufficient amount)`);
+        return rec;
+      }
+      // Has plaintext but insufficient; don't use as fallback
+      continue;
+    }
+
+    // No plaintext amount (encrypted); can use as fallback if we have no better option
+    unspentTokenRecords.push(rec);
+    console.log(`${logPrefix} Record[${i}] has no plaintext amount (encrypted). Added to fallback list.`);
+  }
+
+  if (unspentTokenRecords.length > 0) {
+    console.log(`${logPrefix} No record with plaintext amount >= ${amount}. Using first unspent Token record with encrypted amount; program will assert balance.`);
+    return unspentTokenRecords[0];
+  }
+
+  console.warn(`${logPrefix} No unspent USDCx Token record. Check that you have private USDCx (transfer_public_to_private) and record access.`);
+  return null;
+}
+
+function handleUsdcTxError(error: any, action: string): string {
+  const rawMsg = String(error?.message || error || '').toLowerCase();
+  const isCancelled =
+    rawMsg.includes('operation was cancelled by the user') ||
+    rawMsg.includes('operation was canceled by the user') ||
+    rawMsg.includes('user cancelled') ||
+    rawMsg.includes('user canceled') ||
+    rawMsg.includes('user rejected') ||
+    rawMsg.includes('rejected by user') ||
+    rawMsg.includes('transaction cancelled by user');
+  if (isCancelled) return '__CANCELLED__';
+  if (rawMsg.includes('proving failed') || rawMsg.includes('proving error')) {
+    throw new Error(
+      `${action} failed: Proving failed. The USDCx token program requires valid Merkle proofs for your record. ` +
+        'Placeholder proofs cannot be used on-chain. Obtain valid proofs from your wallet (if it supports USDCx private transfer) or from Provable/token issuer. ' +
+        'See programusdc/inputs/README_DEPOSIT_EXAMPLE.md for details.'
+    );
+  }
+  throw new Error(`${action} failed: ${error?.message || 'Unknown error'}`);
+}
+
+/**
+ * USDC deposit: lending_pool_usdce_v86.aleo/deposit(token, amount, current_block, proofs) — 4 inputs.
+ * Amount in human USDC; converted to micro-USDC for the program.
+ */
+export async function lendingDepositUsdc(
+  executeTransaction: ((tx: any) => Promise<any>) | undefined,
+  amount: number,
+  tokenRecord: any,
+  proofs?: [string, string] | string
+): Promise<string> {
+  if (!executeTransaction) throw new Error('executeTransaction is not available.');
+  if (amount <= 0) throw new Error('Deposit amount must be greater than 0');
+  if (tokenRecord == null) throw new Error('A USDC Token record is required. Please ensure you have USDCx in your wallet.');
+  try {
+    const tokenInput = getUsdcTokenInputForTransition(tokenRecord);
+    if (tokenInput === '' || (typeof tokenInput === 'string' && !String(tokenInput).trim())) {
+      throw new Error('USDC Token record has no ciphertext or plaintext. Ensure the record is from test_usdcx_stablecoin.aleo and try again.');
+    }
+    const amountMicro = Math.round(amount * 1_000_000);
+    const amountStr = `${amountMicro}u64`;
+    const currentBlock = await getLatestBlockHeight();
+    const currentBlockStr = `${Math.max(0, currentBlock)}u64`;
+    let proofsEncoded: string;
+    if (typeof proofs === 'string' && proofs.trim().startsWith('[') && proofs.includes('siblings')) {
+      proofsEncoded = proofs.trim();
+    } else {
+      const proofsInput = Array.isArray(proofs) && proofs.length >= 2
+        ? [String(proofs[0]).trim(), String(proofs[1]).trim()]
+        : ['', ''];
+      proofsEncoded =
+        proofsInput.every(Boolean) && proofsInput[0] && proofsInput[1]
+          ? (proofsInput[0].startsWith('{') ? `[${proofsInput[0]}, ${proofsInput[1]}]` : proofsInput.join(','))
+          : DEFAULT_USDC_MERKLE_PROOFS;
+    }
+
+    const inputs: (string | any)[] = [tokenInput, amountStr, currentBlockStr, proofsEncoded];
+
+    console.log('[USDC deposit] All 4 inputs:', {
+      input0_token: tokenInput,
+      input1_amount: amountStr,
+      input2_current_block: currentBlockStr,
+      input3_proofs: proofsEncoded,
+    });
+
+    const result = await executeTransaction({
+      program: USDC_LENDING_POOL_PROGRAM_ID,
+      function: 'deposit',
+      inputs,
+      fee: DEFAULT_LENDING_FEE * 1_000_000,
+      privateFee: false,
+    });
+    const tempId = result?.transactionId;
+    if (!tempId) throw new Error('Deposit failed: No transactionId returned.');
+    return tempId;
+  } catch (error: any) {
+    return handleUsdcTxError(error, 'USDC deposit');
+  }
+}
+
+/**
+ * USDC repay: lending_pool_usdce_v86.aleo/repay(token, amount, current_block, proofs) — 4 inputs.
+ * Amount in human USDC; converted to micro-USDC for the program.
+ */
+export async function lendingRepayUsdc(
+  executeTransaction: ((tx: any) => Promise<any>) | undefined,
+  amount: number,
+  tokenRecord: any,
+  proofs?: [string, string] | string
+): Promise<string> {
+  if (!executeTransaction) throw new Error('executeTransaction is not available.');
+  if (amount <= 0) throw new Error('Repay amount must be greater than 0');
+  if (tokenRecord == null) throw new Error('A USDC Token record is required for repay.');
+  try {
+    const tokenInput = getUsdcTokenInputForTransition(tokenRecord);
+    if (tokenInput === '' || (typeof tokenInput === 'string' && !String(tokenInput).trim())) {
+      throw new Error('USDC Token record has no ciphertext or plaintext. Ensure the record is from test_usdcx_stablecoin.aleo and try again.');
+    }
+    const amountMicro = Math.round(amount * 1_000_000);
+    const amountStr = `${amountMicro}u64`;
+    const currentBlock = await getLatestBlockHeight();
+    const currentBlockStr = `${Math.max(0, currentBlock)}u64`;
+    let proofsEncoded: string;
+    if (typeof proofs === 'string' && proofs.trim().startsWith('[') && proofs.includes('siblings')) {
+      proofsEncoded = proofs.trim();
+    } else {
+      const proofsInput = Array.isArray(proofs) && proofs.length >= 2
+        ? [String(proofs[0]).trim(), String(proofs[1]).trim()]
+        : ['', ''];
+      proofsEncoded =
+        proofsInput.every(Boolean) && proofsInput[0] && proofsInput[1]
+          ? (proofsInput[0].startsWith('{') ? `[${proofsInput[0]}, ${proofsInput[1]}]` : proofsInput.join(','))
+          : DEFAULT_USDC_MERKLE_PROOFS;
+    }
+    const inputs: (string | any)[] = [tokenInput, amountStr, currentBlockStr, proofsEncoded];
+
+    console.log('[USDC repay] All 4 inputs:', {
+      input0_token: tokenInput,
+      input1_amount: amountStr,
+      input2_current_block: currentBlockStr,
+      input3_proofs: proofsEncoded,
+    });
+
+    const result = await executeTransaction({
+      program: USDC_LENDING_POOL_PROGRAM_ID,
+      function: 'repay',
+      inputs,
+      fee: DEFAULT_LENDING_FEE * 1_000_000,
+      privateFee: false,
+    });
+    const tempId = result?.transactionId;
+    if (!tempId) throw new Error('Repay failed: No transactionId returned.');
+    return tempId;
+  } catch (error: any) {
+    return handleUsdcTxError(error, 'USDC repay');
+  }
+}
+
+export async function lendingWithdrawUsdc(
+  executeTransaction: ((tx: any) => Promise<any>) | undefined,
+  amount: number,
+): Promise<string> {
+  if (!executeTransaction) throw new Error('executeTransaction is not available.');
+  if (amount <= 0) throw new Error('Withdraw amount must be greater than 0');
+  try {
+    const amountMicro = Math.round(amount * 1_000_000);
+    const currentBlock = await getLatestBlockHeight();
+    const inputs = [`${amountMicro}u64`, `${Math.max(0, currentBlock)}u64`];
+    const result = await executeTransaction({
+      program: USDC_LENDING_POOL_PROGRAM_ID,
+      function: 'withdraw',
+      inputs,
+      fee: DEFAULT_LENDING_FEE * 1_000_000,
+      privateFee: false,
+    });
+    const tempId = result?.transactionId;
+    if (!tempId) throw new Error('Withdraw failed: No transactionId returned.');
+    return tempId;
+  } catch (error: any) {
+    return handleUsdcTxError(error, 'USDC withdraw');
+  }
+}
+
+export async function lendingBorrowUsdc(
+  executeTransaction: ((tx: any) => Promise<any>) | undefined,
+  amount: number,
+): Promise<string> {
+  if (!executeTransaction) throw new Error('executeTransaction is not available.');
+  if (amount <= 0) throw new Error('Borrow amount must be greater than 0');
+  try {
+    const amountMicro = Math.round(amount * 1_000_000);
+    const currentBlock = await getLatestBlockHeight();
+    const inputs = [`${amountMicro}u64`, `${Math.max(0, currentBlock)}u64`];
+    const result = await executeTransaction({
+      program: USDC_LENDING_POOL_PROGRAM_ID,
+      function: 'borrow',
+      inputs,
+      fee: DEFAULT_LENDING_FEE * 1_000_000,
+      privateFee: false,
+    });
+    const tempId = result?.transactionId;
+    if (!tempId) throw new Error('Borrow failed: No transactionId returned.');
+    return tempId;
+  } catch (error: any) {
+    return handleUsdcTxError(error, 'USDC borrow');
+  }
+}
+
+/**
+ * Accrue interest on the Aleo pool (v86) using wallet adapter.
+ * accrue_interest(public current_block: u64) — updates liquidity_index and borrow_index up to current_block.
+ * Anyone can call; indices are also updated automatically on every deposit, borrow, repay, withdraw.
  */
 export async function lendingAccrueInterest(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
-  deltaIndex: number
+  currentBlock: number
 ): Promise<string> {
   console.log('========================================');
-  console.log('📈 LENDING ACCRUE INTEREST FUNCTION CALLED');
+  console.log('📈 LENDING ACCRUE INTEREST FUNCTION CALLED (Aleo pool)');
   console.log('========================================');
   console.log('📥 Input Parameters:', {
-    deltaIndex,
+    currentBlock,
     network: CURRENT_NETWORK,
     programId: LENDING_POOL_PROGRAM_ID,
   });
@@ -736,11 +1522,11 @@ export async function lendingAccrueInterest(
   if (!executeTransaction) {
     throw new Error('executeTransaction is not available from the connected wallet.');
   }
-  // Use the same default fee logic as other lending functions
   const fee = DEFAULT_LENDING_FEE * 1_000_000;
 
   try {
-    const inputs = [`${deltaIndex}u64`];
+    const blockInput = `${Math.max(0, currentBlock)}u64`;
+    const inputs = [blockInput];
     console.log('💰 Transaction Configuration:', {
       inputs,
       fee: `${fee} microcredits`,
@@ -795,41 +1581,72 @@ export async function lendingAccrueInterest(
 }
 
 /**
- * Read global pool state from mappings.
- * Keys are always GLOBAL_KEY = 0u8 in the Leo program.
+ * Accrue interest on the USDC pool (lending_pool_usdce_v86.aleo). Same signature as Aleo pool.
  */
-export async function getLendingPoolState(): Promise<{
+export async function lendingAccrueInterestUsdc(
+  executeTransaction: ((tx: any) => Promise<any>) | undefined,
+  currentBlock: number
+): Promise<string> {
+  if (!executeTransaction) throw new Error('executeTransaction is not available.');
+  const fee = DEFAULT_LENDING_FEE * 1_000_000;
+  try {
+    const blockInput = `${Math.max(0, currentBlock)}u64`;
+    const result = await executeTransaction({
+      program: USDC_LENDING_POOL_PROGRAM_ID,
+      function: 'accrue_interest',
+      inputs: [blockInput],
+      fee,
+      privateFee: false,
+    });
+    const tempId = result?.transactionId;
+    if (!tempId) throw new Error('USDC accrue interest failed: No transactionId returned.');
+    return tempId;
+  } catch (error: any) {
+    const rawMsg = String(error?.message || error || '').toLowerCase();
+    const isCancelled =
+      rawMsg.includes('operation was cancelled by the user') ||
+      rawMsg.includes('user cancelled') || rawMsg.includes('user rejected');
+    if (isCancelled) return '__CANCELLED__';
+    throw new Error(`USDC accrue interest failed: ${error?.message || 'Unknown error'}`);
+  }
+}
+
+/**
+ * Read global pool state from mappings for a given program.
+ * Keys are always GLOBAL_KEY = 0u8 in the Leo program.
+ * v85 (lending_pool_v85.aleo) also has liquidity_index and borrow_index for interest/APY.
+ */
+export async function getLendingPoolStateForProgram(programId: string): Promise<{
   totalSupplied: string | null;
   totalBorrowed: string | null;
   utilizationIndex: string | null;
   interestIndex: string | null;
+  liquidityIndex: string | null;
+  borrowIndex: string | null;
 }> {
   const key = '0u8';
 
   try {
-    // Note: Public RPC endpoints may not support 'getMappingValue' method
-    // This will trigger CORS preflight (OPTIONS) requests
-    // If the method is not supported, we'll catch the error and return nulls
-    
-    // Wrap client.request in Promise.resolve to ensure it's a proper Promise
     const requestWithErrorHandling = async (mappingName: string) => {
       try {
         return await Promise.resolve(client.request('getMappingValue', {
-          program_id: LENDING_POOL_PROGRAM_ID,
+          program_id: programId,
           mapping_name: mappingName,
           key,
         }));
       } catch (err: any) {
-        console.warn(`getLendingPoolState: Failed to fetch ${mappingName}:`, err?.message);
+        console.warn(`getLendingPoolStateForProgram(${programId}): Failed to fetch ${mappingName}:`, err?.message);
         return null;
       }
     };
-    
-    const [supplied, borrowed, utilization, interest] = await Promise.all([
+
+    const [supplied, borrowed, utilization, interest, liquidityIdx, borrowIdx] = await Promise.all([
       requestWithErrorHandling('total_supplied'),
       requestWithErrorHandling('total_borrowed'),
       requestWithErrorHandling('utilization_index'),
       requestWithErrorHandling('interest_index'),
+      requestWithErrorHandling('liquidity_index'),
+      requestWithErrorHandling('borrow_index'),
     ]);
 
     const extract = (res: any): string | null => {
@@ -837,7 +1654,6 @@ export async function getLendingPoolState(): Promise<{
       const raw = res.value ?? res ?? null;
       if (raw == null) return null;
       const str = String(raw);
-      // Strip common Leo suffixes like "u64" so the UI shows plain numbers.
       return str.replace(/u64$/i, '');
     };
 
@@ -846,15 +1662,136 @@ export async function getLendingPoolState(): Promise<{
       totalBorrowed: extract(borrowed),
       utilizationIndex: extract(utilization),
       interestIndex: extract(interest),
+      liquidityIndex: extract(liquidityIdx),
+      borrowIndex: extract(borrowIdx),
     };
   } catch (error: any) {
-    console.error('getLendingPoolState: Error fetching pool state:', error);
+    console.error('getLendingPoolStateForProgram: Error fetching pool state:', error);
     return {
       totalSupplied: null,
       totalBorrowed: null,
       utilizationIndex: null,
       interestIndex: null,
+      liquidityIndex: null,
+      borrowIndex: null,
     };
+  }
+}
+
+/**
+ * Read global pool state for the Aleo pool (lending_pool_v86.aleo).
+ */
+export async function getLendingPoolState(): Promise<{
+  totalSupplied: string | null;
+  totalBorrowed: string | null;
+  utilizationIndex: string | null;
+  interestIndex: string | null;
+  liquidityIndex: string | null;
+  borrowIndex: string | null;
+}> {
+  return getLendingPoolStateForProgram(LENDING_POOL_PROGRAM_ID);
+}
+
+/**
+ * Read global pool state for the USDC pool (lending_pool_usdce_v86.aleo).
+ */
+export async function getUsdcLendingPoolState(): Promise<{
+  totalSupplied: string | null;
+  totalBorrowed: string | null;
+  utilizationIndex: string | null;
+  interestIndex: string | null;
+  liquidityIndex: string | null;
+  borrowIndex: string | null;
+}> {
+  return getLendingPoolStateForProgram(USDC_LENDING_POOL_PROGRAM_ID);
+}
+
+// --- v86 interest/APY constants (match program lending_pool_v86.aleo) ---
+const INDEX_SCALE_ALEO = 1_000_000_000_000; // 1e12
+const SCALE_ALEO = 1_000_000; // 1e6
+const BASE_RATE_PER_BLOCK_ALEO = 1000;
+const SLOPE_PER_UTIL_ALEO = 6667;
+const RESERVE_FACTOR_BPS_ALEO = 1000;
+/** Approximate blocks per year (e.g. 15s block time => 2_102_400). */
+export const BLOCKS_PER_YEAR_ALEO = 365 * 24 * 60 * 4; // 4 blocks/min => 2_102_400
+
+/**
+ * Compute supply and borrow APY from pool state (v85 rate model).
+ * Program accrual: bi_new = bi + (bi * br * delta) / INDEX_SCALE, so rate per block = br/INDEX_SCALE (not br/SCALE).
+ * br = BASE_RATE_PER_BLOCK + (SLOPE_PER_UTIL * util) / SCALE  [in SCALE units]
+ * sr = (br * util * (10000 - RESERVE_FACTOR_BPS)) / (SCALE * 10000)  [in SCALE units]
+ * APY = rate_per_block * blocks_per_year (simple-interest; matches program accrual scale).
+ */
+export function computeAleoPoolAPY(
+  totalSupplied: number | string,
+  totalBorrowed: number | string,
+  blocksPerYear: number = BLOCKS_PER_YEAR_ALEO
+): { supplyAPY: number; borrowAPY: number } {
+  const ts = Number(totalSupplied) || 0;
+  const tb = Number(totalBorrowed) || 0;
+  if (ts <= 0) {
+    return { supplyAPY: 0, borrowAPY: 0 };
+  }
+  const util = tb / ts; // 0..1
+  const utilScaled = Math.floor(util * SCALE_ALEO); // u64-style in JS
+  const br =
+    BASE_RATE_PER_BLOCK_ALEO + (SLOPE_PER_UTIL_ALEO * utilScaled) / SCALE_ALEO;
+  const sr =
+    (br * util * (10000 - RESERVE_FACTOR_BPS_ALEO)) / 10000;
+  // Program uses INDEX_SCALE in accrual: (index * rate * delta) / INDEX_SCALE => rate_per_block = rate/INDEX_SCALE
+  const borrowRatePerBlock = br / INDEX_SCALE_ALEO;
+  const supplyRatePerBlock = sr / INDEX_SCALE_ALEO;
+  const borrowAPY = borrowRatePerBlock * blocksPerYear;
+  const supplyAPY = supplyRatePerBlock * blocksPerYear;
+  return { supplyAPY, borrowAPY };
+}
+
+/** Same rate model as Aleo pool (v86); USDC pool uses identical constants. */
+export const computeUsdcPoolAPY = computeAleoPoolAPY;
+
+/**
+ * Effective supply balance = (user_scaled_supply * liquidity_index) / INDEX_SCALE.
+ * Effective borrow debt = (user_scaled_borrow * borrow_index) / INDEX_SCALE.
+ * Returns null if user hash cannot be computed (frontend falls back to record-based position).
+ */
+export async function getAleoPoolUserEffectivePosition(
+  programId: string,
+  userAddress: string
+): Promise<{ effectiveSupplyBalance: number; effectiveBorrowDebt: number } | null> {
+  const userHash = computeAddressHash(userAddress);
+  if (!userHash) return null;
+  try {
+    const requestWithErrorHandling = async (mappingName: string, key: string) => {
+      try {
+        const res = await client.request('getMappingValue', {
+          program_id: programId,
+          mapping_name: mappingName,
+          key,
+        });
+        const raw = res?.value ?? res ?? null;
+        if (raw == null) return null;
+        const str = String(raw).replace(/u64$/i, '');
+        return str ? BigInt(str) : null;
+      } catch {
+        return null;
+      }
+    };
+    const globalKey = '0u8';
+    const [scaledSupply, scaledBorrow, liquidityIndex, borrowIndex] = await Promise.all([
+      requestWithErrorHandling('user_scaled_supply', userHash),
+      requestWithErrorHandling('user_scaled_borrow', userHash),
+      requestWithErrorHandling('liquidity_index', globalKey),
+      requestWithErrorHandling('borrow_index', globalKey),
+    ]);
+    const li = liquidityIndex ?? BigInt(INDEX_SCALE_ALEO);
+    const bi = borrowIndex ?? BigInt(INDEX_SCALE_ALEO);
+    const ss = scaledSupply ?? BigInt(0);
+    const sb = scaledBorrow ?? BigInt(0);
+    const effectiveSupplyBalance = Number((ss * li) / BigInt(INDEX_SCALE_ALEO));
+    const effectiveBorrowDebt = Number((sb * bi) / BigInt(INDEX_SCALE_ALEO));
+    return { effectiveSupplyBalance, effectiveBorrowDebt };
+  } catch {
+    return null;
   }
 }
 

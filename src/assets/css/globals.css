@@ -5,10 +5,10 @@
 @plugin "@tailwindcss/typography";
 @plugin "@tailwindcss/forms";
 
-/* Wallet button styles */
+/* Wallet button styles — keep z-index below wallet adapter modal (1040/1050) so popup appears on top */
 .wallet-button-wrapper {
   position: relative !important;
-  z-index: 9999 !important;
+  z-index: 50 !important;
   pointer-events: auto !important;
 }
 
@@ -215,6 +215,22 @@ Styles for Swiper slider
 /* DaisyUI tooltips: ensure they show above cards and have visible border */
 .tooltip::before {
   z-index: 9999;
+}
+/* Info icon tooltips: allow wrapping for interest earned/owed text */
+.tooltip-info::before {
+  max-width: 18rem;
+  font-size: 0.75rem;
+  white-space: normal;
+  text-align: left;
+}
+/* Private data (shield) column header tooltip - visible and readable */
+.private-data-tooltip::before {
+  font-size: 0.75rem;
+  padding: 0.35rem 0.6rem;
+  max-width: 16rem;
+  white-space: normal;
+  text-align: center;
+  line-height: 1.3;
 }
 .btn-outline {
   border-width: 2px;

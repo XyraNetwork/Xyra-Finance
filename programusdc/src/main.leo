@@ -1,23 +1,25 @@
-// Core single-asset lending pool program - Version 8
-// Lending pool with real interest and APY (Aave-style indices).
-//  - liquidity_index / borrow_index accrue per block from utilization
-//  - User supply balance = scaled_supply * liquidity_index / INDEX_SCALE
-//  - User borrow debt = scaled_borrow * borrow_index / INDEX_SCALE
+// USDC lending pool - uses test_usdcx_stablecoin.aleo (USDCx) for deposit & repay only.
+//  - Deposit: Real USDCx — user sends token to pool vault; state updated after transfer.
+//  - Repay: Real USDCx — user sends token to pool vault; state updated after transfer.
+//  - Withdraw: State only. Caller’s withdrawal recorded; backend sends USDCx from vault to user.
+//  - Borrow: State only. Caller’s borrow recorded; backend sends USDCx from vault to user.
 
-import credits.aleo;
+import test_usdcx_stablecoin.aleo;
 
-program lending_pool_v86.aleo {
+program lending_pool_usdce_v86.aleo {
     // ---- Constants ----
+    // SCALE is the fixed-point scale for utilization/interest calculations (1e6).
+    // All pool amounts (totals, user totals, amounts) are stored in micro-USDC (1 USDC = 1_000_000 units).
     const SCALE: u64 = 1_000_000u64;
     const GLOBAL_KEY: u8 = 0u8;
+    // Vault address that holds pool USDCx. Deposits/repays send here; withdraw/borrow spend from here.
     const POOL_VAULT_ADDRESS: address = aleo1a2ehlgqhvs3p7d4hqhs0tvgk954dr8gafu9kxse2mzu9a5sqxvpsrn98pr;
 
-    // ---- Interest / APY (fixed-point; INDEX_SCALE = 1e12) ----
+    // ---- Interest / APY (v86-style; INDEX_SCALE = 1e12) ----
     const INDEX_SCALE: u64 = 1_000_000_000_000u64;
     const BASE_RATE_PER_BLOCK: u64 = 1000u64;
     const SLOPE_PER_UTIL: u64 = 6667u64;
     const RESERVE_FACTOR_BPS: u64 = 1000u64;
-    // Cap accrual delta per tx to avoid u64 overflow in (index * rate * delta) / INDEX_SCALE
     const MAX_ACCRUAL_DELTA: u64 = 1_000u64;
 
     // ---- Public Aggregates (Pool State) ----
@@ -37,7 +39,7 @@ program lending_pool_v86.aleo {
         total_repayments: u64,
     }
 
-    // ---- Private User Mappings (with hashed keys for privacy) ----
+    // ---- Private User Mappings (hashed keys for privacy) ----
     mapping user_total_deposits: field => u64;
     mapping user_total_withdrawals: field => u64;
     mapping user_total_borrows: field => u64;
@@ -45,34 +47,32 @@ program lending_pool_v86.aleo {
     mapping user_scaled_supply: field => u64;
     mapping user_scaled_borrow: field => u64;
 
-    // ---- Constructor (Upgradable via Admin) ----
-    // Only the specified admin address can upgrade this program.
+    // ---- Constructor ----
     @admin(address = "aleo1rhgdu77hgyqd3xjj8ucu3jj9r2krwz6mnzyd80gncr5fxcwlh5rsvzp9px")
     async constructor() {}
 
-    // ==================== TRANSITIONS ====================
+    // ==================== TRANSITIONS (USDCx) ====================
 
-  
-
-    // 1b) DEPOSIT with private ALEO credits -> vault public balance (transfer_private_to_public)
-    //     NOTE: `amount` is in micro-ALEO (1 ALEO = 1_000_000 micro-ALEO).
-    async transition deposit_with_credits(
-        pay_record: credits.aleo/credits,
+    // 1) DEPOSIT: User sends USDCx to pool. transfer_private(recipient, amount, token, proofs) per NullPay.
+    //    `amount` is in micro-USDC (smallest units; 1 USDC = 1_000_000).
+    async transition deposit(
+        token: test_usdcx_stablecoin.aleo/Token,
         public amount: u64,
-        public current_block: u64
-    ) -> (UserActivity, credits.aleo/credits, Future) {
-        assert(amount > 0u64);
-
+        public current_block: u64,
+        proofs: [MerkleProof; 2]
+    ) -> (UserActivity, test_usdcx_stablecoin.aleo/Token, test_usdcx_stablecoin.aleo/Token, Future) {
         let caller: address = self.caller;
-        assert(caller == pay_record.owner);
+        assert(amount > 0u64);
+        assert(caller == token.owner);
+
+        // amount is already in micro-USDC; token.amount is also in smallest units.
+        let amount_u128: u128 = (amount as u128);
+        assert(token.amount >= amount_u128);
 
         let user_hash: field = BHP256::hash_to_field(caller);
 
-        // `amount` is already in micro-ALEO; send that from user to pool vault.
-        let amount_micro: u64 = amount;
-
-        let (change_to_user, f_transfer): (credits.aleo/credits, Future) =
-            credits.aleo/transfer_private_to_public(pay_record, POOL_VAULT_ADDRESS, amount_micro);
+        let (compliance_out, to_user, to_pool, token_future): (test_usdcx_stablecoin.aleo/ComplianceRecord, test_usdcx_stablecoin.aleo/Token, test_usdcx_stablecoin.aleo/Token, Future) =
+            test_usdcx_stablecoin.aleo/transfer_private(POOL_VAULT_ADDRESS, amount_u128, token, proofs);
 
         let updated: UserActivity = UserActivity {
             owner: caller,
@@ -82,49 +82,29 @@ program lending_pool_v86.aleo {
             total_repayments: 0u64,
         };
 
-        let f: Future = finalize_deposit_after_transfer(f_transfer, amount, user_hash, current_block);
-        return (updated, change_to_user, f);
+        let f: Future = finalize_deposit(amount, user_hash, current_block, token_future);
+        return (updated, to_pool, to_user, f);
     }
 
-    // 2) BORROW: User borrows amount (state tracking only)
-    async transition borrow(public amount: u64, public current_block: u64) -> (UserActivity, Future) {
-        assert(amount > 0u64);
-        let caller: address = self.caller;
-        let user_hash: field = BHP256::hash_to_field(caller);
-
-        let updated: UserActivity = UserActivity {
-            owner: caller,
-            total_deposits: 0u64,
-            total_withdrawals: 0u64,
-            total_borrows: amount,
-            total_repayments: 0u64,
-        };
-
-        let f: Future = finalize_borrow(amount, user_hash, current_block);
-        return (updated, f);
-    }
-
-    
-
-    // 3b) REPAY with private ALEO credits -> vault public balance (transfer_private_to_public)
-    //     NOTE: `amount` is in micro-ALEO (1 ALEO = 1_000_000 micro-ALEO).
-    async transition repay_with_credits(
-        pay_record: credits.aleo/credits,
+    // 2) REPAY: User sends USDCx to pool. Same transfer_private pattern as deposit.
+    //    `amount` is in micro-USDC (smallest units; 1 USDC = 1_000_000).
+    async transition repay(
+        token: test_usdcx_stablecoin.aleo/Token,
         public amount: u64,
-        public current_block: u64
-    ) -> (UserActivity, credits.aleo/credits, Future) {
-        assert(amount > 0u64);
-
+        public current_block: u64,
+        proofs: [MerkleProof; 2]
+    ) -> (UserActivity, test_usdcx_stablecoin.aleo/Token, test_usdcx_stablecoin.aleo/Token, Future) {
         let caller: address = self.caller;
-        assert(caller == pay_record.owner);
+        assert(amount > 0u64);
+        assert(caller == token.owner);
+        // amount is already in micro-USDC; token.amount is also in smallest units.
+        let amount_u128: u128 = (amount as u128);
+        assert(token.amount >= amount_u128);
 
         let user_hash: field = BHP256::hash_to_field(caller);
 
-        // `amount` is already in micro-ALEO; send that from user to pool vault.
-        let amount_micro: u64 = amount;
-
-        let (change_to_user, f_transfer): (credits.aleo/credits, Future) =
-            credits.aleo/transfer_private_to_public(pay_record, POOL_VAULT_ADDRESS, amount_micro);
+        let (compliance_out, to_user, to_pool, token_future): (test_usdcx_stablecoin.aleo/ComplianceRecord, test_usdcx_stablecoin.aleo/Token, test_usdcx_stablecoin.aleo/Token, Future) =
+            test_usdcx_stablecoin.aleo/transfer_private(POOL_VAULT_ADDRESS, amount_u128, token, proofs);
 
         let updated: UserActivity = UserActivity {
             owner: caller,
@@ -134,11 +114,11 @@ program lending_pool_v86.aleo {
             total_repayments: amount,
         };
 
-        let f: Future = finalize_repay_after_transfer(f_transfer, amount, user_hash, current_block);
-        return (updated, change_to_user, f);
+        let f: Future = finalize_repay(amount, user_hash, current_block, token_future);
+        return (updated, to_pool, to_user, f);
     }
 
-    // 4) WITHDRAW: User withdraws amount (state tracking only)
+    // 3) WITHDRAW: State only. Caller is the user withdrawing; backend sends USDCx from vault to user.
     async transition withdraw(public amount: u64, public current_block: u64) -> (UserActivity, Future) {
         assert(amount > 0u64);
         let caller: address = self.caller;
@@ -156,26 +136,40 @@ program lending_pool_v86.aleo {
         return (updated, f);
     }
 
-    // 5) Accrue interest: updates liquidity_index and borrow_index up to current_block.
-    //    Optional: any wallet can call it to sync indices without depositing/borrowing/repaying/withdrawing.
-    //    Indices are also updated automatically on every deposit, borrow, repay, and withdraw.
+    // 4) BORROW: State only. Caller is the borrower; backend sends USDCx from vault to user.
+    async transition borrow(public amount: u64, public current_block: u64) -> (UserActivity, Future) {
+        assert(amount > 0u64);
+        let caller: address = self.caller;
+        let user_hash: field = BHP256::hash_to_field(caller);
+
+        let updated: UserActivity = UserActivity {
+            owner: caller,
+            total_deposits: 0u64,
+            total_withdrawals: 0u64,
+            total_borrows: amount,
+            total_repayments: 0u64,
+        };
+
+        let f: Future = finalize_borrow(amount, user_hash, current_block);
+        return (updated, f);
+    }
+
+    // 5) Accrue interest (v86: updates liquidity_index and borrow_index from current_block)
     async transition accrue_interest(public current_block: u64) -> Future {
         let f: Future = finalize_accrue(current_block);
         return f;
     }
 
-    // 6) Helper: Get address hash
     transition get_address_hash() -> field {
         let caller: address = self.caller;
         let user_hash: field = BHP256::hash_to_field(caller);
         return user_hash;
     }
 
-    // 7) Helper: Get user activity (returns placeholder, actual values in mappings)
     async transition get_user_activity() -> (UserActivity, Future) {
         let caller: address = self.caller;
         let user_hash: field = BHP256::hash_to_field(caller);
-        
+
         let placeholder: UserActivity = UserActivity {
             owner: caller,
             total_deposits: 0u64,
@@ -190,8 +184,8 @@ program lending_pool_v86.aleo {
 
     // ==================== FINALIZE FUNCTIONS ====================
 
-    async function finalize_deposit_after_transfer(f_transfer: Future, amount: u64, user_hash: field, current_block: u64) {
-        f_transfer.await();
+    async function finalize_deposit(amount: u64, user_hash: field, current_block: u64, token_future: Future) {
+        token_future.await();
         let lub: u64 = Mapping::get_or_use(last_update_block, GLOBAL_KEY, 0u64);
         if current_block > lub {
             let delta: u64 = current_block - lub;
@@ -257,66 +251,8 @@ program lending_pool_v86.aleo {
         }
     }
 
-    async function finalize_borrow(amount: u64, user_hash: field, current_block: u64) {
-        let lub: u64 = Mapping::get_or_use(last_update_block, GLOBAL_KEY, 0u64);
-        if current_block > lub {
-            let delta: u64 = current_block - lub;
-            let effective_delta: u64 = (delta > MAX_ACCRUAL_DELTA) ? MAX_ACCRUAL_DELTA : delta;
-            last_update_block.set(GLOBAL_KEY, lub + effective_delta);
-            let ts: u64 = Mapping::get_or_use(total_supplied, GLOBAL_KEY, 0u64);
-            if ts > 0u64 {
-                let tb: u64 = Mapping::get_or_use(total_borrowed, GLOBAL_KEY, 0u64);
-                let li: u64 = Mapping::get_or_use(liquidity_index, GLOBAL_KEY, INDEX_SCALE);
-                let bi: u64 = Mapping::get_or_use(borrow_index, GLOBAL_KEY, INDEX_SCALE);
-                let util: u64 = (tb * SCALE) / ts;
-                let br: u64 = BASE_RATE_PER_BLOCK + (SLOPE_PER_UTIL * util) / SCALE;
-                let sr: u64 = (br * util * (10000u64 - RESERVE_FACTOR_BPS)) / (SCALE * 10000u64);
-                let li_new: u64 = li + (li * sr * effective_delta) / INDEX_SCALE;
-                let bi_new: u64 = bi + (bi * br * effective_delta) / INDEX_SCALE;
-                liquidity_index.set(GLOBAL_KEY, li_new);
-                borrow_index.set(GLOBAL_KEY, bi_new);
-            }
-        }
-        let bi: u64 = Mapping::get_or_use(borrow_index, GLOBAL_KEY, INDEX_SCALE);
-        let scaled_delta: u64 = (amount * INDEX_SCALE) / bi;
-        let prev_scaled: u64 = Mapping::get_or_use(user_scaled_borrow, user_hash, 0u64);
-        Mapping::set(user_scaled_borrow, user_hash, prev_scaled + scaled_delta);
-
-        let current_borrows: u64 = Mapping::get_or_use(user_total_borrows, user_hash, 0u64);
-        let new_total_borrows: u64 = current_borrows + amount;
-        Mapping::set(user_total_borrows, user_hash, new_total_borrows);
-
-        if total_supplied.contains(GLOBAL_KEY) && total_borrowed.contains(GLOBAL_KEY) {
-            let prev_supplied: u64 = total_supplied.get(GLOBAL_KEY);
-            let prev_borrowed: u64 = total_borrowed.get(GLOBAL_KEY);
-            assert(prev_borrowed + amount <= prev_supplied);
-            let new_borrowed: u64 = prev_borrowed + amount;
-            total_borrowed.set(GLOBAL_KEY, new_borrowed);
-            if prev_supplied == 0u64 {
-                utilization_index.set(GLOBAL_KEY, 0u64);
-            } else {
-                let util: u64 = (new_borrowed * SCALE) / prev_supplied;
-                utilization_index.set(GLOBAL_KEY, util);
-            }
-        } else if total_supplied.contains(GLOBAL_KEY) {
-            let prev_supplied: u64 = total_supplied.get(GLOBAL_KEY);
-            assert(amount <= prev_supplied);
-            total_borrowed.set(GLOBAL_KEY, amount);
-            if prev_supplied == 0u64 {
-                utilization_index.set(GLOBAL_KEY, 0u64);
-            } else {
-                let util: u64 = (amount * SCALE) / prev_supplied;
-                utilization_index.set(GLOBAL_KEY, util);
-            }
-        } else {
-            assert(false);
-        }
-    }
-
-   
-
-    async function finalize_repay_after_transfer(f_transfer: Future, amount: u64, user_hash: field, current_block: u64) {
-        f_transfer.await();
+    async function finalize_repay(amount: u64, user_hash: field, current_block: u64, token_future: Future) {
+        token_future.await();
         let lub: u64 = Mapping::get_or_use(last_update_block, GLOBAL_KEY, 0u64);
         if current_block > lub {
             let delta: u64 = current_block - lub;
@@ -424,6 +360,62 @@ program lending_pool_v86.aleo {
         }
     }
 
+    async function finalize_borrow(amount: u64, user_hash: field, current_block: u64) {
+        let lub: u64 = Mapping::get_or_use(last_update_block, GLOBAL_KEY, 0u64);
+        if current_block > lub {
+            let delta: u64 = current_block - lub;
+            let effective_delta: u64 = (delta > MAX_ACCRUAL_DELTA) ? MAX_ACCRUAL_DELTA : delta;
+            last_update_block.set(GLOBAL_KEY, lub + effective_delta);
+            let ts: u64 = Mapping::get_or_use(total_supplied, GLOBAL_KEY, 0u64);
+            if ts > 0u64 {
+                let tb: u64 = Mapping::get_or_use(total_borrowed, GLOBAL_KEY, 0u64);
+                let li: u64 = Mapping::get_or_use(liquidity_index, GLOBAL_KEY, INDEX_SCALE);
+                let bi: u64 = Mapping::get_or_use(borrow_index, GLOBAL_KEY, INDEX_SCALE);
+                let util: u64 = (tb * SCALE) / ts;
+                let br: u64 = BASE_RATE_PER_BLOCK + (SLOPE_PER_UTIL * util) / SCALE;
+                let sr: u64 = (br * util * (10000u64 - RESERVE_FACTOR_BPS)) / (SCALE * 10000u64);
+                let li_new: u64 = li + (li * sr * effective_delta) / INDEX_SCALE;
+                let bi_new: u64 = bi + (bi * br * effective_delta) / INDEX_SCALE;
+                liquidity_index.set(GLOBAL_KEY, li_new);
+                borrow_index.set(GLOBAL_KEY, bi_new);
+            }
+        }
+        let bi: u64 = Mapping::get_or_use(borrow_index, GLOBAL_KEY, INDEX_SCALE);
+        let scaled_delta: u64 = (amount * INDEX_SCALE) / bi;
+        let prev_scaled: u64 = Mapping::get_or_use(user_scaled_borrow, user_hash, 0u64);
+        Mapping::set(user_scaled_borrow, user_hash, prev_scaled + scaled_delta);
+
+        let current_borrows: u64 = Mapping::get_or_use(user_total_borrows, user_hash, 0u64);
+        let new_total_borrows: u64 = current_borrows + amount;
+        Mapping::set(user_total_borrows, user_hash, new_total_borrows);
+
+        if total_supplied.contains(GLOBAL_KEY) && total_borrowed.contains(GLOBAL_KEY) {
+            let prev_supplied: u64 = total_supplied.get(GLOBAL_KEY);
+            let prev_borrowed: u64 = total_borrowed.get(GLOBAL_KEY);
+            assert(prev_borrowed + amount <= prev_supplied);
+            let new_borrowed: u64 = prev_borrowed + amount;
+            total_borrowed.set(GLOBAL_KEY, new_borrowed);
+            if prev_supplied == 0u64 {
+                utilization_index.set(GLOBAL_KEY, 0u64);
+            } else {
+                let util: u64 = (new_borrowed * SCALE) / prev_supplied;
+                utilization_index.set(GLOBAL_KEY, util);
+            }
+        } else if total_supplied.contains(GLOBAL_KEY) {
+            let prev_supplied: u64 = total_supplied.get(GLOBAL_KEY);
+            assert(amount <= prev_supplied);
+            total_borrowed.set(GLOBAL_KEY, amount);
+            if prev_supplied == 0u64 {
+                utilization_index.set(GLOBAL_KEY, 0u64);
+            } else {
+                let util: u64 = (amount * SCALE) / prev_supplied;
+                utilization_index.set(GLOBAL_KEY, util);
+            }
+        } else {
+            assert(false);
+        }
+    }
+
     async function finalize_accrue(current_block: u64) {
         let lub: u64 = Mapping::get_or_use(last_update_block, GLOBAL_KEY, 0u64);
         if current_block > lub {
@@ -447,12 +439,9 @@ program lending_pool_v86.aleo {
     }
 
     async function finalize_get_user_activity(user_hash: field) {
-        // This function reads from mappings but cannot return values
-        // The actual values are stored in mappings and can be read via RPC
         let total_deposits: u64 = Mapping::get_or_use(user_total_deposits, user_hash, 0u64);
         let total_withdrawals: u64 = Mapping::get_or_use(user_total_withdrawals, user_hash, 0u64);
         let total_borrows: u64 = Mapping::get_or_use(user_total_borrows, user_hash, 0u64);
         let total_repayments: u64 = Mapping::get_or_use(user_total_repayments, user_hash, 0u64);
-        // Values are in mappings, cannot return from finalize function
     }
 }
