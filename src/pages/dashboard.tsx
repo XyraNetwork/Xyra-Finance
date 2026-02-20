@@ -406,11 +406,31 @@ const DashboardPage: NextPageWithLayout = () => {
 
   const isExplorerHash = (id: string | null) => !!id && id.length >= 61;
 
+  const getErrorMessage = (e: unknown): string => {
+    if (e == null) return 'Unknown error';
+    const err = e as Record<string, unknown>;
+    const msg =
+      typeof err?.message === 'string'
+        ? err.message
+        : typeof (err?.data as any)?.message === 'string'
+          ? (err.data as { message: string }).message
+          : typeof err?.reason === 'string'
+            ? err.reason
+            : typeof err?.error === 'string'
+              ? err.error
+              : typeof err?.toString === 'function'
+                ? err.toString()
+                : String(e);
+    return msg || 'Unknown error';
+  };
+
   const openActionModal = (mode: 'withdraw' | 'deposit' | 'borrow' | 'repay', asset: 'aleo' | 'usdc', prefilledAmount?: number) => {
     setActionModalMode(mode);
     setActionModalAsset(asset);
     setActionModalSubmitted(false);
     setStatusMessage('');
+    setAmountError(null);
+    setAmountErrorUsdc(null);
     setTxId(null);
     setTxFinalized(false);
     setVaultWithdrawTxId(null);
@@ -789,19 +809,6 @@ const DashboardPage: NextPageWithLayout = () => {
   }, [address, fetchTransactionHistory]);
 
   const handleAction = async (action: 'deposit' | 'borrow' | 'repay' | 'withdraw') => {
-    console.log('========================================');
-    console.log(`🚀 BUTTON CLICKED: ${action.toUpperCase()}`);
-    console.log('========================================');
-    console.log('📊 Initial State:', {
-      action,
-      amount,
-      connected,
-      hasPublicKey: !!publicKey,
-      publicKey: publicKey?.substring(0, 20) + '...',
-      hasTransactionStatus: !!transactionStatus,
-      loading,
-    });
-    
     if (!connected) {
       const error = 'Please connect your wallet first.';
       setStatusMessage(error);
@@ -819,7 +826,6 @@ const DashboardPage: NextPageWithLayout = () => {
     }
     
     try {
-      console.log('✅ All validations passed');
       setLoading(true);
       setStatusMessage(`Executing ${action}...`);
       setAmountError(null);
@@ -838,6 +844,7 @@ const DashboardPage: NextPageWithLayout = () => {
         if (amount > (balance ?? 0)) {
           const msg = `Insufficient private Aleo. Your balance: ${(Math.floor((balance ?? 0) * 100) / 100).toFixed(2)} credits.`;
           setAmountError(msg);
+          setStatusMessage(msg);
           setLoading(false);
           return;
         }
@@ -873,7 +880,7 @@ const DashboardPage: NextPageWithLayout = () => {
               2,
             )} ALEO from your current position.`;
         setAmountError(msg);
-        console.warn(msg);
+        setStatusMessage(msg);
         setLoading(false);
         return;
       }
@@ -883,7 +890,7 @@ const DashboardPage: NextPageWithLayout = () => {
           2,
         )} ALEO to fully clear your debt.`;
         setAmountError(msg);
-        console.warn(msg);
+        setStatusMessage(msg);
         setLoading(false);
         return;
       }
@@ -891,13 +898,12 @@ const DashboardPage: NextPageWithLayout = () => {
       if (action === 'borrow' && poolStateLoaded && amount > availableLiquidity) {
         const msg = `Borrow amount exceeds available pool liquidity (${availableLiquidity.toFixed(2)} ALEO). Please reduce the amount.`;
         setAmountError(msg);
-        console.warn(msg);
+        setStatusMessage(msg);
         setLoading(false);
         return;
       }
-      
-      console.log(`📝 Calling ${action} function with:`, { amount });
 
+      setActionModalSubmitted(true);
       let tx: string;
       const startTime = Date.now();
 
@@ -1053,15 +1059,11 @@ const DashboardPage: NextPageWithLayout = () => {
           try {
             const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:4000';
             const endpoint = action === 'withdraw' ? '/withdraw' : '/borrow';
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 120_000);
             const resp = await fetch(`${backendUrl}${endpoint}`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ userAddress: publicKey, amountCredits: amount }),
-              signal: controller.signal,
             });
-            clearTimeout(timeoutId);
             const data = await resp.json().catch(() => ({}));
             const vaultTxId = resp.ok ? (data?.transactionId ?? null) : null;
             if (!resp.ok) {
@@ -1083,7 +1085,7 @@ const DashboardPage: NextPageWithLayout = () => {
               .then(() => fetchTransactionHistory())
               .catch(() => {});
           } catch (e: any) {
-            const msg = e?.name === 'AbortError' ? 'Request timed out' : (e?.message || 'Network error');
+            const msg = e?.message || 'Network error';
             setStatusMessage(`Vault ${action}: ${msg}`);
             saveTransactionToSupabase(
               publicKey,
@@ -1112,29 +1114,29 @@ const DashboardPage: NextPageWithLayout = () => {
       console.log('✅ Transaction flow completed successfully');
       console.log('========================================\n');
     } catch (e: any) {
-      console.error('========================================');
-      console.error(`❌ ERROR in ${action.toUpperCase()}:`, {
-        message: e?.message,
-        name: e?.name,
-        stack: e?.stack,
-        error: e,
-        errorString: String(e),
-        errorKeys: e ? Object.keys(e) : [],
-      });
-      console.error('========================================\n');
+      const displayMsg = getErrorMessage(e);
+      if (process.env.NODE_ENV === 'development') {
+        console.warn(`[${action}]`, displayMsg, e);
+      }
       
       // Detect wallet cancellation/rejection
-      const errorMsg = String(e?.message || e || '').toLowerCase();
+      const errorMsg = displayMsg.toLowerCase();
       const isCancelled = errorMsg.includes('cancel') || errorMsg.includes('reject') || errorMsg.includes('denied') || errorMsg.includes('user rejected');
       
       if (isCancelled) {
-        // Show toast for cancellation (not error)
         setStatusMessage('Transaction cancelled by user.');
         if (!isDevAppEnv) {
           setTimeout(() => setStatusMessage(''), 2500);
         }
       } else {
-        setStatusMessage(e?.message || `Failed to execute ${action}. Check console for details.`);
+        setStatusMessage(displayMsg);
+        const isLiquidityOrLimit =
+          errorMsg.includes('withdraw at most') ||
+          errorMsg.includes('available pool liquidity') ||
+          errorMsg.includes('free for withdrawal') ||
+          errorMsg.includes('exceeds available') ||
+          errorMsg.includes('insufficient liquidity');
+        if (isLiquidityOrLimit) setAmountError(displayMsg);
       }
     } finally {
       setLoading(false);
@@ -1160,21 +1162,33 @@ const DashboardPage: NextPageWithLayout = () => {
       const netBorrowedMicro = (effectiveUserBorrowedUsdc ?? Number(userBorrowedUsdc)) || 0;
       const poolSuppliedMicro = Number(totalSuppliedUsdc) || 0;
       const poolBorrowedMicro = Number(totalBorrowedUsdc) || 0;
-      const maxWithdrawHuman = netSuppliedMicro / USDC_SCALE;
+      const netSuppliedHuman = netSuppliedMicro / USDC_SCALE;
       const maxRepayHuman = netBorrowedMicro / USDC_SCALE;
       const availableLiquidityHuman = Math.max(0, (poolSuppliedMicro - poolBorrowedMicro) / USDC_SCALE);
+      const poolStateLoadedUsdc = poolSuppliedMicro > 0 || poolBorrowedMicro > 0;
+      const maxWithdrawHuman = poolStateLoadedUsdc
+        ? Math.min(netSuppliedHuman, availableLiquidityHuman)
+        : netSuppliedHuman;
       if (action === 'withdraw' && amountUsdc > maxWithdrawHuman) {
-        setAmountErrorUsdc(`You can withdraw at most ${maxWithdrawHuman.toFixed(2)} USDC.`);
+        const msg = poolStateLoadedUsdc && availableLiquidityHuman < netSuppliedHuman
+          ? `You can withdraw at most ${maxWithdrawHuman.toFixed(2)} USDCx (available pool liquidity). Your position is ${netSuppliedHuman.toFixed(2)} USDCx but only ${availableLiquidityHuman.toFixed(2)} USDCx is free for withdrawal.`
+          : `You can withdraw at most ${netSuppliedHuman.toFixed(2)} USDCx from your current position.`;
+        setAmountErrorUsdc(msg);
+        setStatusMessage(msg);
         setLoading(false);
         return;
       }
       if (action === 'repay' && amountUsdc > maxRepayHuman) {
-        setAmountErrorUsdc(`Repay at most ${maxRepayHuman.toFixed(2)} USDC.`);
+        const msg = `Repay at most ${maxRepayHuman.toFixed(2)} USDCx.`;
+        setAmountErrorUsdc(msg);
+        setStatusMessage(msg);
         setLoading(false);
         return;
       }
       if (action === 'borrow' && amountUsdc > availableLiquidityHuman) {
-        setAmountErrorUsdc(`Borrow exceeds available liquidity (${availableLiquidityHuman.toFixed(2)}).`);
+        const msg = `Borrow exceeds available liquidity (${availableLiquidityHuman.toFixed(2)} USDCx).`;
+        setAmountErrorUsdc(msg);
+        setStatusMessage(msg);
         setLoading(false);
         return;
       }
@@ -1192,6 +1206,7 @@ const DashboardPage: NextPageWithLayout = () => {
           return;
         }
       }
+      setActionModalSubmitted(true);
       let tx: string;
       switch (action) {
         case 'deposit': {
@@ -1316,16 +1331,12 @@ const DashboardPage: NextPageWithLayout = () => {
         if (publicKey) {
           try {
             const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:4000';
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 120_000);
             const endpoint = action === 'withdraw' ? '/withdraw-usdc' : '/borrow-usdc';
             const resp = await fetch(`${backendUrl}${endpoint}`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ userAddress: publicKey, amountUsdc }),
-              signal: controller.signal,
             });
-            clearTimeout(timeoutId);
             const data = await resp.json().catch(() => ({}));
             const vaultTxId = resp.ok ? (data?.transactionId ?? null) : null;
             if (vaultTxId) {
@@ -1338,7 +1349,7 @@ const DashboardPage: NextPageWithLayout = () => {
             }
             saveTransactionToSupabase(publicKey, finalTxId, action, 'usdcx', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID, vaultTxId).then(() => fetchTransactionHistory()).catch(() => {});
           } catch (e: any) {
-            setStatusMessage(e?.name === 'AbortError' ? 'Vault request timed out.' : (e?.message || 'Vault request failed.'));
+            setStatusMessage(e?.message || 'Vault request failed.');
             saveTransactionToSupabase(publicKey, finalTxId, action, 'usdcx', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID).then(() => fetchTransactionHistory()).catch(() => {});
           }
         }
@@ -1352,7 +1363,16 @@ const DashboardPage: NextPageWithLayout = () => {
         setStatusMessage('USDC flow complete. Click Refresh to update pool.');
       }
     } catch (e: any) {
-      setStatusMessage(e?.message || `USDC ${action} failed.`);
+      const displayMsg = getErrorMessage(e);
+      setStatusMessage(displayMsg);
+      const errorLower = displayMsg.toLowerCase();
+      const isLiquidityOrLimit =
+        errorLower.includes('withdraw at most') ||
+        errorLower.includes('available pool liquidity') ||
+        errorLower.includes('free for withdrawal') ||
+        errorLower.includes('exceeds available') ||
+        errorLower.includes('insufficient liquidity');
+      if (isLiquidityOrLimit) setAmountErrorUsdc(displayMsg);
     } finally {
       setLoading(false);
     }
@@ -1886,7 +1906,15 @@ const DashboardPage: NextPageWithLayout = () => {
                       <span>{remainingSupply.toFixed(7)} {actionModalAsset === 'aleo' ? 'ALEO' : 'USDCx'}</span>
                     </div>
                   </div>
-                  {statusMessage && <p className="text-sm text-error">{statusMessage}</p>}
+                  {(actionModalAsset === 'aleo' ? amountError : amountErrorUsdc) ? (
+                    <div className="rounded-lg bg-error/15 border border-error/30 px-4 py-3 text-error text-sm">
+                      {actionModalAsset === 'aleo' ? amountError : amountErrorUsdc}
+                    </div>
+                  ) : statusMessage ? (
+                    <div className="rounded-lg bg-error/15 border border-error/30 px-4 py-3 text-error text-sm">
+                      {statusMessage}
+                    </div>
+                  ) : null}
                   <button
                     type="button"
                     className="btn btn-primary w-full"
@@ -1897,7 +1925,6 @@ const DashboardPage: NextPageWithLayout = () => {
                       modalAmount > modalMaxAmount
                     }
                     onClick={async () => {
-                      setActionModalSubmitted(true);
                       if (actionModalAsset === 'usdc') {
                         await handleActionUsdc(actionModalMode);
                       } else {
@@ -1926,9 +1953,19 @@ const DashboardPage: NextPageWithLayout = () => {
                       ) : (
                         <p className="text-sm text-base-content/70">Processing…</p>
                       )}
+                      {statusMessage ? (
+                        <div className={`rounded-lg px-4 py-3 mt-2 max-w-sm w-full text-center text-sm ${statusMessage.includes('at most') || statusMessage.includes('liquidity') || statusMessage.includes('Failed') || statusMessage.includes('Insufficient') || statusMessage.includes('free for withdrawal') ? 'bg-error/15 text-error' : 'text-base-content/70'}`}>
+                          {statusMessage}
+                        </div>
+                      ) : null}
                     </div>
                   ) : (
                     <>
+                      {statusMessage && !txFinalized ? (
+                        <div className="rounded-lg bg-error/15 border border-error/30 px-4 py-3 text-error text-sm text-center w-full">
+                          {statusMessage}
+                        </div>
+                      ) : null}
                       {txFinalized && txId ? (
                         <a
                           href={getProvableExplorerTxUrl(txId)}
@@ -1950,9 +1987,6 @@ const DashboardPage: NextPageWithLayout = () => {
                         >
                           View vault transfer in explorer
                         </a>
-                      ) : null}
-                      {statusMessage && !txFinalized ? (
-                        <p className="text-sm text-error text-center">{statusMessage}</p>
                       ) : null}
                       <button type="button" className="btn btn-primary w-full mt-2" onClick={closeActionModal}>
                         Close
