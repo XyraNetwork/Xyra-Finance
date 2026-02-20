@@ -7,6 +7,33 @@ import { logTestnetStatus } from './checkTestnet.js';
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// In-process queue for vault operations: one at a time to avoid RPC overload and vault key contention.
+// Set VAULT_QUEUE_CONCURRENCY to 2 or 3 if your RPC supports limited parallelism (default 1).
+const VAULT_QUEUE_CONCURRENCY = Math.max(1, Math.min(10, Number(process.env.VAULT_QUEUE_CONCURRENCY) || 1));
+const vaultQueue = [];
+let vaultQueueRunning = 0;
+
+function runVaultTask(fn) {
+  return new Promise((resolve, reject) => {
+    vaultQueue.push({ fn, resolve, reject });
+    processVaultQueue();
+  });
+}
+
+function processVaultQueue() {
+  while (vaultQueueRunning < VAULT_QUEUE_CONCURRENCY && vaultQueue.length > 0) {
+    const entry = vaultQueue.shift();
+    vaultQueueRunning += 1;
+    Promise.resolve(entry.fn())
+      .then((result) => entry.resolve(result))
+      .catch((err) => entry.reject(err))
+      .finally(() => {
+        vaultQueueRunning -= 1;
+        processVaultQueue();
+      });
+  }
+}
+
 // Allow frontend origin to call this backend
 const allowedOrigin = process.env.CORS_ORIGIN || 'http://localhost:3003';
 app.use(
@@ -33,8 +60,8 @@ app.post('/withdraw', async (req, res) => {
       amountCredits: amount,
     });
 
-    // Await vault transfer so we can return the transaction ID to the frontend
-    const transactionId = await runWithdrawal(userAddress, amount);
+    // Queue vault transfer so we don't run 100 concurrent vault ops
+    const transactionId = await runVaultTask(() => runWithdrawal(userAddress, amount));
     return res.json({ ok: true, transactionId });
   } catch (err) {
     console.error('❌ /withdraw handler failed:', err);
@@ -59,7 +86,7 @@ app.post('/borrow', async (req, res) => {
       amountCredits: amount,
     });
 
-    const transactionId = await runBorrow(userAddress, amount);
+    const transactionId = await runVaultTask(() => runBorrow(userAddress, amount));
     return res.json({ ok: true, transactionId });
   } catch (err) {
     console.error('❌ /borrow handler failed:', err);
@@ -84,7 +111,7 @@ app.post('/withdraw-usdc', async (req, res) => {
       amountUsdc: amount,
     });
 
-    const transactionId = await runWithdrawalUsdc(userAddress, amount);
+    const transactionId = await runVaultTask(() => runWithdrawalUsdc(userAddress, amount));
     return res.json({ ok: true, transactionId });
   } catch (err) {
     console.error('❌ /withdraw-usdc handler failed:', err);
@@ -109,7 +136,7 @@ app.post('/borrow-usdc', async (req, res) => {
       amountUsdc: amount,
     });
 
-    const transactionId = await runBorrowUsdc(userAddress, amount);
+    const transactionId = await runVaultTask(() => runBorrowUsdc(userAddress, amount));
     return res.json({ ok: true, transactionId });
   } catch (err) {
     console.error('❌ /borrow-usdc handler failed:', err);
@@ -120,6 +147,7 @@ app.post('/borrow-usdc', async (req, res) => {
 
 app.listen(PORT, async () => {
   console.log(`✅ Vault backend (withdraw + borrow) listening on http://localhost:${PORT}`);
+  console.log(`   Vault queue: concurrency ${VAULT_QUEUE_CONCURRENCY} (set VAULT_QUEUE_CONCURRENCY in .env to change)`);
   await logTestnetStatus();
 });
 

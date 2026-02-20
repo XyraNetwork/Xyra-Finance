@@ -80,7 +80,24 @@ export function MarketsView() {
 
         <div className="rounded-xl bg-base-200 border border-base-300 overflow-hidden">
           <div className="p-4 border-b border-base-300">
-            <h2 className="text-lg font-semibold">Reserve overview</h2>
+            <h2 className="text-lg font-semibold">
+              Reserve overview
+              {process.env.NEXT_PUBLIC_VAULT_ADDRESS?.trim() ? (
+                <>
+                  {' '}
+                  (
+                  <a
+                    href={`https://testnet.explorer.provable.com/address/${process.env.NEXT_PUBLIC_VAULT_ADDRESS.trim()}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="link link-primary"
+                  >
+                    Vault
+                  </a>
+                  )
+                </>
+              ) : null}
+            </h2>
             <p className="text-xs text-base-content/70 mt-0.5">
               Supply and borrow APY, total supplied, total borrowed, and available liquidity.
             </p>
