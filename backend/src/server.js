@@ -34,13 +34,18 @@ function processVaultQueue() {
   }
 }
 
-// Allow frontend origin to call this backend
-const allowedOrigin = process.env.CORS_ORIGIN || 'http://localhost:3003';
-app.use(
-  cors({
-    origin: allowedOrigin,
-  }),
-);
+// Allow frontend origin(s) to call this backend. Comma-separated for multiple (e.g. production + local).
+const corsOriginEnv = process.env.CORS_ORIGIN || 'http://localhost:3003';
+const allowedOrigins = corsOriginEnv.split(',').map((o) => o.trim()).filter(Boolean);
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    if (allowedOrigins.length === 1 && allowedOrigins[0] === '*') return cb(null, true);
+    cb(null, false);
+  },
+};
+app.use(cors(corsOptions));
 
 app.use(express.json());
 
