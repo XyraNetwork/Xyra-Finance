@@ -411,6 +411,8 @@ const DashboardPage: NextPageWithLayout = () => {
     setActionModalAsset(asset);
     setActionModalSubmitted(false);
     setStatusMessage('');
+    setTxId(null);
+    setTxFinalized(false);
     setVaultWithdrawTxId(null);
     setVaultBorrowTxId(null);
     if (prefilledAmount != null) {
@@ -1916,7 +1918,14 @@ const DashboardPage: NextPageWithLayout = () => {
                   {loading || (txId && !txFinalized) ? (
                     <div className="flex flex-col items-center justify-center py-8 gap-3">
                       <span className="loading loading-spinner loading-lg" />
-                      <p className="text-sm text-base-content/70">Processing…</p>
+                      {txFinalized && txId && (actionModalMode === 'withdraw' || actionModalMode === 'borrow') ? (
+                        <>
+                          <p className="text-sm font-medium text-base-content">Program transaction confirmed.</p>
+                          <p className="text-sm text-base-content/70">Initiating vault transfer…</p>
+                        </>
+                      ) : (
+                        <p className="text-sm text-base-content/70">Processing…</p>
+                      )}
                     </div>
                   ) : (
                     <>
