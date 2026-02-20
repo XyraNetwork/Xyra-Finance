@@ -1,186 +1,170 @@
-### Xyra Finance – Lending Pool Program (`lending_pool_v8.aleo`)
+# Xyra Finance – Private Lending & Borrowing on Aleo
+
+**Live demo:** [https://xyra-finance.vercel.app/](https://xyra-finance.vercel.app/)
+
+Xyra Finance is a **privacy-first lending and borrowing protocol** on Aleo—inspired by Aave and rebuilt for zero-knowledge execution. Supply, borrow, and manage capital with confidential positions, utilization-based interest, and vault-backed withdraw/borrow flows.
 
 ---
 
 ## Overview
 
-**Xyra Finance** is a privacy-first lending and borrowing protocol on **Aleo**. We are building the **first fully private money market** on Aleo—inspired by Aave’s design but reimplemented from the ground up to use zero-knowledge privacy.
-
-**What we’re doing**
-
-- **Problem**: Existing DeFi lending (Aave, Compound) exposes user balances and strategies, attracts MEV and liquidation sniping, and is unsuitable for institutions and DAOs. Privacy chains today lack full money-market mechanics (supply, borrow, repay, interest, liquidations).
-- **Solution**: A complete lending protocol where **deposits, borrows, repayments, withdrawals, and interest** are tracked on-chain, but **user positions stay private** (encrypted Aleo records). Pool-level metrics (TVL, utilization, interest index) remain provable without revealing individual data.
-- **Current status (Wave 1)**: We have implemented and deployed a **single-asset lending pool** (`lending_pool_v8.aleo`) with all core features—deposit, borrow, repay, withdraw, accrue interest, utilization tracking—and a **web dApp** that connects Aleo wallets, executes transactions, and fetches/decrypts user records to show positions. This is **state tracking only** (no real asset/token integration yet); it is the foundation for the full private money market we are building.
-
-**Vision**: Establish Aleo as the **private credit layer of Web3**—MEV-free, compliant-friendly, and capable of undercollateralized and institutional lending in future phases.
+- **Problem:** Public DeFi lending exposes balances and strategies, attracts MEV and liquidation sniping, and is unsuitable for institutions and regulated entities.
+- **Solution:** A full lending protocol on Aleo where **deposits, borrows, repayments, withdrawals, and interest** are tracked on-chain, **user positions stay private** (Aleo records), and pool-level metrics (TVL, utilization, APY) remain provable.
+- **Current status:** Two lending pools (ALEO and USDCx) with deposit, borrow, repay, withdraw, interest accrual, and a **vault backend** that sends credits/tokens to users after on-chain finalization. A **Next.js dApp** provides Dashboard, Markets, and Docs views with wallet connection, transaction history (Supabase), and APY tooltips.
 
 ---
 
-### About this directory
+## Repository structure
 
-This directory contains the **core Leo program** for Xyra Finance. The current on‑chain component (`lending_pool_v8.aleo`) implements a **single‑asset lending pool** with:
-
-- **Deposits** (supply)  
-- **Borrows**  
-- **Repayments**  
-- **Withdrawals**  
-- **Interest accrual & utilization tracking**  
-- **Private per‑user activity via Aleo records**
-
-This is the foundation of our Wave Hacks submission: a **private money market on Aleo**. The frontend and integration logic live in the root `Aave-Aleo` project; this `program/` folder is focused on the Leo contracts and tests.
+| Path | Description |
+|------|-------------|
+| **`/`** | Next.js frontend (dashboard, Markets, Docs, wallet integration, transaction history) |
+| **`program/`** | Leo programs: ALEO pool and USDCx pool (e.g. `lending_pool_v86.aleo`, `lending_pool_usdce_v86.aleo`) |
+| **`backend/`** | Express vault server: POST `/withdraw`, `/borrow`, `/withdraw-usdc`, `/borrow-usdc`; in-process queue for concurrency |
+| **`supabase/`** | Schema for `transaction_history` (wallet, tx_id, type, asset, amount, vault_tx_id, vault_explorer_url) |
+| **`docs/`** | Second-wave submission, Wave 3/4 ideas; **`backend/docs/CONCURRENCY.md`** for vault queue behavior |
 
 ---
 
-### 1. Features (Current Wave)
+## Features (current)
 
-The `lending_pool_v8.aleo` program (see `src/main.leo`) includes:
+### Leo programs
 
-- **Upgradable constructor**
-  - Uses Leo’s `@admin` mechanism so the program can be upgraded by a designated admin address.
+- **ALEO pool** and **USDCx pool**: deposit, borrow, repay, withdraw, accrue interest, utilization-based rate model.
+- **Public pool state:** total_supplied, total_borrowed, interest indices, utilization.
+- **Private user activity:** UserActivity records (total_deposits, total_withdrawals, total_borrows, total_repayments) in private mappings.
+- **Transitions:** deposit, borrow, repay, withdraw, accrue_interest, plus helpers (get_address_hash, get_user_activity).
 
-- **Public pool state (aggregates)**
-  - `total_supplied`
-  - `total_borrowed`
-  - `interest_index`
-  - `utilization_index`
-  - All tracked as public mappings keyed by a global pool key.
+### Frontend (Next.js)
 
-- **Private user activity**
-  - `UserActivity` record with:
-    - `owner`
-    - `total_deposits`
-    - `total_withdrawals`
-    - `total_borrows`
-    - `total_repayments`
-  - Per‑user aggregates stored in private mappings keyed by a **hashed address** (`field`) for privacy.
+- **Dashboard / Markets / Docs** views (single app; wallet state preserved across views).
+- **Assets to supply & borrow:** ALEO and USDCx with Supply APY / Borrow APY and info tooltips.
+- **Your supplies & borrows:** Private columns with loading spinners; Supply, Borrow, Withdraw, Repay with amount validation and “Available to borrow” for borrow modals.
+- **Transaction modals:** Processing → “View in explorer” and “View vault transfer” (when vault tx is returned); no vault message before the program tx is confirmed.
+- **Transaction history:** Paginated (10 per page), stored in Supabase with optional vault tx link; asset shown as ALEO / USDCx.
+- **Markets:** Reserve overview table (total supplied, borrowed, liquidity, Supply APY, Borrow APY) with optional vault explorer link when `NEXT_PUBLIC_VAULT_ADDRESS` is set.
+- **Docs:** In-app documentation (wallet, flows, APY, Supabase, vault backend, env).
 
-- **Core transitions**
-  - `deposit(amount: u64)`  
-  - `borrow(amount: u64)`  
-  - `repay(amount: u64)`  
-  - `withdraw(amount: u64)`  
-  - `accrue_interest(delta_index: u64)`  
-  - `get_address_hash()`  
-  - `get_user_activity()`
+### Backend (Express)
 
-All state‑changing operations are implemented as `async transition` + `async finalize_*` pairs, aligning with Aleo’s execution model.
+- **Vault endpoints:** POST `/withdraw`, `/borrow` (ALEO credits), `/withdraw-usdc`, `/borrow-usdc` (USDCx).
+- **In-process queue:** Vault operations run through a queue (default concurrency 1) to avoid RPC overload and vault key contention when many users hit at once. See **`backend/docs/CONCURRENCY.md`**.
+- **CORS:** Configurable via `CORS_ORIGIN` (comma-separated) for production frontends (e.g. Vercel).
+
+### Data (Supabase)
+
+- **transaction_history:** wallet_address, tx_id, type (deposit/withdraw/borrow/repay), asset (aleo/usdcx), amount, program_id, explorer_url, vault_tx_id, vault_explorer_url. RLS for anon SELECT/INSERT with publishable key.
 
 ---
 
-### 2. Roadmap (Contract Side)
+## Tech stack
 
-**Phase 1 – Completed (this repo)**  
-- Single‑asset lending pool (`lending_pool_v8.aleo`).  
-- Over‑collateralized borrowing logic.  
-- Pool‑level interest index & utilization index.  
-- Basic liquidation/risk constraints inside the pool (no real token transfers yet).  
-
-**Phase 2 – Planned**  
-- Multi‑asset pools and pool configuration.  
-- Position manager program for aggregated user state.  
-- Liquidation controller and richer risk engine (separate Leo modules).  
-
-**Phase 3 – Planned**  
-- ZK credit primitives and under‑collateralized lending.  
-- Oracle adapter for external price feeds.  
-- Specialized institutional / DAO pools with custom risk parameters.
+- **Frontend:** Next.js, React, `@provablehq/aleo-wallet-adaptor-react`, Supabase client.
+- **Programs:** Leo (Aleo); target Aleo Testnet.
+- **Backend:** Node.js, Express, `cors`, `dotenv`, Provable SDK.
+- **Data:** Supabase (Postgres, RLS, publishable key for frontend).
 
 ---
 
-### 3. Tech Stack
+## Setup & run
 
-- **Language**: Leo (ProvableHQ Aleo smart contract language)  
-- **Target chain**: Aleo Testnet (for current deployment)  
-- **Core program**: `lending_pool_v8.aleo` (`src/main.leo`)  
-- **Tests**: `program/tests/test_lending_pool.leo` (basic harness against `lending_pool_v8.aleo`)  
+### 1. Frontend
 
-The frontend, wallet integration, and off‑chain logic are in the root project (Next.js + React + `@provablehq/aleo-wallet-adaptor-*`), and interact with this program via standard Aleo transaction flows.
+```bash
+cp .env.example .env
+# Edit .env: NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_PUB_KEY;
+# optional: NEXT_PUBLIC_BACKEND_URL, NEXT_PUBLIC_VAULT_ADDRESS
+npm install
+npm run dev
+```
 
----
+- **NEXT_PUBLIC_BACKEND_URL:** Backend base URL for vault calls. For production (e.g. Vercel), set to your deployed backend (e.g. `https://your-app.railway.app`).
 
-### 4. Setup & Build Instructions
+### 2. Backend (vault server)
 
-#### 4.1 Prerequisites
+```bash
+cd backend
+cp .env.example .env
+# Edit .env: ALEO_RPC_URL, VAULT_ADDRESS, VAULT_PRIVATE_KEY;
+# for production frontend: CORS_ORIGIN=https://xyra-finance.vercel.app (or comma-separated list)
+npm install
+npm run dev
+```
 
-- **Leo** CLI installed (see official docs for installation).  
-- A recent Rust toolchain (if building Leo from source).  
-- (Optional) Aleo account / keys configured in `.env` for deployment and real executions.
+- **CORS_ORIGIN:** Required when the frontend is on a different domain (e.g. Vercel). Comma-separated for multiple origins.
+- **VAULT_QUEUE_CONCURRENCY:** Default 1; optional 2–3 if RPC supports limited parallelism (see `backend/docs/CONCURRENCY.md`).
 
-From the `program/` directory:
+### 3. Leo programs
 
 ```bash
 cd program
-```
-
-#### 4.2 Install / Initialize
-
-If this project was created with `leo new`, the scaffolding is already in place. To verify:
-
-```bash
-leo info
-```
-
-You should see `lending_pool_v8.aleo` as the main program in `src/main.leo`.
-
-#### 4.3 Build
-
-Compile the program:
-
-```bash
 leo build
-```
-
-This will:
-
-- Type‑check the Leo code.  
-- Generate the Aleo program artifacts in `build/`.  
-
-#### 4.4 Run Transitions Locally
-
-You can execute transitions with sample inputs using:
-
-```bash
-# Example: simulate a deposit of 100 units
-leo run deposit 100u64
-
-# Example: simulate accrue_interest with a delta index of 10_000 (scaled)
-leo run accrue_interest 10000u64
-```
-
-Note: these `leo run` commands execute locally and **do not** interact with the real Aleo network; they’re for development and testing of constraints.
-
-#### 4.5 Tests
-
-The `tests/test_lending_pool.leo` file provides a minimal harness that imports `lending_pool_v8.aleo`:
-
-```bash
 leo test
 ```
 
-This validates that the program builds and that the test harness itself compiles and runs. Because `lending_pool_v8.aleo` uses `async` transitions and `Future`s, full end‑to‑end behavioral tests are primarily handled via the frontend and manual flows (see the root project docs).
+### 4. Supabase
+
+- Create a project and run **`supabase/schema.sql`** in the SQL Editor (creates `transaction_history`, indexes, RLS).
+- Use Project → Settings → API for `NEXT_PUBLIC_SUPABASE_URL` and the publishable key (`NEXT_PUBLIC_SUPABASE_PUB_KEY`).
 
 ---
 
-### 5. Frontend Integration (High‑Level)
+## Environment variables
 
-The main dApp lives in the root of the repository (`Aave-Aleo`), and:
+### Frontend (`.env`)
 
-- Connects to Aleo wallets via `@provablehq/aleo-wallet-adaptor-react`.  
-- Executes transitions (deposit, borrow, repay, withdraw, accrue_interest) via `executeTransaction`.  
-- Fetches and decrypts user records from `lending_pool_v8.aleo` to display:
-  - Total Deposits  
-  - Total Withdrawals  
-  - Total Borrows  
-  - Total Repayments  
-  - Net supplied / net borrowed positions  
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `NEXT_PUBLIC_SUPABASE_URL` | Yes | Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_PUB_KEY` | Yes | Supabase publishable (anon) key |
+| `NEXT_PUBLIC_BACKEND_URL` | No | Vault backend URL (default `http://localhost:4000`) |
+| `NEXT_PUBLIC_VAULT_ADDRESS` | No | Shown as vault explorer link on Markets page |
+| `NEXT_PUBLIC_APP_ENV` | No | e.g. `prod` |
 
-For details on wallet integration and UI, see the main project README at the repo root.
+### Backend (`backend/.env`)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ALEO_RPC_URL` | Yes | Aleo RPC endpoint (e.g. Provable) |
+| `VAULT_ADDRESS` | Yes | Vault wallet address |
+| `VAULT_PRIVATE_KEY` | Yes | Vault private key (never commit) |
+| `CORS_ORIGIN` | Yes for prod | Allowed frontend origin(s), comma-separated |
+| `VAULT_QUEUE_CONCURRENCY` | No | Default 1; 2–3 if RPC allows |
+| `WITHDRAW_FEE_CREDITS` / `BORROW_FEE_CREDITS` | No | Optional fees for vault→user transfers |
+| USDC block vars | No | Optional for USDC record search |
 
 ---
 
-### 6. Contributing
+## Deployment
 
-- Contract changes should keep **backwards compatibility** in mind where possible (especially for future upgrades).  
-- Please run `leo build` and `leo test` before opening a PR that touches `src/main.leo` or `tests/`.  
-- For larger architectural changes (new modules like `risk_engine` or `position_manager`), keep contracts small, composable, and well‑documented.
-  
+- **Frontend (Vercel):** Set `NEXT_PUBLIC_BACKEND_URL` to your deployed backend URL. Redeploy after adding env vars.
+- **Backend:** Set `CORS_ORIGIN` to your frontend origin(s), e.g. `https://xyra-finance.vercel.app`. Multiple origins: comma-separated. Redeploy after changing CORS or queue settings.
+
+---
+
+## Concurrency (many users at once)
+
+The vault backend uses an **in-process queue** so that many simultaneous withdraw/borrow requests do not overload the RPC or the single vault key. Requests are processed in order (default one at a time). For details and tuning, see **`backend/docs/CONCURRENCY.md`**.
+
+---
+
+## Roadmap
+
+- **Phase 1 (current):** Single-asset-style ALEO and USDCx pools, over-collateralized borrowing, vault-backed transfers, dashboard + Markets + Docs, transaction history, APY and concurrency handling.
+- **Phase 2+:** Multi-asset pools, liquidations, governance, flash loans, staking, oracles. See **`docs/WAVE_3_AND_WAVE_4_IDEAS.md`**.
+
+---
+
+## Contributing
+
+- Run `leo build` and `leo test` in `program/` for contract changes.
+- Keep backward compatibility in mind for upgrades.
+- For larger changes (new modules, risk engine, position manager), keep contracts small and documented.
+
+---
+
+## Links
+
+- **Live app:** [https://xyra-finance.vercel.app/](https://xyra-finance.vercel.app/)
+- **Second-wave summary:** `docs/SECOND_WAVE_SUBMISSION.md`
+- **Backend concurrency:** `backend/docs/CONCURRENCY.md`
