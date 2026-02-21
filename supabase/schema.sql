@@ -15,12 +15,15 @@ CREATE TABLE IF NOT EXISTS transaction_history (
   explorer_url TEXT,
   vault_tx_id TEXT,
   vault_explorer_url TEXT,
+  status TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- If table already exists, add vault columns (run once)
 ALTER TABLE transaction_history ADD COLUMN IF NOT EXISTS vault_tx_id TEXT;
 ALTER TABLE transaction_history ADD COLUMN IF NOT EXISTS vault_explorer_url TEXT;
+ALTER TABLE transaction_history ADD COLUMN IF NOT EXISTS status TEXT;
+COMMENT ON COLUMN transaction_history.status IS 'Optional: vault_pending (withdraw/borrow queued), completed (vault done). UI infers from vault_tx_id when null.';
 
 -- If you already had asset CHECK (asset IN ('aleo', 'usdc')), run this to allow only usdcx:
 -- ALTER TABLE transaction_history DROP CONSTRAINT IF EXISTS transaction_history_asset_check;
