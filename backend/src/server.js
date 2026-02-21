@@ -3,6 +3,8 @@ import express from 'express';
 import cors from 'cors';
 import { runWithdrawal, runBorrow, runWithdrawalUsdc, runBorrowUsdc } from './processWithdrawal.js';
 import { logTestnetStatus } from './checkTestnet.js';
+import { updateVaultTx, setVaultStatus } from './supabase.js';
+import { startVaultWatcher } from './vaultWatcher.js';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -51,7 +53,7 @@ app.use(express.json());
 
 app.post('/withdraw', async (req, res) => {
   try {
-    const { userAddress, amountCredits } = req.body || {};
+    const { userAddress, amountCredits, finalTxId } = req.body || {};
     if (!userAddress || typeof userAddress !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid userAddress' });
     }
@@ -59,15 +61,24 @@ app.post('/withdraw', async (req, res) => {
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Missing or invalid amountCredits' });
     }
+    if (!finalTxId || typeof finalTxId !== 'string') {
+      return res.status(400).json({ error: 'Missing or invalid finalTxId' });
+    }
 
-    console.log('📥 Received withdrawal request from frontend:', {
-      userAddress,
-      amountCredits: amount,
-    });
+    console.log('📥 Queuing withdrawal from frontend:', { userAddress, amountCredits: amount, finalTxId });
+    const { rowsUpdated } = await setVaultStatus(userAddress, finalTxId, 'withdraw', 'vault_processing');
+    if (rowsUpdated > 0) {
+      runVaultTask(() => runWithdrawal(userAddress, amount))
+        .then((transactionId) => {
+          return updateVaultTx(userAddress, finalTxId, 'withdraw', transactionId);
+        })
+        .catch((err) => {
+          console.error('❌ Vault withdraw task failed:', err);
+          setVaultStatus(userAddress, finalTxId, 'withdraw', 'vault_pending');
+        });
+    }
 
-    // Queue vault transfer so we don't run 100 concurrent vault ops
-    const transactionId = await runVaultTask(() => runWithdrawal(userAddress, amount));
-    return res.json({ ok: true, transactionId });
+    return res.json({ ok: true, queued: true });
   } catch (err) {
     console.error('❌ /withdraw handler failed:', err);
     const message = err?.message || 'Internal server error';
@@ -77,7 +88,7 @@ app.post('/withdraw', async (req, res) => {
 
 app.post('/borrow', async (req, res) => {
   try {
-    const { userAddress, amountCredits } = req.body || {};
+    const { userAddress, amountCredits, finalTxId } = req.body || {};
     if (!userAddress || typeof userAddress !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid userAddress' });
     }
@@ -85,14 +96,24 @@ app.post('/borrow', async (req, res) => {
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Missing or invalid amountCredits' });
     }
+    if (!finalTxId || typeof finalTxId !== 'string') {
+      return res.status(400).json({ error: 'Missing or invalid finalTxId' });
+    }
 
-    console.log('📥 Received borrow request from frontend:', {
-      userAddress,
-      amountCredits: amount,
-    });
+    console.log('📥 Queuing borrow from frontend:', { userAddress, amountCredits: amount, finalTxId });
+    const { rowsUpdated } = await setVaultStatus(userAddress, finalTxId, 'borrow', 'vault_processing');
+    if (rowsUpdated > 0) {
+      runVaultTask(() => runBorrow(userAddress, amount))
+        .then((transactionId) => {
+          return updateVaultTx(userAddress, finalTxId, 'borrow', transactionId);
+        })
+        .catch((err) => {
+          console.error('❌ Vault borrow task failed:', err);
+          setVaultStatus(userAddress, finalTxId, 'borrow', 'vault_pending');
+        });
+    }
 
-    const transactionId = await runVaultTask(() => runBorrow(userAddress, amount));
-    return res.json({ ok: true, transactionId });
+    return res.json({ ok: true, queued: true });
   } catch (err) {
     console.error('❌ /borrow handler failed:', err);
     const message = err?.message || 'Internal server error';
@@ -102,7 +123,7 @@ app.post('/borrow', async (req, res) => {
 
 app.post('/withdraw-usdc', async (req, res) => {
   try {
-    const { userAddress, amountUsdc } = req.body || {};
+    const { userAddress, amountUsdc, finalTxId } = req.body || {};
     if (!userAddress || typeof userAddress !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid userAddress' });
     }
@@ -110,14 +131,24 @@ app.post('/withdraw-usdc', async (req, res) => {
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Missing or invalid amountUsdc (u64 human, e.g. 1 = 1 USDC)' });
     }
+    if (!finalTxId || typeof finalTxId !== 'string') {
+      return res.status(400).json({ error: 'Missing or invalid finalTxId' });
+    }
 
-    console.log('📥 Received USDC withdrawal request from frontend:', {
-      userAddress,
-      amountUsdc: amount,
-    });
+    console.log('📥 Queuing USDC withdrawal from frontend:', { userAddress, amountUsdc: amount, finalTxId });
+    const { rowsUpdated } = await setVaultStatus(userAddress, finalTxId, 'withdraw', 'vault_processing');
+    if (rowsUpdated > 0) {
+      runVaultTask(() => runWithdrawalUsdc(userAddress, amount))
+        .then((transactionId) => {
+          return updateVaultTx(userAddress, finalTxId, 'withdraw', transactionId);
+        })
+        .catch((err) => {
+          console.error('❌ Vault withdraw-usdc task failed:', err);
+          setVaultStatus(userAddress, finalTxId, 'withdraw', 'vault_pending');
+        });
+    }
 
-    const transactionId = await runVaultTask(() => runWithdrawalUsdc(userAddress, amount));
-    return res.json({ ok: true, transactionId });
+    return res.json({ ok: true, queued: true });
   } catch (err) {
     console.error('❌ /withdraw-usdc handler failed:', err);
     const message = err?.message || 'Internal server error';
@@ -127,7 +158,7 @@ app.post('/withdraw-usdc', async (req, res) => {
 
 app.post('/borrow-usdc', async (req, res) => {
   try {
-    const { userAddress, amountUsdc } = req.body || {};
+    const { userAddress, amountUsdc, finalTxId } = req.body || {};
     if (!userAddress || typeof userAddress !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid userAddress' });
     }
@@ -135,14 +166,24 @@ app.post('/borrow-usdc', async (req, res) => {
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Missing or invalid amountUsdc (u64 human, e.g. 1 = 1 USDC)' });
     }
+    if (!finalTxId || typeof finalTxId !== 'string') {
+      return res.status(400).json({ error: 'Missing or invalid finalTxId' });
+    }
 
-    console.log('📥 Received USDC borrow request from frontend:', {
-      userAddress,
-      amountUsdc: amount,
-    });
+    console.log('📥 Queuing USDC borrow from frontend:', { userAddress, amountUsdc: amount, finalTxId });
+    const { rowsUpdated } = await setVaultStatus(userAddress, finalTxId, 'borrow', 'vault_processing');
+    if (rowsUpdated > 0) {
+      runVaultTask(() => runBorrowUsdc(userAddress, amount))
+        .then((transactionId) => {
+          return updateVaultTx(userAddress, finalTxId, 'borrow', transactionId);
+        })
+        .catch((err) => {
+          console.error('❌ Vault borrow-usdc task failed:', err);
+          setVaultStatus(userAddress, finalTxId, 'borrow', 'vault_pending');
+        });
+    }
 
-    const transactionId = await runVaultTask(() => runBorrowUsdc(userAddress, amount));
-    return res.json({ ok: true, transactionId });
+    return res.json({ ok: true, queued: true });
   } catch (err) {
     console.error('❌ /borrow-usdc handler failed:', err);
     const message = err?.message || 'Internal server error';
@@ -154,5 +195,10 @@ app.listen(PORT, async () => {
   console.log(`✅ Vault backend (withdraw + borrow) listening on http://localhost:${PORT}`);
   console.log(`   Vault queue: concurrency ${VAULT_QUEUE_CONCURRENCY} (set VAULT_QUEUE_CONCURRENCY in .env to change)`);
   await logTestnetStatus();
+  if (process.env.VAULT_WATCHER_ENABLED !== 'false') {
+    startVaultWatcher(runVaultTask);
+  } else {
+    console.log('   Vault watcher: disabled (VAULT_WATCHER_ENABLED=false)');
+  }
 });
 

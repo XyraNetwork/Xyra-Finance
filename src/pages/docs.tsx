@@ -223,11 +223,8 @@ const DocsPage: NextPageWithLayout = () => {
             <li>
               For <span className="font-semibold">borrow</span> and{' '}
               <span className="font-semibold">withdraw</span>, after the main tx finalizes the
-              frontend calls the vault backend (<span className="font-mono">/withdraw</span>,{' '}
-              <span className="font-mono">/borrow</span>,{' '}
-              <span className="font-mono">/withdraw-usdc</span>,{' '}
-              <span className="font-mono">/borrow-usdc</span>) which returns its own{' '}
-              <span className="font-mono">transactionId</span> for the vault transfer.
+              frontend only saves the row to Supabase (with <span className="font-mono">vault_tx_id</span> null).
+              The backend watcher picks up pending rows and performs the vault transfer; no frontend call to the backend is made.
             </li>
           </ol>
         </div>

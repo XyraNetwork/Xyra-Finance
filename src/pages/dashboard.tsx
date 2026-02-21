@@ -970,7 +970,7 @@ const DashboardPage: NextPageWithLayout = () => {
       console.log('📤 Transaction ID:', tx);
       console.log('⏳ Starting finalization polling...');
 
-      // Poll for transaction finalization; only then call backend for withdraw/borrow (same as USDC pool).
+      // Poll for transaction finalization; then save to Supabase (withdraw/borrow). Backend watcher performs vault transfer.
       let finalized = false;
       let txFailed = false;
       let finalTxId = tx; // use final on-chain id (at1...) for explorer and Supabase, not the initial shield id
@@ -1027,7 +1027,7 @@ const DashboardPage: NextPageWithLayout = () => {
       }
       if (!finalized) {
         setStatusMessage(
-          'Transaction not finalized in time. Please check the explorer. Vault transfer was not requested.'
+          'Transaction not finalized in time. Please check the explorer. Backend will process vault transfer once it is finalized.'
         );
         setLoading(false);
         console.log('========================================\n');
@@ -1052,52 +1052,19 @@ const DashboardPage: NextPageWithLayout = () => {
         }
       }
 
-      // Only after finalization: call backend for withdraw/borrow (vault sends credits to user).
+      // After finalization: save one record (vault_tx_id null). Backend watcher picks it up and performs vault transfer; no frontend call.
       if (action === 'withdraw' || action === 'borrow') {
-        setStatusMessage('Transaction finalized. Requesting credits from vault...');
         if (publicKey) {
-          try {
-            const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:4000';
-            const endpoint = action === 'withdraw' ? '/withdraw' : '/borrow';
-            const resp = await fetch(`${backendUrl}${endpoint}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ userAddress: publicKey, amountCredits: amount }),
-            });
-            const data = await resp.json().catch(() => ({}));
-            const vaultTxId = resp.ok ? (data?.transactionId ?? null) : null;
-            if (!resp.ok) {
-              setStatusMessage(`Vault ${action} failed: ${(data?.error as string) || resp.statusText || 'Backend error'}`);
-            } else {
-              if (action === 'withdraw') setVaultWithdrawTxId(vaultTxId);
-              else setVaultBorrowTxId(vaultTxId);
-              setStatusMessage(vaultTxId ? `Vault ${action} submitted.` : `Vault ${action} complete.`);
-            }
-            saveTransactionToSupabase(
-              publicKey,
-              finalTxId,
-              action,
-              'aleo',
-              amount,
-              LENDING_POOL_PROGRAM_ID,
-              vaultTxId
-            )
-              .then(() => fetchTransactionHistory())
-              .catch(() => {});
-          } catch (e: any) {
-            const msg = e?.message || 'Network error';
-            setStatusMessage(`Vault ${action}: ${msg}`);
-            saveTransactionToSupabase(
-              publicKey,
-              finalTxId,
-              action,
-              'aleo',
-              amount,
-              LENDING_POOL_PROGRAM_ID
-            )
-              .then(() => fetchTransactionHistory())
-              .catch(() => {});
-          }
+          await saveTransactionToSupabase(
+            publicKey,
+            finalTxId,
+            action,
+            'aleo',
+            amount,
+            LENDING_POOL_PROGRAM_ID,
+            null
+          ).catch(() => {});
+          fetchTransactionHistory();
         }
       }
 
@@ -1105,8 +1072,12 @@ const DashboardPage: NextPageWithLayout = () => {
       console.log('📋 Refreshing pool and user position after transaction finalization...');
       try {
         await refreshPoolState(true);
-        setStatusMessage('Transaction finalized! Pool and position have been refreshed.');
-        if (!isDevAppEnv) setTimeout(() => setStatusMessage(''), 2500);
+        if (action === 'withdraw' || action === 'borrow') {
+          setStatusMessage('Transaction finalized! Vault transfer will be done in 1–5 min — check status in Transaction History.');
+        } else {
+          setStatusMessage('Transaction finalized! Pool and position have been refreshed.');
+        }
+        if (!isDevAppEnv) setTimeout(() => setStatusMessage(''), 5000);
       } catch (refreshError) {
         console.warn('⚠️ Failed to refresh pool state after transaction:', refreshError);
         setStatusMessage('Transaction finalized, but automatic refresh failed. Please click Refresh to update.');
@@ -1307,7 +1278,7 @@ const DashboardPage: NextPageWithLayout = () => {
         return;
       }
       if (!finalized) {
-        setStatusMessage('Transaction not finalized in time. Please check the explorer. Vault transfer was not requested.');
+        setStatusMessage('Transaction not finalized in time. Please check the explorer. Backend will process vault transfer once it is finalized.');
         setLoading(false);
         return;
       }
@@ -1326,41 +1297,20 @@ const DashboardPage: NextPageWithLayout = () => {
             .catch(() => {});
         }
       }
+      // Backend watcher picks up the row and performs vault transfer; no frontend call.
       if (action === 'withdraw' || action === 'borrow') {
-        setStatusMessage('Transaction finalized. Requesting USDC from vault...');
         if (publicKey) {
-          try {
-            const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:4000';
-            const endpoint = action === 'withdraw' ? '/withdraw-usdc' : '/borrow-usdc';
-            const resp = await fetch(`${backendUrl}${endpoint}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ userAddress: publicKey, amountUsdc }),
-            });
-            const data = await resp.json().catch(() => ({}));
-            const vaultTxId = resp.ok ? (data?.transactionId ?? null) : null;
-            if (vaultTxId) {
-              if (action === 'withdraw') setVaultWithdrawTxId(vaultTxId);
-              else setVaultBorrowTxId(vaultTxId);
-              setStatusMessage(`Vault transfer submitted.`);
-            } else {
-              const errMsg = (data?.error as string) || resp.statusText || 'Vault transfer failed';
-              setStatusMessage(errMsg);
-            }
-            saveTransactionToSupabase(publicKey, finalTxId, action, 'usdcx', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID, vaultTxId).then(() => fetchTransactionHistory()).catch(() => {});
-          } catch (e: any) {
-            setStatusMessage(e?.message || 'Vault request failed.');
-            saveTransactionToSupabase(publicKey, finalTxId, action, 'usdcx', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID).then(() => fetchTransactionHistory()).catch(() => {});
-          }
+          await saveTransactionToSupabase(publicKey, finalTxId, action, 'usdcx', amountUsdc, USDC_LENDING_POOL_PROGRAM_ID, null).catch(() => {});
+          fetchTransactionHistory();
         }
       }
       setAmountUsdc(0);
       try {
         await refreshUsdcPoolState(true);
-        setStatusMessage('USDC flow complete. Pool refreshed.');
+        setStatusMessage('Transaction finalized! Pool refreshed.');
         if (!isDevAppEnv) setTimeout(() => setStatusMessage(''), 2500);
       } catch {
-        setStatusMessage('USDC flow complete. Click Refresh to update pool.');
+        setStatusMessage('Transaction finalized. Click Refresh to update pool.');
       }
     } catch (e: any) {
       const displayMsg = getErrorMessage(e);
@@ -1975,8 +1925,13 @@ const DashboardPage: NextPageWithLayout = () => {
                         >
                           View in explorer
                         </a>
-                      ) : txFinalized ? (
-                        <p className="text-sm text-base-content/70 text-center">Transaction finalized.</p>
+                      ) : null}
+                      {txFinalized ? (
+                        <p className="text-sm text-base-content/70 text-center">
+                          {actionModalMode === 'withdraw' || actionModalMode === 'borrow'
+                            ? 'Transaction finalized! Vault transfer will be done in 1–5 min — check status in Transaction History.'
+                            : 'Transaction finalized.'}
+                        </p>
                       ) : null}
                       {txFinalized && (actionModalMode === 'withdraw' || actionModalMode === 'borrow') && (vaultWithdrawTxId || vaultBorrowTxId) ? (
                         <a
@@ -2460,6 +2415,8 @@ const DashboardPage: NextPageWithLayout = () => {
                               >
                                 Vault transfer
                               </a>
+                            ) : (row.type === 'withdraw' || row.type === 'borrow') ? (
+                              <span className="text-base-content/60 text-sm">Vault: Pending</span>
                             ) : null}
                           </td>
                         </tr>
