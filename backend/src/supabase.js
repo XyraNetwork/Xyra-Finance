@@ -101,3 +101,23 @@ export function setVaultStatus(walletAddress, txId, type, status) {
     return { rowsUpdated: Array.isArray(data) ? data.length : 0 };
   });
 }
+
+/** Insert a transaction record (server-only). Used by POST /record-transaction so only the backend can add rows; prevents fake withdraw/borrow rows from triggering vault payouts. */
+export function insertTransactionRecord(payload) {
+  if (!supabase) {
+    return Promise.resolve({ data: null, error: { message: 'Supabase not configured' } });
+  }
+  const explorerUrl = payload.tx_id ? `${PROVABLE_EXPLORER_TX}/${payload.tx_id}` : null;
+  const row = {
+    wallet_address: payload.wallet_address,
+    tx_id: payload.tx_id,
+    type: payload.type,
+    asset: payload.asset,
+    amount: payload.amount,
+    program_id: payload.program_id ?? null,
+    explorer_url: explorerUrl,
+    vault_tx_id: null,
+    vault_explorer_url: null,
+  };
+  return supabase.from('transaction_history').insert(row).select('id').single();
+}

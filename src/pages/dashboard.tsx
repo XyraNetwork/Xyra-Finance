@@ -580,31 +580,29 @@ const DashboardPage: NextPageWithLayout = () => {
     asset: 'aleo' | 'usdc',
     amount: number,
     programId?: string,
-    vaultTxId?: string | null,
+    _vaultTxId?: string | null,
   ) => {
-    const supabase = getSupabaseBrowserClient();
-    if (!supabase) return;
     try {
-      const explorerUrl = getProvableExplorerTxUrl(txId);
-      const vaultExplorerUrl = vaultTxId ? getProvableExplorerTxUrl(vaultTxId) : null;
-      const { error } = await supabase.from('transaction_history').insert({
-        wallet_address: walletAddress,
-        tx_id: txId,
-        type,
-        asset,
-        amount,
-        program_id: programId ?? null,
-        explorer_url: explorerUrl,
-        vault_tx_id: vaultTxId ?? null,
-        vault_explorer_url: vaultExplorerUrl,
+      const res = await fetch('/api/record-transaction', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          wallet_address: walletAddress,
+          tx_id: txId,
+          type,
+          asset: asset === 'usdc' ? 'usdcx' : asset,
+          amount,
+          program_id: programId ?? null,
+        }),
       });
-      if (error) {
-        console.warn('Supabase save failed:', error.message);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        console.warn('Save transaction failed:', err?.error || res.statusText);
         return;
       }
       await fetchTransactionHistory();
     } catch (e) {
-      console.warn('Failed to save transaction to Supabase:', e);
+      console.warn('Failed to save transaction:', e);
     }
   };
 
@@ -806,6 +804,13 @@ const DashboardPage: NextPageWithLayout = () => {
     } else {
       setTxHistory([]);
     }
+  }, [address, fetchTransactionHistory]);
+
+  // Auto-refresh transaction history every 1 min (e.g. to show vault_tx_id when backend completes)
+  useEffect(() => {
+    if (!address?.trim()) return;
+    const interval = setInterval(() => fetchTransactionHistory(), 60_000);
+    return () => clearInterval(interval);
   }, [address, fetchTransactionHistory]);
 
   const handleAction = async (action: 'deposit' | 'borrow' | 'repay' | 'withdraw') => {
@@ -2416,7 +2421,10 @@ const DashboardPage: NextPageWithLayout = () => {
                                 Vault transfer
                               </a>
                             ) : (row.type === 'withdraw' || row.type === 'borrow') ? (
-                              <span className="text-base-content/60 text-sm">Vault: Pending</span>
+                              <span className="inline-flex items-center gap-2 text-sm text-base-content/70">
+                                <span className="loading loading-spinner loading-xs text-primary" aria-hidden />
+                                <span>Vault: Pending (1–5 min)</span>
+                              </span>
                             ) : null}
                           </td>
                         </tr>
