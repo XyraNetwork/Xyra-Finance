@@ -1,16 +1,21 @@
 /** @type {import('next').NextConfig} */
 
+const path = require('path');
 const webpack = require('webpack');
 const withPWA = require('next-pwa')({
   dest: 'public',
   disable: process.env.NODE_ENV === 'development',
   runtimeCaching: require('next-pwa/cache'),
 });
-require('dotenv').config();
+
+// Load .env from this project root (where next.config.js lives) so server envs like RECORD_TRANSACTION_SECRET are set even when the app is run from a parent directory (e.g. workspace root).
+require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+require('dotenv').config({ path: path.resolve(__dirname, '.env.local') });
 
 const nextConfig = {
   env: {
     URL: process.env.URL,
+    RECORD_TRANSACTION_SECRET:process.env.RECORD_TRANSACTION_SECRET,
     TWITTER: process.env.TWITTER,
     DISCORD: process.env.DISCORD,
     RPC_URL: process.env.RPC_URL,

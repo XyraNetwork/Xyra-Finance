@@ -38,8 +38,7 @@ CREATE INDEX IF NOT EXISTS idx_transaction_history_wallet_address
 CREATE INDEX IF NOT EXISTS idx_transaction_history_wallet_created_at
   ON transaction_history (wallet_address, created_at DESC);
 
--- Row Level Security: required for the Publishable key (sb_publishable_...).
--- Requests using the Publishable key run as Postgres role "anon"; these policies allow SELECT and INSERT.
+-- Row Level Security: Publishable key (anon) can only SELECT. INSERT is done by the backend (service role) via POST /record-transaction to prevent fake withdraw/borrow rows.
 ALTER TABLE transaction_history ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS "transaction_history_anon_select" ON transaction_history;
@@ -48,10 +47,7 @@ CREATE POLICY "transaction_history_publishable_select"
   ON transaction_history FOR SELECT TO anon
   USING (true);
 
-DROP POLICY IF EXISTS "transaction_history_anon_insert" ON transaction_history;
-DROP POLICY IF EXISTS "transaction_history_publishable_insert" ON transaction_history;
-CREATE POLICY "transaction_history_publishable_insert"
-  ON transaction_history FOR INSERT TO anon
-  WITH CHECK (true);
+-- No INSERT policy for anon. Run supabase/migrations/revoke_anon_insert_transaction_history.sql to drop any existing anon INSERT policy.
+-- Inserts: backend only (service role), via POST /record-transaction.
 
-COMMENT ON TABLE transaction_history IS 'Stores transaction history per user wallet for deposit, withdraw, borrow, repay (ALEO and USDCx). Fetched by wallet_address in the app.';
+COMMENT ON TABLE transaction_history IS 'Transaction history per wallet. SELECT: anon. INSERT: service role only (backend).';

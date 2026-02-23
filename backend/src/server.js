@@ -3,7 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import { runWithdrawal, runBorrow, runWithdrawalUsdc, runBorrowUsdc } from './processWithdrawal.js';
 import { logTestnetStatus } from './checkTestnet.js';
-import { updateVaultTx, setVaultStatus } from './supabase.js';
+import { updateVaultTx, setVaultStatus, insertTransactionRecord } from './supabase.js';
 import { startVaultWatcher } from './vaultWatcher.js';
 
 const app = express();
@@ -188,6 +188,62 @@ app.post('/borrow-usdc', async (req, res) => {
     console.error('❌ /borrow-usdc handler failed:', err);
     const message = err?.message || 'Internal server error';
     return res.status(500).json({ error: message });
+  }
+});
+
+// Secure transaction record insert: only callers with RECORD_TRANSACTION_SECRET can add rows (e.g. your Next.js server). Prevents anyone from posting fake withdraw/borrow rows.
+function normalizeSecret(s) {
+  if (s == null || typeof s !== 'string') return '';
+  const t = s.trim().replace(/^["']|["']$/g, '');
+  return t.trim();
+}
+const RECORD_TRANSACTION_SECRET = normalizeSecret(process.env.RECORD_TRANSACTION_SECRET);
+
+app.post('/record-transaction', async (req, res) => {
+  if (RECORD_TRANSACTION_SECRET) {
+    const raw = req.headers['x-record-transaction-secret'] || req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
+    const provided = (typeof raw === 'string' ? raw : String(raw)).trim();
+    if (provided !== RECORD_TRANSACTION_SECRET) {
+      console.warn('[record-transaction] 401: secret mismatch or missing header');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
+  try {
+    const { wallet_address, tx_id, type, asset, amount, program_id } = req.body || {};
+    if (!wallet_address || typeof wallet_address !== 'string' || !wallet_address.trim()) {
+      return res.status(400).json({ error: 'Missing or invalid wallet_address' });
+    }
+    if (!tx_id || typeof tx_id !== 'string' || !tx_id.trim()) {
+      return res.status(400).json({ error: 'Missing or invalid tx_id' });
+    }
+    const validTypes = ['deposit', 'withdraw', 'borrow', 'repay'];
+    if (!validTypes.includes(type)) {
+      return res.status(400).json({ error: 'Invalid type. Must be one of: deposit, withdraw, borrow, repay' });
+    }
+    const validAssets = ['aleo', 'usdcx'];
+    if (!validAssets.includes(asset)) {
+      return res.status(400).json({ error: 'Invalid asset. Must be aleo or usdcx' });
+    }
+    const amountNum = Number(amount);
+    if (!Number.isFinite(amountNum) || amountNum < 0) {
+      return res.status(400).json({ error: 'Missing or invalid amount' });
+    }
+    const { data, error } = await insertTransactionRecord({
+      wallet_address: wallet_address.trim(),
+      tx_id: tx_id.trim(),
+      type,
+      asset,
+      amount: amountNum,
+      program_id: program_id ? String(program_id).trim() : null,
+    });
+    if (error) {
+      console.error('[record-transaction] insert error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to save transaction' });
+    }
+    return res.status(201).json(data);
+  } catch (err) {
+    console.error('❌ /record-transaction failed:', err);
+    return res.status(500).json({ error: err?.message || 'Internal server error' });
   }
 });
 
