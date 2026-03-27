@@ -3112,7 +3112,17 @@ export function resolvePoolApyDisplay(
   if (chain == null) return computed;
   const bothZero = chain.borrowAPY < 1e-12 && chain.supplyAPY < 1e-12;
   if (bothZero && totalSupplied > 0) return computed;
-  return { supplyAPY: chain.supplyAPY, borrowAPY: chain.borrowAPY };
+  // Some pools can briefly expose stale `supply_apy=0` while `borrow_apy` is already non-zero.
+  // In that case, keep borrow from chain but derive supply from utilization for display.
+  const shouldBackfillSupplyFromComputed =
+    totalSupplied > 0 &&
+    totalBorrowed > 0 &&
+    chain.borrowAPY > 1e-12 &&
+    chain.supplyAPY < 1e-12;
+  return {
+    supplyAPY: shouldBackfillSupplyFromComputed ? computed.supplyAPY : chain.supplyAPY,
+    borrowAPY: chain.borrowAPY,
+  };
 }
 
 // --- v91 interest/APY constants (match program lending_pool_v91.aleo) ---
