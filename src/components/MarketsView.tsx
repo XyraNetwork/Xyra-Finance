@@ -5,9 +5,8 @@ import {
   getLendingPoolState,
   getUsdcLendingPoolState,
   getUsadLendingPoolState,
-  computeAleoPoolAPY,
-  computeUsdcPoolAPY,
-  computeUsadPoolAPY,
+  getPoolApyFractionsFromChain,
+  resolvePoolApyDisplay,
   getAssetPriceForProgram,
   LENDING_POOL_PROGRAM_ID,
   USDC_LENDING_POOL_PROGRAM_ID,
@@ -65,9 +64,14 @@ export function MarketsView() {
         const tsUsad = Number(usadState.totalSupplied ?? 0) || 0;
         const tbUsad = Number(usadState.totalBorrowed ?? 0) || 0;
 
-        const { supplyAPY: sApyAleo, borrowAPY: bApyAleo } = computeAleoPoolAPY(tsAleo, tbAleo);
-        const { supplyAPY: sApyUsdc, borrowAPY: bApyUsdc } = computeUsdcPoolAPY(tsUsdc, tbUsdc);
-        const { supplyAPY: sApyUsad, borrowAPY: bApyUsad } = computeUsadPoolAPY(tsUsad, tbUsad);
+        const [chainAleo, chainUsdc, chainUsad] = await Promise.all([
+          getPoolApyFractionsFromChain(LENDING_POOL_PROGRAM_ID, '0field'),
+          getPoolApyFractionsFromChain(USDC_LENDING_POOL_PROGRAM_ID, '1field'),
+          getPoolApyFractionsFromChain(USAD_LENDING_POOL_PROGRAM_ID, '2field'),
+        ]);
+        const { supplyAPY: sApyAleo, borrowAPY: bApyAleo } = resolvePoolApyDisplay(tsAleo, tbAleo, chainAleo);
+        const { supplyAPY: sApyUsdc, borrowAPY: bApyUsdc } = resolvePoolApyDisplay(tsUsdc, tbUsdc, chainUsdc);
+        const { supplyAPY: sApyUsad, borrowAPY: bApyUsad } = resolvePoolApyDisplay(tsUsad, tbUsad, chainUsad);
 
         setAleoTotalSupplied(tsAleo / SCALE);
         setAleoTotalBorrowed(tbAleo / SCALE);
@@ -183,6 +187,10 @@ export function MarketsView() {
             </h2>
             <p className="text-xs text-base-content/70 mt-0.5">
               Supply and borrow APY, total supplied, total borrowed, available liquidity, and vault wallet balance.
+              {' '}
+              <span className="text-base-content/60">
+                At 0% utilization: supply APY is 0%; borrow APY is the base rate on the curve.
+              </span>
             </p>
           </div>
           {loading ? (

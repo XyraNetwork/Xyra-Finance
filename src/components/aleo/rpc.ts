@@ -2065,15 +2065,15 @@ export async function getSuitableUsdcTokenRecord(
       );
       continue;
     }
-    if (val === BigInt(0)) {
+      if (val === BigInt(0)) {
       console.log(`${logPrefix} Record[${i}] skipped (amount is 0)`);
-      continue;
-    }
+        continue;
+      }
     console.log(`${logPrefix} Record[${i}] amount: ${String(val)} micro (need >= ${String(amountU128)}): ${val >= amountU128}`);
-    if (val >= amountU128) {
+      if (val >= amountU128) {
       console.log(`${logPrefix} Using record[${i}] for deposit/repay`);
-      return rec;
-    }
+        return rec;
+      }
   }
 
   console.warn(
@@ -3052,6 +3052,67 @@ export async function getUsadLendingPoolState(): Promise<{
   borrowIndex: string | null;
 }> {
   return getLendingPoolStateForProgram(USAD_LENDING_POOL_PROGRAM_ID, '2field');
+}
+
+function parseMappingU64Response(res: unknown): number | null {
+  if (res == null) return null;
+  const raw = (res as { value?: unknown })?.value ?? res;
+  if (raw == null) return null;
+  const str = String(raw);
+  const m = str.match(/(\d[\d_]*)/);
+  if (!m) return null;
+  const n = Number(m[1].replace(/_/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Read `supply_apy` / `borrow_apy` mappings written by `finalize_accrue` (xyra_lending_v6.aleo).
+ * Values are annual APR in basis points (SCALE=10_000): 200 => 2% => fraction 0.02.
+ */
+export async function getPoolApyFractionsFromChain(
+  programId: string,
+  assetKey: string,
+): Promise<{ supplyAPY: number; borrowAPY: number } | null> {
+  try {
+    const [sRes, bRes] = await Promise.all([
+      client.request('getMappingValue', {
+        program_id: programId,
+        mapping_name: 'supply_apy',
+        key: assetKey,
+      }),
+      client.request('getMappingValue', {
+        program_id: programId,
+        mapping_name: 'borrow_apy',
+        key: assetKey,
+      }),
+    ]);
+    const sBps = parseMappingU64Response(sRes);
+    const bBps = parseMappingU64Response(bRes);
+    if (sBps == null && bBps == null) return null;
+    const BPS = 10_000;
+    return {
+      supplyAPY: sBps != null ? sBps / BPS : 0,
+      borrowAPY: bBps != null ? bBps / BPS : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Prefer on-chain APY from mappings; fall back to utilization formula when mappings are missing
+ * or still zero while the pool has deposits (before first accrue).
+ */
+export function resolvePoolApyDisplay(
+  totalSupplied: number,
+  totalBorrowed: number,
+  chain: { supplyAPY: number; borrowAPY: number } | null,
+): { supplyAPY: number; borrowAPY: number } {
+  const computed = computeAleoPoolAPY(totalSupplied, totalBorrowed);
+  if (chain == null) return computed;
+  const bothZero = chain.borrowAPY < 1e-12 && chain.supplyAPY < 1e-12;
+  if (bothZero && totalSupplied > 0) return computed;
+  return { supplyAPY: chain.supplyAPY, borrowAPY: chain.borrowAPY };
 }
 
 // --- v91 interest/APY constants (match program lending_pool_v91.aleo) ---
