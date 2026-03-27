@@ -1909,7 +1909,15 @@ export async function getPrivateUsadBalance(
 export async function getLatestBlockHeight(): Promise<number> {
   const toNum = (v: any): number => {
     if (v === undefined || v === null) return 0;
+    if (typeof v === 'bigint') {
+      const x = Number(v);
+      return Number.isFinite(x) ? x : 0;
+    }
     if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'string' && v.trim() !== '') {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : 0;
+    }
     if (typeof v === 'object' && v !== null) {
       const n = v.result ?? v.height ?? v.block_height ?? v.value;
       return toNum(n);
@@ -1917,16 +1925,77 @@ export async function getLatestBlockHeight(): Promise<number> {
     const n = Number(v);
     return Number.isFinite(n) ? n : 0;
   };
+
+  const logPrefix = '[getLatestBlockHeight]';
+
   try {
     const h = await client.request('latest/height', {});
-    return toNum(h);
-  } catch (e) {
+    const n = toNum(h);
+    if (n > 0) {
+      if (typeof window !== 'undefined') {
+        console.debug(`${logPrefix} OK via JSON-RPC client`, { raw: h, height: n, url: CURRENT_RPC_URL });
+      }
+      return n;
+    }
+    console.warn(`${logPrefix} client returned non-positive height`, { raw: h, parsed: n, url: CURRENT_RPC_URL });
+  } catch (e: any) {
+    console.warn(`${logPrefix} latest/height (client) failed`, {
+      message: e?.message ?? String(e),
+      url: CURRENT_RPC_URL,
+    });
     try {
       const h = await client.request('getLatestBlockHeight', {});
-      return toNum(h);
+      const n = toNum(h);
+      if (n > 0) {
+        console.debug(`${logPrefix} OK via getLatestBlockHeight`, { raw: h, height: n });
+        return n;
+      }
+    } catch (e2: any) {
+      console.warn(`${logPrefix} getLatestBlockHeight failed`, { message: e2?.message ?? String(e2) });
+    }
+  }
+
+  // Direct fetch: same endpoint as the JSON-RPC client (avoids rare client parsing quirks; clearer errors in DevTools).
+  try {
+    const res = await fetch(CURRENT_RPC_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'height-fallback',
+        method: 'latest/height',
+        params: {},
+      }),
+    });
+    const text = await res.text();
+    let json: any;
+    try {
+      json = JSON.parse(text);
     } catch {
+      console.error(`${logPrefix} fetch: non-JSON body`, { status: res.status, text: text.slice(0, 200) });
       return 0;
     }
+    if (!res.ok) {
+      console.error(`${logPrefix} fetch: HTTP error`, { status: res.status, body: json });
+      return 0;
+    }
+    if (json.error) {
+      console.error(`${logPrefix} fetch: JSON-RPC error`, json.error);
+      return 0;
+    }
+    const n = toNum(json.result);
+    if (n > 0) {
+      console.debug(`${logPrefix} OK via fetch fallback`, { height: n, url: CURRENT_RPC_URL });
+    } else {
+      console.warn(`${logPrefix} fetch: unexpected result`, { result: json.result, full: json });
+    }
+    return n;
+  } catch (e: any) {
+    console.error(`${logPrefix} fetch fallback failed (CORS or network?)`, {
+      message: e?.message ?? String(e),
+      url: CURRENT_RPC_URL,
+    });
+    return 0;
   }
 }
 

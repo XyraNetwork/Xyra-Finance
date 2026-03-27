@@ -25,9 +25,8 @@ import { WalletPersistence } from '@/components/WalletPersistence';
 import { installDevBorrowDebug } from '@/utils/devBorrowDebug';
 
 // Initialize the wallet adapters outside the component
-// Currently only Shield Wallet is enabled in the connect modal.
-// Leo & Fox adapters are intentionally disabled/hidden for now.
 const wallets = [new ShieldWalletAdapter()];
+const WALLET_PROGRAMS = getWalletConnectProgramIds();
 
 type AppPropsWithLayout = AppProps & {
   Component: NextPageWithLayout;
@@ -52,11 +51,8 @@ function CustomApp({ Component, pageProps }: AppPropsWithLayout) {
             wallets={wallets}
             autoConnect={false}
             network={Network.TESTNET}
-            // Request AUTO_DECRYPT permission so the wallet can automatically
-            // decrypt records (e.g. for UserActivity) after the first approval.
             decryptPermission={DecryptPermission.AutoDecrypt}
-            // Programs this dApp will interact with via executeTransaction/requestRecords (deduped)
-            programs={getWalletConnectProgramIds()}
+            programs={WALLET_PROGRAMS}
             onError={(error) => console.error(error.message)}
           >
             <WalletPersistence>

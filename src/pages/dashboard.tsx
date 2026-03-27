@@ -14,7 +14,7 @@ import { AssetBadge } from '@/components/ui/AssetBadge';
 import { StatCard } from '@/components/ui/StatCard';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { useWallet } from '@provablehq/aleo-wallet-adaptor-react';
-import { WalletMultiButton } from '@provablehq/aleo-wallet-adaptor-react-ui';
+import { WalletModalButton } from '@provablehq/aleo-wallet-adaptor-react-ui';
 import { Network } from '@provablehq/aleo-types';
 import {
   getLendingPoolState,
@@ -84,11 +84,11 @@ function logPoolTxRejected(
     hints:
       status.toLowerCase() === 'rejected'
         ? [
-            meta?.action === 'borrow'
-              ? 'Validator rejected borrow: usually new_borrow_usd > cross-collateral headroom (integer rounding), wrong program id, or stale UI — try Max (chain) or a slightly smaller amount; confirm on-chain asset_price / LTV.'
-              : 'Validator rejected: for repay, amount > accrued debt or bad Merkle proofs; for borrow, portfolio assert failed or program mismatch.',
-            'Verify NEXT_PUBLIC_* pool id matches deployment; run accrue interest; refresh balances.',
-          ]
+          meta?.action === 'borrow'
+            ? 'Validator rejected borrow: usually new_borrow_usd > cross-collateral headroom (integer rounding), wrong program id, or stale UI — try Max (chain) or a slightly smaller amount; confirm on-chain asset_price / LTV.'
+            : 'Validator rejected: for repay, amount > accrued debt or bad Merkle proofs; for borrow, portfolio assert failed or program mismatch.',
+          'Verify NEXT_PUBLIC_* pool id matches deployment; run accrue interest; refresh balances.',
+        ]
         : undefined,
   });
 }
@@ -109,6 +109,26 @@ function txHistoryAssetVaultLabel(asset: string): string {
   if (a === 'usad' || a === 'usadx') return 'USAD';
   if (a === 'aleo') return 'ALEO';
   return String(asset || 'Asset').toUpperCase();
+}
+
+/**
+ * True if amount is positive and does not exceed max. Uses 1e6 micro-unit rounding so
+ * UI strings / Max (toFixed(2)) match portfolio math from USD÷price (avoids only 1.60
+ * working when displayed max is 1.61 due to float drift).
+ */
+function amountWithinMax(amount: number, max: number): boolean {
+  if (!Number.isFinite(amount) || !Number.isFinite(max)) return false;
+  if (amount <= 0 || max < 0) return false;
+  const SCALE = 1_000_000;
+  return Math.round(amount * SCALE) <= Math.round(max * SCALE);
+}
+
+/** Subtracted from computed max when using Max / % presets so the input stays below on-chain limits (rounding / float). */
+const MAX_BUTTON_BUFFER = 0.01;
+
+function amountForMaxButton(rawMax: number): number {
+  if (!Number.isFinite(rawMax) || rawMax <= 0) return 0;
+  return Math.max(0, rawMax - MAX_BUTTON_BUFFER);
 }
 
 /** Transaction history: program tx + optional vault tx pills in one row */
@@ -662,7 +682,7 @@ const DashboardPage: NextPageWithLayout = () => {
 
       // Fetch lending_pool_v8.aleo records and update user position
       await fetchRecordsInBackground(LENDING_POOL_PROGRAM_ID);
-      
+
       console.log('📋 fetchAllUserRecords: All records fetched successfully');
     } catch (error: any) {
       console.warn('📋 fetchAllUserRecords: Error fetching records:', error?.message);
@@ -1277,7 +1297,7 @@ const DashboardPage: NextPageWithLayout = () => {
       console.log('========================================\n');
       return;
     }
-    
+
     if (!publicKey) {
       const error = 'Public key not available. Please reconnect your wallet.';
       setStatusMessage(error);
@@ -1287,12 +1307,12 @@ const DashboardPage: NextPageWithLayout = () => {
     }
 
     const amountToUse = typeof amountOverride === 'number' ? amountOverride : amount;
-    
+
     try {
       setLoading(true);
       setStatusMessage(`Executing ${action}...`);
       setAmountError(null);
-      
+
       if (amountToUse <= 0) {
         throw new Error('Amount must be greater than zero.');
       }
@@ -1442,7 +1462,7 @@ const DashboardPage: NextPageWithLayout = () => {
       setTxId(null);
       setTxFinalized(false);
       setStatusMessage('Transaction submitted. Waiting for finalization…');
-      
+
       console.log('📤 Transaction ID:', tx);
       console.log('⏳ Starting finalization polling...');
 
@@ -1528,7 +1548,7 @@ const DashboardPage: NextPageWithLayout = () => {
             LENDING_POOL_PROGRAM_ID
           )
             .then(() => fetchTransactionHistory())
-            .catch(() => {});
+            .catch(() => { });
         }
       }
 
@@ -1543,7 +1563,7 @@ const DashboardPage: NextPageWithLayout = () => {
             amountToUse,
             LENDING_POOL_PROGRAM_ID,
             null
-          ).catch(() => {});
+          ).catch(() => { });
           fetchTransactionHistory();
         }
       }
@@ -1569,11 +1589,11 @@ const DashboardPage: NextPageWithLayout = () => {
       if (process.env.NODE_ENV === 'development') {
         console.warn(`[${action}]`, displayMsg, e);
       }
-      
+
       // Detect wallet cancellation/rejection
       const errorMsg = displayMsg.toLowerCase();
       const isCancelled = errorMsg.includes('cancel') || errorMsg.includes('reject') || errorMsg.includes('denied') || errorMsg.includes('user rejected');
-      
+
       if (isCancelled) {
         setStatusMessage('Transaction cancelled by user.');
         if (!isDevAppEnv) {
@@ -1703,7 +1723,7 @@ const DashboardPage: NextPageWithLayout = () => {
         principal,
         LENDING_POOL_PROGRAM_ID,
         null,
-      ).catch(() => {});
+      ).catch(() => { });
       fetchTransactionHistory();
       setFlashAmountInput('');
       setFlashStatusMessage(
@@ -1939,13 +1959,13 @@ const DashboardPage: NextPageWithLayout = () => {
             USDC_LENDING_POOL_PROGRAM_ID
           )
             .then(() => fetchTransactionHistory())
-            .catch(() => {});
+            .catch(() => { });
         }
       }
       // Backend watcher picks up the row and performs vault transfer; no frontend call.
       if (action === 'withdraw' || action === 'borrow') {
         if (publicKey) {
-          await saveTransactionToSupabase(publicKey, finalTxId, action, 'usdc', amountToUse, USDC_LENDING_POOL_PROGRAM_ID, null).catch(() => {});
+          await saveTransactionToSupabase(publicKey, finalTxId, action, 'usdc', amountToUse, USDC_LENDING_POOL_PROGRAM_ID, null).catch(() => { });
           fetchTransactionHistory();
         }
       }
@@ -2200,14 +2220,14 @@ const DashboardPage: NextPageWithLayout = () => {
         if (publicKey) {
           saveTransactionToSupabase(publicKey, finalTxId, action, 'usad', amountToUse, USAD_LENDING_POOL_PROGRAM_ID)
             .then(() => fetchTransactionHistory())
-            .catch(() => {});
+            .catch(() => { });
         }
       }
 
       // Backend watcher picks up the row and performs vault transfer; no frontend call.
       if (action === 'withdraw' || action === 'borrow') {
         if (publicKey) {
-          await saveTransactionToSupabase(publicKey, finalTxId, action, 'usad', amountToUse, USAD_LENDING_POOL_PROGRAM_ID, null).catch(() => {});
+          await saveTransactionToSupabase(publicKey, finalTxId, action, 'usad', amountToUse, USAD_LENDING_POOL_PROGRAM_ID, null).catch(() => { });
           fetchTransactionHistory();
         }
       }
@@ -2252,7 +2272,7 @@ const DashboardPage: NextPageWithLayout = () => {
       setStatusMessage(`Creating ${testCreditsAmount} test credits...`);
 
       const tx = await createTestCredits(requestTransaction, publicKey, testCreditsAmount);
-      
+
       setTxId(null);
       setTxFinalized(false);
       setStatusMessage('Test credits creation submitted. Waiting for finalization…');
@@ -2264,19 +2284,19 @@ const DashboardPage: NextPageWithLayout = () => {
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
-        
+
         if (transactionStatus) {
           try {
             const status = await transactionStatus(tx);
             console.log(`🧪 Create Test Credits: Poll attempt ${attempt}/${maxAttempts}, status:`, status);
-            
+
             if (status && (status.status === 'Finalized' || (status as any).finalized)) {
               finalized = true;
               const resolvedId = (typeof status === 'object' && (status as any).transactionId) || tx;
               setTxId(isExplorerHash(resolvedId) ? resolvedId : null);
               setTxFinalized(true);
               setStatusMessage(`✅ Test credits created successfully! You should now have a Credits record with ${testCreditsAmount} credits (${testCreditsAmount * 1_000_000} microcredits) in your wallet.`);
-              
+
               // Fetch records in background to update UI
               fetchRecordsInBackground();
               break;
@@ -2331,7 +2351,7 @@ const DashboardPage: NextPageWithLayout = () => {
       setStatusMessage(`Testing deposit with ${amount} credits...`);
 
       const tx = await depositTestReal(requestTransaction, publicKey, amount, requestRecords);
-      
+
       setTxId(null);
       setTxFinalized(false);
       setStatusMessage('Deposit test submitted. Waiting for finalization…');
@@ -2343,19 +2363,19 @@ const DashboardPage: NextPageWithLayout = () => {
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
-        
+
         if (transactionStatus) {
           try {
             const status = await transactionStatus(tx);
             console.log(`🧪 Deposit Test Real: Poll attempt ${attempt}/${maxAttempts}, status:`, status);
-            
+
             if (status && (status.status === 'Finalized' || (status as any).finalized)) {
               finalized = true;
               const resolvedId = (typeof status === 'object' && (status as any).transactionId) || tx;
               setTxId(isExplorerHash(resolvedId) ? resolvedId : null);
               setTxFinalized(true);
               setStatusMessage(`✅ Deposit test completed successfully! The test validates that real Aleo credits records work correctly. If this succeeded, your Credits record format is correct.`);
-              
+
               // Fetch records in background to update UI
               fetchRecordsInBackground();
               break;
@@ -2417,7 +2437,7 @@ const DashboardPage: NextPageWithLayout = () => {
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
-        
+
         try {
           const statusResult = await transactionStatus(tx);
           console.log(`📊 Accrue interest status (attempt ${attempt}):`, statusResult);
@@ -2476,11 +2496,11 @@ const DashboardPage: NextPageWithLayout = () => {
       }
     } catch (e: any) {
       console.error('Accrue interest error:', e);
-      
+
       // Detect wallet cancellation/rejection
       const errorMsg = String(e?.message || e || '').toLowerCase();
       const isCancelled = errorMsg.includes('cancel') || errorMsg.includes('reject') || errorMsg.includes('denied') || errorMsg.includes('user rejected');
-      
+
       if (isCancelled) {
         setStatusMessage('Transaction cancelled by user.');
         if (!isDevAppEnv) {
@@ -2771,20 +2791,16 @@ const DashboardPage: NextPageWithLayout = () => {
 
   const actionModalTitle =
     actionModalMode === 'withdraw'
-      ? `Withdraw ${
-          actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'
-        }`
+      ? `Withdraw ${actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'
+      }`
       : actionModalMode === 'deposit'
-        ? `Deposit ${
-            actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'
-          }`
+        ? `Deposit ${actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'
+        }`
         : actionModalMode === 'borrow'
-          ? `Borrow ${
-              actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'
-            }`
-          : `Repay ${
-              actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'
-            }`;
+          ? `Borrow ${actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'
+          }`
+          : `Repay ${actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'
+          }`;
 
   const supplyBalanceModal =
     actionModalAsset === 'aleo' ? supplyBalanceAleo : actionModalAsset === 'usdc' ? supplyBalanceUsdc : supplyBalanceUsad;
@@ -2837,9 +2853,9 @@ const DashboardPage: NextPageWithLayout = () => {
             : availableWithdrawUsad
         : actionModalMode === 'repay'
           ? Math.min(privateBalanceModal, repaySuggestedModalHuman)
-        : actionModalMode === 'borrow'
-          ? modalBorrowPortfolioMax
-          : debtBalanceModal;
+          : actionModalMode === 'borrow'
+            ? modalBorrowPortfolioMax
+            : debtBalanceModal;
 
   const remainingSupply = actionModalMode === 'withdraw'
     ? Math.max(0, modalMaxAmount - modalAmount)
@@ -2915,8 +2931,8 @@ const DashboardPage: NextPageWithLayout = () => {
     actionModalMode === 'repay'
       ? remainingDebtUsdAfterRepay
       : postDebtAleo * ALEO_PRICE_USD +
-        postDebtUsdc * USDCX_PRICE_USD +
-        postDebtUsad * USAD_PRICE_USD;
+      postDebtUsdc * USDCX_PRICE_USD +
+      postDebtUsad * USAD_PRICE_USD;
   const postHealthFactor = postTotalDebtUsd > 0 ? postWeightedCollateralUsd / postTotalDebtUsd : null;
 
   type ManageTab = 'Supply' | 'Withdraw' | 'Borrow' | 'Repay';
@@ -3087,7 +3103,7 @@ const DashboardPage: NextPageWithLayout = () => {
           try {
             bal = await getPrivateCreditsBalance(requestRecords, decrypt);
             setPrivateAleoBalance(bal);
-          } catch {}
+          } catch { }
         }
         return bal ?? 0;
       }
@@ -3097,7 +3113,7 @@ const DashboardPage: NextPageWithLayout = () => {
           try {
             bal = await getPrivateUsdcBalance(requestRecords, decrypt);
             setPrivateUsdcBalance(bal);
-          } catch {}
+          } catch { }
         }
         return bal ?? 0;
       }
@@ -3107,7 +3123,7 @@ const DashboardPage: NextPageWithLayout = () => {
         try {
           bal = await getPrivateUsadBalance(requestRecords, decrypt);
           setPrivateUsadBalance(bal);
-        } catch {}
+        } catch { }
       }
       return bal ?? 0;
     }
@@ -3125,7 +3141,7 @@ const DashboardPage: NextPageWithLayout = () => {
           try {
             bal = await getPrivateCreditsBalance(requestRecords, decrypt);
             setPrivateAleoBalance(bal);
-          } catch {}
+          } catch { }
         }
         return Math.min(bal ?? 0, suggested);
       }
@@ -3136,7 +3152,7 @@ const DashboardPage: NextPageWithLayout = () => {
           try {
             bal = await getPrivateUsdcBalance(requestRecords, decrypt);
             setPrivateUsdcBalance(bal);
-          } catch {}
+          } catch { }
         }
         // If balance is still unknown, fall back to suggested so UI doesn't show 0.
         return bal == null ? suggested : Math.min(bal, suggested);
@@ -3148,7 +3164,7 @@ const DashboardPage: NextPageWithLayout = () => {
         try {
           bal = await getPrivateUsadBalance(requestRecords, decrypt);
           setPrivateUsadBalance(bal);
-        } catch {}
+        } catch { }
       }
       return bal == null ? suggested : Math.min(bal, suggested);
     }
@@ -3234,277 +3250,192 @@ const DashboardPage: NextPageWithLayout = () => {
     return <DocsPage />;
   }
 
+  // Inject dashboard dark styles
+  useEffect(() => {
+    const style = document.createElement('style');
+    style.textContent = `
+      @keyframes float {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(-10px); }
+      }
+      .dash-glass {
+        background: linear-gradient(145deg, rgba(15,23,42,0.4) 0%, rgba(3,7,18,0.6) 100%);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border: 1px solid rgba(255,255,255,0.05);
+      }
+      .dash-gradient-text {
+        background: linear-gradient(to right, #22d3ee, #818cf8);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+      }
+    `;
+    document.head.appendChild(style);
+    return () => { document.head.removeChild(style); };
+  }, []);
+
+  const dashGlass: React.CSSProperties = {
+    background: 'linear-gradient(145deg, rgba(15,23,42,0.4) 0%, rgba(3,7,18,0.6) 100%)',
+    backdropFilter: 'blur(16px)',
+    WebkitBackdropFilter: 'blur(16px)',
+    border: '1px solid rgba(255,255,255,0.05)',
+  };
+  const dashRadialGlow: React.CSSProperties = {
+    background: 'radial-gradient(circle at center, rgba(6,182,212,0.05) 0%, transparent 70%)',
+  };
+
   return (
-    <div className="flex justify-center pt-16 sm:pt-20">
-      {/* Aave-style action modal (withdraw/deposit/borrow/repay) */}
+    <div style={{ minHeight: '100vh', backgroundColor: '#030712', color: '#f8fafc', position: 'relative' }}>
+      {/* Background effects */}
+      <div style={{ position: 'fixed', inset: 0, zIndex: -2, backgroundSize: '50px 50px', backgroundImage: 'linear-gradient(to right, rgba(255,255,255,0.02) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.02) 1px, transparent 1px)' }} />
+      <div style={{ position: 'fixed', borderRadius: '50%', filter: 'blur(120px)', zIndex: -1, opacity: 0.3, width: '600px', height: '600px', top: '-200px', right: '-100px', background: 'rgba(6,182,212,0.1)', pointerEvents: 'none' }} />
+      <div style={{ position: 'fixed', borderRadius: '50%', filter: 'blur(120px)', zIndex: -1, opacity: 0.3, width: '600px', height: '600px', bottom: '-200px', left: '-100px', background: 'rgba(99,102,241,0.1)', pointerEvents: 'none' }} />
+
+      {/* Action modal — logic unchanged, new dark styling */}
       {actionModalOpen && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: 'rgba(0,0,0,0.7)' }}
           onClick={(e) => {
             const canClose = !actionModalSubmitted || (!loading && txFinalized);
             if (e.target === e.currentTarget && canClose) closeActionModal();
           }}
         >
-          <div className="bg-base-200 rounded-xl shadow-xl w-full max-w-md border border-base-300" onClick={(e) => e.stopPropagation()}>
-            <div className="p-4 border-b border-base-300 flex items-center justify-between">
-              <h2 className="text-xl font-bold">{actionModalTitle}</h2>
-              {(!actionModalSubmitted || (!loading && txFinalized)) ? (
-                <button type="button" className="btn btn-ghost btn-sm btn-circle" onClick={closeActionModal} aria-label="Close">×</button>
-              ) : null}
+          <div className="relative rounded-[24px] p-8 w-full max-w-md" style={dashGlass} onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="text-xl font-bold text-white">{actionModalTitle}</h2>
+              {(!actionModalSubmitted || (!loading && txFinalized)) && (
+                <button type="button" onClick={closeActionModal} className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-white/10 transition-colors text-slate-400 text-lg">×</button>
+              )}
             </div>
-            <div className="p-4 space-y-4">
+            <div className="space-y-4">
               {!actionModalSubmitted ? (
                 <>
                   <div>
-                    <label className="label">
-                      <span className="label-text">Amount</span>
-                    </label>
-                    <div className="flex items-center gap-2 rounded-lg bg-base-300/50 p-2">
+                    <label className="text-sm text-slate-400 mb-2 block">Amount</label>
+                    <div className="flex items-center gap-2 rounded-xl p-3" style={{ backgroundColor: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}>
                       <input
-                        type="number"
-                        min={0}
-                        step="any"
+                        type="number" min={0} step="any"
                         value={modalAmountInput}
                         onChange={(e) => {
                           const val = e.target.value;
                           setModalAmountInput(val);
                           const n = Number(val);
                           if (!Number.isNaN(n)) {
-                          if (actionModalAsset === 'usdc') {
-                            setAmountUsdc(n);
-                          } else if (actionModalAsset === 'usad') {
-                            setAmountUsad(n);
-                          } else {
-                            setAmount(n);
-                          }
+                            if (actionModalAsset === 'usdc') setAmountUsdc(n);
+                            else if (actionModalAsset === 'usad') setAmountUsad(n);
+                            else setAmount(n);
                           }
                         }}
                         placeholder="0.00"
-                        className="input input-bordered flex-1 bg-transparent border-0 focus:outline-none"
+                        className="flex-1 bg-transparent outline-none text-white font-mono text-lg"
                       />
-                      <span className="font-medium">
-                        {actionModalAsset === 'aleo'
-                          ? 'ALEO'
-                          : actionModalAsset === 'usdc'
-                            ? 'USDCx'
-                            : 'USAD'}
+                      <span className="font-medium text-cyan-400">
+                        {actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'}
                       </span>
                     </div>
-                    <div className="flex items-center justify-between mt-1 text-sm text-base-content/70">
+                    <div className="flex items-center justify-between mt-2 text-sm text-slate-500">
                       <span>
-                      {actionModalMode === 'withdraw'
-                        ? 'Withdrawable '
-                        : actionModalMode === 'deposit'
-                          ? 'Wallet balance '
-                          : actionModalMode === 'borrow'
-                            ? 'Portfolio borrow max '
-                            : 'Debt '}
-                      {actionModalMode === 'withdraw'
-                        ? modalMaxAmount.toFixed(2)
-                        : actionModalMode === 'deposit'
-                          ? privateBalanceModal.toFixed(2)
-                          : actionModalMode === 'borrow'
-                            ? modalBorrowPortfolioMax.toFixed(2)
-                            : actionModalMode === 'repay'
-                              ? repaySuggestedModalHuman.toFixed(2)
-                              : debtBalanceModal.toFixed(2)}
-                        {' '}
-                        <button
-                          type="button"
-                          className="link link-primary text-xs"
-                          onClick={() => {
-                            const maxVal =
-                              actionModalMode === 'withdraw'
-                                ? actionModalAsset === 'aleo'
-                                  ? availableWithdrawAleo
-                                  : actionModalAsset === 'usdc'
-                                    ? availableWithdrawUsdc
-                                    : availableWithdrawUsad
-                                : actionModalMode === 'deposit'
-                                  ? privateBalanceModal
-                                  : actionModalMode === 'repay'
-                                    ? Math.min(privateBalanceModal, repaySuggestedModalHuman)
-                                  : actionModalMode === 'borrow'
-                                    ? modalBorrowPortfolioMax
-                                    : debtBalanceModal;
-                            setModalAmountInput(String(maxVal));
-                            if (actionModalAsset === 'usdc') {
-                              setAmountUsdc(maxVal);
-                            } else if (actionModalAsset === 'usad') {
-                              setAmountUsad(maxVal);
-                            } else {
-                              setAmount(maxVal);
-                            }
-                          }}
-                        >
-                          MAX
-                        </button>
+                        {actionModalMode === 'withdraw' ? `Withdrawable ${modalMaxAmount.toFixed(2)}`
+                          : actionModalMode === 'deposit' ? `Wallet balance ${privateBalanceModal.toFixed(2)}`
+                            : actionModalMode === 'borrow' ? `Portfolio borrow max ${modalBorrowPortfolioMax.toFixed(2)}`
+                              : `Debt ${repaySuggestedModalHuman.toFixed(2)}`}
                       </span>
+                      <button
+                        type="button"
+                        className="text-xs font-bold text-cyan-400 hover:text-cyan-300 transition-colors ml-2"
+                        onClick={() => {
+                          const maxVal = actionModalMode === 'withdraw'
+                            ? (actionModalAsset === 'aleo' ? availableWithdrawAleo : actionModalAsset === 'usdc' ? availableWithdrawUsdc : availableWithdrawUsad)
+                            : actionModalMode === 'deposit' ? privateBalanceModal
+                              : actionModalMode === 'repay' ? Math.min(privateBalanceModal, repaySuggestedModalHuman)
+                                : actionModalMode === 'borrow' ? modalBorrowPortfolioMax
+                                  : debtBalanceModal;
+                          const adjusted = amountForMaxButton(maxVal);
+                          setModalAmountInput(adjusted.toFixed(2));
+                          if (actionModalAsset === 'usdc') setAmountUsdc(adjusted);
+                          else if (actionModalAsset === 'usad') setAmountUsad(adjusted);
+                          else setAmount(adjusted);
+                        }}
+                      >MAX</button>
                     </div>
                   </div>
-                  <div className="rounded-lg bg-base-300/30 p-3 space-y-2">
-                    <div className="font-medium text-sm">Transaction overview</div>
-                    <div className="flex justify-between text-sm">
-                      <span className="text-base-content/70">
-                        {actionModalMode === 'withdraw'
-                          ? 'Remaining withdrawable'
-                          : actionModalMode === 'deposit'
-                            ? 'Supply after'
-                            : actionModalMode === 'borrow'
-                              ? 'Debt after'
-                              : 'Remaining debt'}
-                      </span>
-                      <span>
-                        {remainingSupply.toFixed(2)}{' '}
-                        {actionModalAsset === 'aleo'
-                          ? 'ALEO'
-                          : actionModalAsset === 'usdc'
-                            ? 'USDCx'
-                            : 'USAD'}
+                  <div className="rounded-xl p-4 space-y-2" style={{ backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)' }}>
+                    <div className="text-sm font-medium text-slate-300 mb-1">Transaction overview</div>
+                    <div className="flex justify-between text-sm text-slate-400">
+                      <span>{actionModalMode === 'withdraw' ? 'Remaining withdrawable' : actionModalMode === 'deposit' ? 'Supply after' : actionModalMode === 'borrow' ? 'Debt after' : 'Remaining debt'}</span>
+                      <span className="text-white font-mono">{remainingSupply.toFixed(2)} {actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'}</span>
+                    </div>
+                    <div className="flex justify-between text-sm text-slate-400">
+                      <span>Est. weighted collateral (USD)</span>
+                      <span className="text-white font-mono">${postWeightedCollateralUsd.toFixed(2)}</span>
+                    </div>
+                    <div className="flex justify-between text-sm text-slate-400">
+                      <span>Est. total debt (USD)</span>
+                      <span className="text-white font-mono">${postTotalDebtUsd.toFixed(2)}</span>
+                    </div>
+                    <div className="flex justify-between text-sm text-slate-400">
+                      <span>Est. health factor</span>
+                      <span className={`font-mono font-medium ${postHealthFactor != null && postHealthFactor < 1 ? 'text-red-400' : 'text-emerald-400'}`}>
+                        {postHealthFactor == null ? '∞' : (postHealthFactor as number).toFixed(2)}
                       </span>
                     </div>
-                    {(actionModalMode === 'borrow' || actionModalMode === 'withdraw' || actionModalMode === 'deposit' || actionModalMode === 'repay') ? (
-                      <>
-                        <div className="flex justify-between text-sm">
-                          <span className="text-base-content/70">Est. weighted collateral (USD)</span>
-                          <span>${postWeightedCollateralUsd.toFixed(2)}</span>
-                        </div>
-                        <div className="flex justify-between text-sm">
-                          <span className="text-base-content/70">Est. total debt (USD)</span>
-                          <span>${postTotalDebtUsd.toFixed(2)}</span>
-                        </div>
-                        <div className="flex justify-between text-sm">
-                          <span className="text-base-content/70">Est. health factor</span>
-                          <span className={postHealthFactor != null && postHealthFactor < 1 ? 'text-error font-medium' : 'font-medium'}>
-                            {postHealthFactor == null ? 'Infinity' : postHealthFactor.toFixed(2)}
-                          </span>
-                        </div>
-                        {postHealthFactor != null && postHealthFactor < 1 ? (
-                          <div className="rounded-md bg-error/15 border border-error/30 px-2 py-1 text-xs text-error">
-                            Estimated health factor is below 1.0. This action is likely to fail on-chain due to cross-collateral safety checks.
-                          </div>
-                        ) : null}
-                      </>
-                    ) : null}
+                    {postHealthFactor != null && postHealthFactor < 1 && (
+                      <div className="rounded-lg px-3 py-2 text-xs text-red-400" style={{ backgroundColor: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)' }}>
+                        Estimated health factor is below 1.0. This action is likely to fail on-chain.
+                      </div>
+                    )}
                   </div>
-                  {(actionModalAsset === 'aleo'
-                    ? amountError
-                    : actionModalAsset === 'usdc'
-                      ? amountErrorUsdc
-                      : amountErrorUsad) ? (
-                    <div className="rounded-lg bg-error/15 border border-error/30 px-4 py-3 text-error text-sm">
-                      {actionModalAsset === 'aleo'
-                        ? amountError
-                        : actionModalAsset === 'usdc'
-                          ? amountErrorUsdc
-                          : amountErrorUsad}
+                  {(actionModalAsset === 'aleo' ? amountError : actionModalAsset === 'usdc' ? amountErrorUsdc : amountErrorUsad) && (
+                    <div className="rounded-lg px-4 py-3 text-sm text-red-400" style={{ backgroundColor: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)' }}>
+                      {actionModalAsset === 'aleo' ? amountError : actionModalAsset === 'usdc' ? amountErrorUsdc : amountErrorUsad}
                     </div>
-                  ) : statusMessage ? (
-                    <div
-                      className={`rounded-lg px-4 py-3 text-sm ${
-                        statusMessage.includes('at most') ||
-                        statusMessage.includes('liquidity') ||
-                        statusMessage.includes('Failed') ||
-                        statusMessage.includes('Insufficient') ||
-                        statusMessage.includes('free for withdrawal')
-                          ? 'bg-error/15 border border-error/30 text-error'
-                          : 'text-base-content/70'
-                      }`}
-                    >
-                      {statusMessage}
-                    </div>
-                  ) : null}
+                  )}
+                  {statusMessage && !(actionModalAsset === 'aleo' ? amountError : actionModalAsset === 'usdc' ? amountErrorUsdc : amountErrorUsad) && (
+                    <div className="text-sm text-slate-400 px-1">{statusMessage}</div>
+                  )}
                   <button
                     type="button"
-                    className="btn btn-primary w-full"
-                    disabled={
-                      loading ||
-                      !modalAmount ||
-                      modalAmount <= 0 ||
-                      modalAmount > modalMaxAmount
-                    }
+                    disabled={loading || !modalAmount || modalAmount <= 0 || !amountWithinMax(modalAmount, modalMaxAmount)}
                     onClick={async () => {
-                      if (actionModalAsset === 'usdc') {
-                        await handleActionUsdc(actionModalMode);
-                      } else if (actionModalAsset === 'usad') {
-                        await handleActionUsad(actionModalMode);
-                      } else {
-                        await handleAction(actionModalMode);
-                      }
+                      if (actionModalAsset === 'usdc') await handleActionUsdc(actionModalMode);
+                      else if (actionModalAsset === 'usad') await handleActionUsad(actionModalMode);
+                      else await handleAction(actionModalMode);
                     }}
+                    className="w-full py-3 rounded-xl font-bold transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                    style={{ background: 'linear-gradient(to right, #22d3ee, #6366f1)', color: '#030712' }}
                   >
                     {loading ? <span className="loading loading-spinner loading-sm" /> : null}
-                    {!modalAmount || modalAmount <= 0
-                      ? 'Enter an amount'
-                      : modalAmount > modalMaxAmount
-                        ? 'Amount too high'
-                        : actionModalTitle}
+                    {!modalAmount || modalAmount <= 0 ? 'Enter an amount' : !amountWithinMax(modalAmount, modalMaxAmount) ? 'Amount too high' : actionModalTitle}
                   </button>
                 </>
               ) : (
                 <div className="space-y-4">
-                  {loading || (txId && !txFinalized) ? (
+                  {loading ? (
                     <div className="flex flex-col items-center justify-center py-8 gap-3">
-                      <span className="loading loading-spinner loading-lg" />
-                      {txFinalized && txId && (actionModalMode === 'withdraw' || actionModalMode === 'borrow') ? (
-                        <>
-                          <p className="text-sm font-medium text-base-content">Program transaction confirmed.</p>
-                          <p className="text-sm text-base-content/70">Initiating vault transfer…</p>
-                        </>
-                      ) : (
-                        <p className="text-sm text-base-content/70">Processing…</p>
-                      )}
-                      {statusMessage ? (
-                        <div className={`rounded-lg px-4 py-3 mt-2 max-w-sm w-full text-center text-sm ${statusMessage.includes('at most') || statusMessage.includes('liquidity') || statusMessage.includes('Failed') || statusMessage.includes('Insufficient') || statusMessage.includes('free for withdrawal') ? 'bg-error/15 text-error' : 'text-base-content/70'}`}>
-                          {statusMessage}
-                        </div>
-                      ) : null}
+                      <span className="loading loading-spinner loading-lg text-cyan-400" />
+                      <p className="text-sm text-slate-400">{statusMessage || 'Processing…'}</p>
                     </div>
                   ) : (
                     <>
-                      {statusMessage && !txFinalized ? (
-                        <div
-                          className={`rounded-lg px-4 py-3 text-sm text-center w-full ${
-                            statusMessage.includes('at most') ||
-                            statusMessage.includes('liquidity') ||
-                            statusMessage.includes('Failed') ||
-                            statusMessage.includes('Insufficient') ||
-                            statusMessage.includes('free for withdrawal')
-                              ? 'bg-error/15 border border-error/30 text-error'
-                              : 'text-base-content/70'
-                          }`}
-                        >
-                          {statusMessage}
-                        </div>
-                      ) : null}
-                      {txFinalized && txId ? (
-                        <a
-                          href={getProvableExplorerTxUrl(txId)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="link link-primary text-base font-medium block text-center py-2"
-                        >
-                          View in explorer
+                      {statusMessage && !txFinalized && (
+                        <div className="rounded-lg px-4 py-3 text-sm text-center text-slate-400">{statusMessage}</div>
+                      )}
+                      {txFinalized && txId && (
+                        <a href={getProvableExplorerTxUrl(txId ?? '')} target="_blank" rel="noopener noreferrer"
+                          className="text-cyan-400 text-sm font-medium block text-center py-2 hover:text-cyan-300">
+                          View in explorer ↗
                         </a>
-                      ) : null}
-                      {txFinalized ? (
-                        <p className="text-sm text-base-content/70 text-center">
+                      )}
+                      {txFinalized && (
+                        <p className="text-sm text-slate-400 text-center">
                           {actionModalMode === 'withdraw' || actionModalMode === 'borrow'
-                            ? 'Transaction finalized! Vault transfer will be done in 1–5 min — check status in Transaction History.'
+                            ? 'Transaction finalized! Vault transfer will be done in 1–5 min.'
                             : 'Transaction finalized.'}
                         </p>
-                      ) : null}
-                      {txFinalized && (actionModalMode === 'withdraw' || actionModalMode === 'borrow') && (vaultWithdrawTxId || vaultBorrowTxId) ? (
-                        <a
-                          href={getProvableExplorerTxUrl(vaultWithdrawTxId || vaultBorrowTxId!)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="link link-primary text-base font-medium block text-center py-2"
-                        >
-                          View vault transfer in explorer
-                        </a>
-                      ) : null}
-                      <button type="button" className="btn btn-primary w-full mt-2" onClick={closeActionModal}>
+                      )}
+                      <button type="button" onClick={closeActionModal}
+                        className="w-full py-3 rounded-xl font-bold text-white border border-white/10 hover:bg-white/10 transition-all">
                         Close
                       </button>
                     </>
@@ -3516,725 +3447,569 @@ const DashboardPage: NextPageWithLayout = () => {
         </div>
       )}
 
-      <div className="space-y-6 w-full max-w-6xl px-4">
-        {/* Brief loading when wallet state may be restoring after nav (e.g. from Markets) */}
-        {!connected && (connecting || !allowShowConnectCTA) && (
-          <div className="rounded-xl bg-base-200 border border-base-300 flex flex-col items-center justify-center py-16 px-6">
-            <span className="loading loading-spinner loading-lg text-primary" />
-            <p className="text-sm text-base-content/70 mt-3">Loading wallet…</p>
+      <main className="max-w-[1440px] mx-auto px-4 sm:px-8 pt-8 pb-20">
+        {/* Page header */}
+        <div className="flex flex-col md:flex-row md:items-end justify-between mb-10">
+          <div>
+            <h1 className="text-4xl font-bold mb-2 text-white">Private Dashboard</h1>
+            <p className="font-mono text-sm tracking-wide" style={{ color: '#64748b' }}>SHIELDED OVERVIEW • ALEO TESTNET</p>
           </div>
-        )}
-        {/* Aave-style: connect wallet CTA when not connected */}
-        {!connected && !connecting && allowShowConnectCTA && (
-          <div className="rounded-xl bg-base-200 border border-base-300 flex flex-col items-center justify-center py-16 px-6 text-center">
-            <div className="w-24 h-24 rounded-full bg-base-300 flex items-center justify-center mb-4 text-4xl opacity-80" aria-hidden>
-              👻
-            </div>
-            <h2 className="text-xl font-bold mb-2">Please, connect your wallet</h2>
-            <p className="text-base-content/70 text-sm max-w-md mb-6">
-              Connect your wallet to see your supplies, borrowings, and open positions.
-            </p>
-            <div className="wallet-button-wrapper">
-              <WalletMultiButton className="!bg-gradient-to-r !from-primary !to-secondary !border-0 !text-primary-content !font-semibold !px-6 !py-3 !rounded-lg !min-h-0 !h-auto" />
-            </div>
+          <div className="flex mt-6 md:mt-0">
+            {connected && (
+              <button
+                type="button"
+                onClick={() => { refreshPoolState(true); refreshUsdcPoolState(true); refreshUsadPoolState(true); }}
+                disabled={loading || isRefreshingState || isRefreshingUsdcState || isRefreshingUsadState}
+                className="px-5 py-2 rounded-xl text-sm font-mono transition-all self-end disabled:opacity-50"
+                style={dashGlass}
+              >
+                <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block mr-2" />
+                {isRefreshingState || isRefreshingUsdcState || isRefreshingUsadState ? 'Refreshing...' : 'Refresh'}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Not connected — loading spinner */}
+        {!connected && (connecting || !allowShowConnectCTA) && (
+          <div className="rounded-[32px] p-20 flex flex-col items-center justify-center text-center mb-12" style={dashGlass}>
+            <span className="loading loading-spinner loading-lg text-cyan-400 mb-4" />
+            <p className="text-sm text-slate-400">Loading wallet…</p>
           </div>
         )}
 
-        {/* Aave-style merged view when connected */}
-        {connected && (
-          <div className="space-y-4">
-            {!dashboardDataReady && (
-              <div className="w-full max-w-[1340px] mx-auto space-y-8 animate-pulse">
-                <div className="flex justify-between items-center text-white/80">
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-lg bg-white/20 border border-white/20" />
-                    <div className="h-6 w-40 rounded-lg bg-white/15" />
-                  </div>
-                  <div className="h-10 w-36 rounded-xl bg-white/10 border border-white/15" />
+        {/* Not connected — CTA */}
+        {!connected && !connecting && allowShowConnectCTA && (
+          <div className="rounded-[32px] p-20 flex flex-col items-center justify-center text-center mb-12 relative overflow-hidden" style={dashGlass}>
+            {/* pointer-events-none so this layer never steals clicks from the Connect control */}
+            <div className="absolute inset-0 pointer-events-none z-0" style={dashRadialGlow} />
+            <div className="relative z-10 flex w-full max-w-lg flex-col items-center">
+              <div className="relative mb-8">
+                <div className="w-24 h-24 rounded-full border border-white/5 flex items-center justify-center" style={{ backgroundColor: 'rgba(30,41,59,0.3)', animation: 'float 6s ease-in-out infinite' }}>
+                  <svg className="w-10 h-10" style={{ color: '#475569' }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><line x1="17" y1="8" x2="23" y2="14" /><line x1="23" y1="8" x2="17" y2="14" /></svg>
                 </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-                  {[0, 1, 2, 3].map((i) => (
-                    <div
-                      key={i}
-                      className="bg-white rounded-2xl p-6 shadow-lg shadow-black/5 border border-slate-100"
-                    >
-                      <div className="h-3 w-28 bg-slate-200 rounded mb-3" />
-                      <div className="h-9 w-32 bg-slate-200/90 rounded mb-2 mt-3" />
-                      <div className="h-3 w-full max-w-[180px] bg-slate-100 rounded" />
-                    </div>
-                  ))}
-                </div>
-                <div className="bg-white rounded-[24px] shadow-2xl overflow-hidden border border-white">
-                  <div className="bg-slate-50/80 border-b border-slate-100 px-8 py-5">
-                    <div className="grid grid-cols-[2fr_1.5fr_1.5fr_1.5fr_1fr] gap-4 items-center">
-                      {[0, 1, 2, 3, 4].map((c) => (
-                        <div key={c} className="h-3 bg-slate-200/90 rounded" />
-                      ))}
-                    </div>
-                  </div>
-                  {[0, 1, 2].map((row) => (
-                    <div key={row} className="border-b border-slate-100 px-8 py-5">
-                      <div className="grid grid-cols-[2fr_1.5fr_1.5fr_1.5fr_1fr] gap-4 items-center">
-                        <div className="h-10 w-36 rounded-full bg-slate-100" />
-                        <div className="h-5 w-20 bg-slate-100 rounded mx-auto" />
-                        <div className="h-8 w-24 bg-slate-100 rounded mx-auto" />
-                        <div className="h-8 w-24 bg-slate-100 rounded mx-auto" />
-                        <div className="h-9 w-24 bg-slate-100 rounded-xl ml-auto" />
-                      </div>
-                    </div>
-                  ))}
-                  <div className="bg-slate-50 border-t border-slate-100 px-8 py-4 flex justify-between">
-                    <div className="h-3 w-48 bg-slate-200/80 rounded" />
-                    <div className="h-3 w-32 bg-slate-200/80 rounded" />
-                  </div>
+                <div className="absolute -bottom-2 -right-2 w-10 h-10 rounded-full border border-cyan-500/30 flex items-center justify-center" style={{ ...dashGlass, backgroundColor: '#030712' }}>
+                  <svg className="w-5 h-5 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></svg>
                 </div>
               </div>
-            )}
-            {dashboardDataReady && (
-              <>
-                <div className="w-full max-w-[1340px] mx-auto space-y-8">
-                  <header className="flex justify-end items-center text-white">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        refreshPoolState(true);
-                        refreshUsdcPoolState(true);
-                        refreshUsadPoolState(true);
-                      }}
-                      disabled={loading || isRefreshingState || isRefreshingUsdcState || isRefreshingUsadState}
-                      className="bg-white/10 hover:bg-white/20 transition-colors px-4 py-2 rounded-xl text-sm font-medium backdrop-blur-sm border border-white/20 flex items-center gap-2 disabled:opacity-60"
-                    >
-                      <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                      {isRefreshingState || isRefreshingUsdcState || isRefreshingUsadState ? 'Refreshing...' : 'Refresh'}
-                    </button>
-                  </header>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-                    <div className="bg-white rounded-2xl p-6 shadow-lg shadow-black/5">
-                      <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest mb-1">Total Collateral (USD)</h2>
-                      <div className="text-[32px] leading-none font-bold font-mono mb-2 mt-3 text-slate-900">${totalCollateralUsd.toFixed(2)}</div>
-                      <p className="text-sm text-slate-500 leading-snug">All supplied assets valued on-chain.</p>
-                    </div>
-                    <div className="bg-white rounded-2xl p-6 shadow-lg shadow-black/5">
-                      <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest mb-1">Borrowable (USD)</h2>
-                      <div className="text-[32px] leading-none font-bold font-mono mb-2 mt-3 text-amber-500">${borrowableUsd.toFixed(2)}</div>
-                      <p className="text-sm text-slate-500 leading-snug">Cross-asset cap before health drops below threshold.</p>
-                    </div>
-                    <div className="bg-white rounded-2xl p-6 shadow-lg shadow-black/5">
-                      <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest mb-1">Total Debt (USD)</h2>
-                      <div className="text-[32px] leading-none font-bold font-mono mb-2 mt-3 text-amber-500">${totalDebtUsd.toFixed(2)}</div>
-                      <p className="text-sm text-slate-500 leading-snug">Borrowed value across ALEO, USDCx, and USAD.</p>
-                    </div>
-                    <div className="bg-white rounded-2xl p-6 shadow-lg shadow-black/5">
-                      <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest mb-1">Health Factor</h2>
-                      <div className={`text-[32px] leading-none font-bold font-mono mb-2 mt-3 ${healthFactor != null && healthFactor < 1 ? 'text-red-500' : 'text-emerald-500'}`}>
-                        {healthFactor == null ? '∞' : healthFactor.toFixed(2)}
-                      </div>
-                      <p className="text-sm text-slate-500 leading-snug">
-                        {healthFactor == null
-                          ? 'No debt.'
-                          : healthFactor < 1
-                            ? 'Repay or add collateral.'
-                            : 'Healthy position.'}
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="bg-white rounded-[24px] shadow-2xl overflow-hidden border border-white">
-                    <div className="bg-slate-50/80 border-b border-slate-100 px-8 py-5">
-                      <div className="grid grid-cols-[2fr_1.5fr_1.5fr_1.5fr_1fr] gap-4 items-center text-xs font-bold text-slate-400 uppercase tracking-wider">
-                        <div>Asset</div>
-                        <div>Wallet Balance</div>
-                        <div>Supplied</div>
-                        <div>Borrowed</div>
-                        <div className="text-right">Manage Position</div>
-                      </div>
-                    </div>
-
-                    {[
-                      { id: 'aleo' as const, label: 'ALEO', wallet: privateAleoBalance ?? 0, supplied: supplyBalanceAleo, borrowed: borrowDebtAleo, sApy: supplyAPY, bApy: borrowAPY },
-                      { id: 'usdc' as const, label: 'USDCx', wallet: privateUsdcBalance ?? 0, supplied: supplyBalanceUsdc, borrowed: borrowDebtUsdc, sApy: supplyAPYUsdc, bApy: borrowAPYUsdc },
-                      { id: 'usad' as const, label: 'USAD', wallet: privateUsadBalance ?? 0, supplied: supplyBalanceUsad, borrowed: borrowDebtUsad, sApy: supplyAPYUsad, bApy: borrowAPYUsad },
-                    ].map((asset) => (
-                      <div key={asset.id} className="border-b border-slate-100">
-                        <div
-                          className={`grid grid-cols-[2fr_1.5fr_1.5fr_1.5fr_1fr] gap-4 items-center px-8 py-5 cursor-pointer ${expandedAsset === asset.id ? 'bg-slate-50' : 'hover:bg-slate-50'}`}
-                          onClick={() => {
-                            const nextExpanded = expandedAsset === asset.id ? null : asset.id;
-                            setExpandedAsset(nextExpanded);
-                            if (nextExpanded) {
-                              setActiveManageTab('Supply');
-                              setManageAmountInput('');
-                            }
-                          }}
-                        >
-                          <div><AssetBadge asset={asset.label as 'ALEO' | 'USDCx' | 'USAD'} compact /></div>
-                          <div className="font-mono text-slate-700 text-[15px]">{asset.wallet.toFixed(2)}</div>
-                          <div className="font-mono text-slate-700 text-[15px]">
-                            {asset.supplied.toFixed(2)}
-                            <div className="text-xs text-slate-400 font-sans">APY: {(asset.sApy * 100).toFixed(2)}%</div>
-                          </div>
-                          <div className="font-mono text-slate-700 text-[15px]">
-                            {asset.borrowed.toFixed(2)}
-                            <div className="text-xs text-slate-400 font-sans">APY: {(asset.bApy * 100).toFixed(2)}%</div>
-                          </div>
-                          <div className="flex justify-end">
-                            <button className="flex items-center gap-2 border border-slate-200 text-slate-600 hover:border-indigo-500 hover:text-indigo-600 bg-white px-4 py-2 rounded-xl text-sm font-semibold transition-colors">
-                              {expandedAsset === asset.id ? 'Close' : 'Manage'}
-                            </button>
-                          </div>
-                        </div>
-
-                        {expandedAsset === asset.id && (
-                          <div className="bg-slate-50/50 border-t border-slate-200 px-8 py-8">
-                            <div className="max-w-4xl mx-auto grid grid-cols-1 lg:grid-cols-[1.5fr_1fr] gap-10">
-                              <div>
-                                <div className="flex gap-1 mb-6 bg-slate-200/50 p-1 rounded-xl w-fit">
-                                  {(['Supply', 'Withdraw', 'Borrow', 'Repay'] as const).map((tab) => (
-                                    <button
-                                      key={tab}
-                                      onClick={() => {
-                                        setActiveManageTab(tab);
-                                        setManageAmountInput('');
-                                      }}
-                                      className={`px-5 py-2 rounded-lg text-sm transition-all ${activeManageTab === tab ? 'bg-white text-slate-900 font-semibold shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
-                                    >
-                                      {tab}
-                                    </button>
-                                  ))}
-                                </div>
-                                <div className="flex justify-between items-end mb-3">
-                                  <label className="text-sm font-semibold text-slate-700">Amount to {activeManageTab}</label>
-                                  <div className="text-xs text-slate-500">
-                                    {activeManageTab === 'Supply' ? (
-                                      <>
-                                        Wallet Balance:{' '}
-                                        <span className="font-mono text-slate-800 font-medium">
-                                          {asset.wallet.toFixed(2)} {asset.label}
-                                        </span>
-                                      </>
-                                    ) : activeManageTab === 'Borrow' ? (
-                                      <>
-                                        Available Borrowable (USD):{' '}
-                                        <span className="font-mono text-slate-800 font-medium">${borrowableUsd.toFixed(2)}</span>
-                                      </>
-                                    ) : activeManageTab === 'Withdraw' ? (
-                                      <>
-                                        Available Withdrawable (USD):{' '}
-                                        <span className="font-mono text-slate-800 font-medium">${portfolioWithdrawUsd.toFixed(2)}</span>
-                                      </>
-                                    ) : (
-                                      <>
-                                        Total Debt (USD):{' '}
-                                        <span className="font-mono text-slate-800 font-medium">${portfolioDebtUsdForRepay.toFixed(2)}</span>
-                                      </>
-                                    )}
-                                  </div>
-                                </div>
-                                <div className="relative flex items-center bg-white border border-slate-200 rounded-2xl overflow-hidden focus-within:border-indigo-500 focus-within:ring-4 focus-within:ring-indigo-500/10 transition-all shadow-sm">
-                                  <input
-                                    type="text"
-                                    placeholder="0.00"
-                                    value={manageAmountInput}
-                                    onChange={(e) => setManageAmountInput(e.target.value)}
-                                    className="w-full text-3xl font-mono text-slate-800 py-6 pl-6 pr-32 outline-none bg-transparent placeholder-slate-300"
-                                  />
-                                  <div className="absolute right-4 flex items-center gap-2">
-                                    <button
-                                      onClick={async () => {
-                                        const maxVal = await resolveInlineMaxAmount(activeManageTab, asset.id);
-                                        setManageAmountInput(maxVal.toFixed(2));
-                                      }}
-                                      type="button"
-                                      className="text-xs font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 rounded-lg transition-colors uppercase tracking-wide"
-                                    >
-                                      Max
-                                    </button>
-                                    <span className="font-semibold text-slate-700">{asset.label}</span>
-                                  </div>
-                                </div>
-                                <div className="flex gap-2 mt-4">
-                                  {[25, 50, 75, 100].map((pct) => (
-                                    <button
-                                      key={pct}
-                                      type="button"
-                                      onClick={() => {
-                                        (async () => {
-                                          const inlineMax = await resolveInlineMaxAmount(activeManageTab, asset.id);
-                                          setManageAmountInput(((inlineMax * pct) / 100).toFixed(2));
-                                        })();
-                                      }}
-                                      className="flex-1 py-1.5 text-xs font-medium text-slate-500 border border-slate-200 rounded-lg hover:bg-slate-100 transition-colors"
-                                    >
-                                      {pct}%
-                                    </button>
-                                  ))}
-                                </div>
-                                <button
-                                  onClick={async () => {
-                                    const raw = Number(manageAmountInput);
-                                    const inlineMax = getInlineMaxAmount(activeManageTab, asset.id);
-                                    const amountToUse =
-                                      Number.isFinite(raw) && raw > 0
-                                        ? Math.min(raw, inlineMax)
-                                        : 0;
-                                    if (!amountToUse) return;
-
-                                    // Ensure the underlying transaction handlers record the correct amount
-                                    // (they use `amount` / `amountUsdc` / `amountUsad` state, not `manageAmountInput`).
-                                    setModalAmountInput(String(amountToUse));
-                                    if (asset.id === 'usdc') setAmountUsdc(amountToUse);
-                                    else if (asset.id === 'usad') setAmountUsad(amountToUse);
-                                    else setAmount(amountToUse);
-
-                                    setInlineTxContext({ tab: activeManageTab, asset: asset.id });
-
-                                    const txAction =
-                                      activeManageTab === 'Supply'
-                                        ? 'deposit'
-                                        : activeManageTab === 'Withdraw'
-                                          ? 'withdraw'
-                                          : activeManageTab === 'Borrow'
-                                            ? 'borrow'
-                                            : 'repay';
-
-                                    if (asset.id === 'aleo') {
-                                      await handleAction(txAction as any, amountToUse);
-                                    } else if (asset.id === 'usdc') {
-                                      await handleActionUsdc(txAction as any, amountToUse);
-                                    } else {
-                                      await handleActionUsad(txAction as any, amountToUse);
-                                    }
-                                  }}
-                                  disabled={(() => {
-                                    const raw = Number(manageAmountInput);
-                                    const inlineMax = getInlineMaxAmount(activeManageTab, asset.id);
-                                    // allow tiny epsilon over max to account for float rounding
-                                    const EPS = 1e-6;
-                                    return (
-                                      loading ||
-                                      !Number.isFinite(raw) ||
-                                      raw <= 0 ||
-                                      raw - inlineMax > EPS
-                                    );
-                                  })()}
-                                  className="w-full mt-4 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-4 rounded-2xl shadow-lg shadow-indigo-500/30 transition-all text-lg disabled:opacity-60 disabled:cursor-not-allowed"
-                                >
-                                  {activeManageTab} {asset.label}
-                                </button>
-                              </div>
-
-                              <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-sm">
-                                <h3 className="text-sm font-semibold text-slate-800 mb-5">Transaction Overview</h3>
-                                {(() => {
-                                  const amountNum = Number(manageAmountInput);
-                                  const preview = computeInlinePreview(activeManageTab, asset.id, amountNum);
-                                  const isThisInline =
-                                    inlineTxContext?.tab === activeManageTab && inlineTxContext?.asset === asset.id;
-
-                                  return (
-                                    <div className="space-y-3 text-sm">
-                                      <div className="space-y-1">
-                                        <div className="text-slate-500">{preview.remainingAfterLabel}</div>
-                                        <div className="font-mono text-slate-800">
-                                          {preview.remainingAfter.toFixed(2)} {preview.assetSymbol}
-                                        </div>
-                                      </div>
-                                      <div className="space-y-1">
-                                        <div className="text-slate-500">Est. weighted collateral (USD)</div>
-                                        <div className="font-mono text-slate-800">${preview.postWeightedCollateralUsd.toFixed(2)}</div>
-                                      </div>
-                                      <div className="space-y-1">
-                                        <div className="text-slate-500">Est. total debt (USD)</div>
-                                        <div className="font-mono text-slate-800">${preview.postTotalDebtUsd.toFixed(2)}</div>
-                                      </div>
-
-                                      {isThisInline && loading ? (
-                                        <div className="mt-2 text-xs text-slate-500 flex items-center gap-2">
-                                          <span className="loading loading-spinner loading-xs" />
-                                          <span>{statusMessage || 'Processing...'}</span>
-                                        </div>
-                                      ) : null}
-
-                                      {isThisInline && txFinalized && txId ? (
-                                        <a
-                                          href={getProvableExplorerTxUrl(txId)}
-                                          target="_blank"
-                                          rel="noopener noreferrer"
-                                          className="link link-primary text-xs block mt-3"
-                                        >
-                                          View in explorer
-                                        </a>
-                                      ) : null}
-                                    </div>
-                                  );
-                                })()}
-                              </div>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    ))}
-
-                    <div className="bg-slate-50 border-t border-slate-100 px-8 py-4 flex items-center text-xs text-slate-500">
-                      <span>Showing 3 supported assets on Aleo</span>
-                    </div>
-                  </div>
-                </div>
-              </>
-            )}
+              <h2 className="text-2xl font-bold mb-3 text-white">Please, connect your wallet</h2>
+              <p className="text-slate-400 max-w-md mx-auto mb-10">
+                Connect your Aleo wallet to decrypt your private records and view your supplies, borrowings, and open positions in the Dark Pool.
+              </p>
+              <div className="w-full flex justify-center">
+                {/* Same wiring as WalletMultiButton when no wallet: opens the adapter modal */}
+                <WalletModalButton
+                  disabled={connecting}
+                  className="!m-0 !min-h-0 !h-auto !rounded-xl !border !border-white/10 !bg-[#0B1221] !px-6 !py-2 !text-sm !font-semibold !text-white !shadow-none hover:!border-white/20 hover:!bg-[#111827] disabled:!cursor-wait disabled:!opacity-60"
+                  style={{ fontFamily: "'Space Grotesk', sans-serif" }}
+                >
+                  {connecting ? 'Connecting...' : 'Connect'}
+                </WalletModalButton>
+              </div>
+            </div>
           </div>
         )}
 
-        {/* Transaction history (Supabase – fetched by wallet address) */}
-        {connected && (
-        <div className="rounded-xl bg-base-200 p-6 border border-base-300 mb-8 pb-2">
-          <div className="flex items-center justify-between gap-4 mb-2">
-            <h2 className="text-xl font-semibold text-base-content">Transaction history</h2>
-            <Button variant="ghost" size="small" onClick={fetchTransactionHistory} disabled={txHistoryLoading || !address}>
-              {txHistoryLoading ? 'Loading…' : 'Refresh'}
-            </Button>
-          </div>
-          {txHistoryError ? (
-            <div className="rounded-lg bg-warning/10 border border-warning/30 p-4 text-sm text-warning">
-              <p className="font-medium">Could not load transaction history</p>
-              <p className="mt-1">{txHistoryError}</p>
-              <p className="mt-2 text-base-content/70">
-                Ensure you ran <code className="text-xs bg-base-300 px-1 rounded">supabase/schema.sql</code> in Supabase SQL Editor and that{' '}
-                <code className="text-xs bg-base-300 px-1 rounded">.env</code> has NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUB_KEY (Publishable key).
-              </p>
+        {/* Connected — full dashboard loading (stats + assets + tx history placeholders) */}
+        {connected && !dashboardDataReady && (
+          <div className="space-y-10 animate-pulse mb-12">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+              {[0, 1, 2, 3].map((i) => (
+                <div key={i} className="rounded-2xl p-6 relative overflow-hidden" style={dashGlass}>
+                  <div className="absolute inset-0" style={dashRadialGlow} />
+                  <div className="relative">
+                    <div className="h-3 w-36 rounded mb-3" style={{ backgroundColor: 'rgba(255,255,255,0.06)' }} />
+                    <div className="h-9 w-28 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.1)' }} />
+                  </div>
+                </div>
+              ))}
             </div>
-          ) : txHistoryLoading && txHistory.length === 0 ? (
-            <p className="text-base-content/70">Loading transactions…</p>
-          ) : txHistory.length === 0 ? (
-            <p className="text-base-content/70">
-              No transactions yet. Deposit, withdraw, borrow, or repay to see history here.
-            </p>
-          ) : (
-            <>
-              <div className="overflow-x-auto">
-                <table className="table table-zebra w-full">
+
+            <div className="rounded-[32px] overflow-hidden" style={dashGlass}>
+              <div
+                className="grid grid-cols-[2fr_1.2fr_1.2fr_1.2fr_1fr] gap-4 items-center px-8 py-5"
+                style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}
+              >
+                {[0, 1, 2, 3, 4].map((i) => (
+                  <div key={i} className={`h-3 rounded ${i === 4 ? 'justify-self-end w-16' : 'w-20'}`} style={{ backgroundColor: 'rgba(255,255,255,0.08)' }} />
+                ))}
+              </div>
+              {[0, 1, 2].map((row) => (
+                <div
+                  key={row}
+                  className="grid grid-cols-[2fr_1.2fr_1.2fr_1.2fr_1fr] gap-4 items-center px-8 py-5"
+                  style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-8 h-8 rounded-lg shrink-0" style={{ backgroundColor: 'rgba(255,255,255,0.1)' }} />
+                    <div className="h-4 w-14 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.1)' }} />
+                  </div>
+                  <div className="h-4 w-12 rounded justify-self-start" style={{ backgroundColor: 'rgba(255,255,255,0.08)' }} />
+                  <div className="flex flex-col gap-2">
+                    <div className="h-4 w-14 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.08)' }} />
+                    <div className="h-3 w-20 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }} />
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <div className="h-4 w-14 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.08)' }} />
+                    <div className="h-3 w-20 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }} />
+                  </div>
+                  <div className="flex justify-end">
+                    <div className="h-9 w-20 rounded-xl" style={{ backgroundColor: 'rgba(255,255,255,0.06)' }} />
+                  </div>
+                </div>
+              ))}
+              <div className="px-8 py-4 flex items-center" style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                <div className="h-3 w-52 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }} />
+              </div>
+            </div>
+
+            <section className="mb-10">
+              <div className="flex items-center justify-between mb-6">
+                <div className="h-7 w-56 rounded-lg" style={{ backgroundColor: 'rgba(255,255,255,0.08)' }} />
+                <div className="h-9 w-24 rounded-lg" style={{ backgroundColor: 'rgba(255,255,255,0.06)' }} />
+              </div>
+              <div className="rounded-[32px] overflow-hidden" style={dashGlass}>
+                <div className="grid grid-cols-5 gap-4 px-8 py-4" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}>
+                  {[0, 1, 2, 3, 4].map((i) => (
+                    <div key={i} className="h-3 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.08)' }} />
+                  ))}
+                </div>
+                {[0, 1, 2].map((r) => (
+                  <div
+                    key={r}
+                    className="grid grid-cols-5 gap-4 px-8 py-5 items-center"
+                    style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }}
+                  >
+                    <div className="h-4 w-16 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.08)' }} />
+                    <div className="flex items-center gap-2">
+                      <div className="w-7 h-7 rounded-lg" style={{ backgroundColor: 'rgba(255,255,255,0.1)' }} />
+                      <div className="h-4 w-12 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.08)' }} />
+                    </div>
+                    <div className="h-4 w-20 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.08)' }} />
+                    <div className="h-4 w-36 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.06)' }} />
+                    <div className="h-8 w-full max-w-[200px] rounded-lg" style={{ backgroundColor: 'rgba(255,255,255,0.06)' }} />
+                  </div>
+                ))}
+              </div>
+            </section>
+          </div>
+        )}
+
+        {/* Connected — full dashboard */}
+        {connected && dashboardDataReady && (
+          <>
+            {/* Stats row */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-10">
+              {[
+                { label: 'Total Collateral (USD)', value: `$${totalCollateralUsd.toFixed(2)}`, color: 'text-white' },
+                { label: 'Borrowable (USD)', value: `$${borrowableUsd.toFixed(2)}`, color: 'text-cyan-400' },
+                { label: 'Total Debt (USD)', value: `$${totalDebtUsd.toFixed(2)}`, color: 'text-indigo-400' },
+                { label: 'Health Factor', value: healthFactor == null ? '∞' : healthFactor.toFixed(2), color: healthFactor != null && healthFactor < 1 ? 'text-red-400' : 'text-emerald-400' },
+              ].map(stat => (
+                <div key={stat.label} className="rounded-2xl p-6 relative overflow-hidden" style={dashGlass}>
+                  <div className="absolute inset-0" style={dashRadialGlow} />
+                  <div className="relative">
+                    <p className="text-xs font-mono text-slate-500 uppercase tracking-wider mb-3">{stat.label}</p>
+                    <p className={`text-3xl font-bold font-mono ${stat.color}`}>{stat.value}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Asset management table */}
+            <div className="rounded-[32px] overflow-hidden mb-10" style={dashGlass}>
+              <div className="grid grid-cols-[2fr_1.2fr_1.2fr_1.2fr_1fr] gap-4 items-center px-8 py-5 font-mono text-xs text-slate-400 uppercase tracking-widest" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}>
+                <div>Asset</div>
+                <div>Wallet Balance</div>
+                <div>Supplied</div>
+                <div>Borrowed</div>
+                <div className="text-right">Manage</div>
+              </div>
+              {[
+                { id: 'aleo' as const, label: 'ALEO', wallet: privateAleoBalance ?? 0, supplied: supplyBalanceAleo, borrowed: borrowDebtAleo, sApy: supplyAPY, bApy: borrowAPY, image: '/logos/aleo-dark.svg' },
+                { id: 'usdc' as const, label: 'USDCx', wallet: privateUsdcBalance ?? 0, supplied: supplyBalanceUsdc, borrowed: borrowDebtUsdc, sApy: supplyAPYUsdc, bApy: borrowAPYUsdc, image: '/logos/usdc.svg' },
+                { id: 'usad' as const, label: 'USAD', wallet: privateUsadBalance ?? 0, supplied: supplyBalanceUsad, borrowed: borrowDebtUsad, sApy: supplyAPYUsad, bApy: borrowAPYUsad, image: '/logos/usad.svg' },
+              ].map((asset) => (
+                <div key={asset.id} style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                  <div
+                    className={`grid grid-cols-[2fr_1.2fr_1.2fr_1.2fr_1fr] gap-4 items-center px-8 py-5 cursor-pointer transition-colors ${expandedAsset === asset.id ? '' : 'hover:bg-white/5'}`}
+                    style={expandedAsset === asset.id ? { backgroundColor: 'rgba(255,255,255,0.04)' } : {}}
+                    onClick={() => {
+                      const next = expandedAsset === asset.id ? null : asset.id;
+                      setExpandedAsset(next);
+                      if (next) { setActiveManageTab('Supply'); setManageAmountInput(''); }
+                    }}
+                  >
+                        <div className="flex items-center gap-3 min-w-0">
+                          <img src={asset.image} alt={asset.label} className="w-8 h-8 rounded-lg shrink-0" />
+                          <p className="font-semibold text-white truncate">{asset.label}</p>
+                        </div>
+                    <div className="font-mono text-slate-300">{asset.wallet.toFixed(2)}</div>
+                    <div className="flex flex-col gap-0.5">
+                      <span className="font-mono text-cyan-400">{asset.supplied.toFixed(2)}</span>
+                      <span className="font-mono text-xs text-cyan-400/75 tabular-nums normal-case tracking-normal">
+                        APY: {(asset.sApy * 100).toFixed(2)}%
+                      </span>
+                    </div>
+                    <div className="flex flex-col gap-0.5">
+                      <span className="font-mono text-indigo-400">{asset.borrowed.toFixed(2)}</span>
+                      <span className="font-mono text-xs text-indigo-400/75 tabular-nums normal-case tracking-normal">
+                        APY: {(asset.bApy * 100).toFixed(2)}%
+                      </span>
+                    </div>
+                    <div className="flex justify-end">
+                      <button className="px-4 py-2 rounded-xl text-sm font-semibold transition-colors" style={{ border: '1px solid rgba(255,255,255,0.1)', color: '#94a3b8' }}>
+                        {expandedAsset === asset.id ? 'Close' : 'Manage'}
+                      </button>
+                    </div>
+                  </div>
+                  {expandedAsset === asset.id && (
+                    <div className="px-6 py-10 sm:px-10 sm:py-12" style={{ borderTop: '1px solid rgba(255,255,255,0.05)', backgroundColor: 'rgba(255,255,255,0.02)' }}>
+                      <div className="max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-[1.55fr_1fr] gap-12 lg:gap-14 xl:gap-16 items-start">
+                        <div className="flex flex-col gap-8">
+                          <div className="flex gap-1.5 p-1.5 rounded-2xl w-fit" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}>
+                            {(['Supply', 'Withdraw', 'Borrow', 'Repay'] as const).map((tab) => (
+                              <button key={tab} onClick={() => { setActiveManageTab(tab); setManageAmountInput(''); }}
+                                className={`px-6 py-3 rounded-xl text-base font-medium transition-all min-h-[48px] ${activeManageTab === tab ? 'text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
+                                style={activeManageTab === tab ? { backgroundColor: 'rgba(255,255,255,0.12)' } : {}}>
+                                {tab}
+                              </button>
+                            ))}
+                          </div>
+                          <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
+                            <span className="text-base font-semibold text-slate-200 tracking-tight">
+                              Amount to {activeManageTab}
+                            </span>
+                            {(() => {
+                              const priceUsd =
+                                asset.id === 'aleo'
+                                  ? ALEO_PRICE_USD
+                                  : asset.id === 'usdc'
+                                    ? USDCX_PRICE_USD
+                                    : USAD_PRICE_USD;
+                              if (activeManageTab === 'Supply') {
+                                return (
+                                  <span className="text-sm sm:text-base text-slate-500 text-right max-w-[min(100%,22rem)]">
+                                    Wallet Balance:{' '}
+                                    <span className="font-mono tabular-nums text-slate-300">{asset.wallet.toFixed(2)}</span>
+                                    <span className="text-slate-500 ml-1">{asset.label}</span>
+                                  </span>
+                                );
+                              }
+                              if (activeManageTab === 'Withdraw') {
+                                const withdrawUsd =
+                                  asset.id === 'aleo'
+                                    ? availableWithdrawAleoUsd
+                                    : asset.id === 'usdc'
+                                      ? availableWithdrawUsdcUsd
+                                      : availableWithdrawUsadUsd;
+                                return (
+                                  <span className="text-sm sm:text-base text-slate-500 text-right max-w-[min(100%,22rem)]">
+                                    Available Withdrawable (USD):{' '}
+                                    <span className="font-mono tabular-nums text-slate-300">${withdrawUsd.toFixed(2)}</span>
+                                  </span>
+                                );
+                              }
+                              if (activeManageTab === 'Borrow') {
+                                const borrowUsd =
+                                  asset.id === 'aleo'
+                                    ? availableBorrowAleoUsd
+                                    : asset.id === 'usdc'
+                                      ? availableBorrowUsdcUsd
+                                      : availableBorrowUsadUsd;
+                                return (
+                                  <span className="text-sm sm:text-base text-slate-500 text-right max-w-[min(100%,22rem)]">
+                                    Available to Borrow (USD):{' '}
+                                    <span className="font-mono tabular-nums text-slate-300">${borrowUsd.toFixed(2)}</span>
+                                  </span>
+                                );
+                              }
+                              const repayUsd = Math.min(portfolioDebtUsdForRepay, asset.wallet * priceUsd);
+                              return (
+                                <span className="text-sm sm:text-base text-slate-500 text-right max-w-[min(100%,22rem)]">
+                                  Available to Repay (USD):{' '}
+                                  <span className="font-mono tabular-nums text-slate-300">${repayUsd.toFixed(2)}</span>
+                                </span>
+                              );
+                            })()}
+                          </div>
+                          <div className="flex items-stretch rounded-3xl overflow-hidden min-h-[5.5rem] focus-within:ring-2 focus-within:ring-cyan-500/35 transition-all shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]" style={{ backgroundColor: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)' }}>
+                            <input
+                              type="text" placeholder="0.00" value={manageAmountInput}
+                              onChange={(e) => setManageAmountInput(e.target.value)}
+                              className="w-full min-w-0 bg-transparent text-4xl sm:text-[2.5rem] font-mono text-white py-6 pl-8 pr-4 outline-none placeholder-slate-600 leading-tight"
+                            />
+                            <div className="flex items-center gap-3 shrink-0 pr-6 pl-2">
+                              <button
+                                onClick={async () => {
+                                  const m = await resolveInlineMaxAmount(activeManageTab, asset.id);
+                                  setManageAmountInput(amountForMaxButton(m).toFixed(2));
+                                }}
+                                type="button"
+                                className="text-sm font-bold text-cyan-400 hover:text-cyan-300 px-4 py-2.5 rounded-xl transition-colors uppercase tracking-wide"
+                                style={{ backgroundColor: 'rgba(6,182,212,0.12)' }}>
+                                Max
+                              </button>
+                              <span className="font-semibold text-slate-300 text-base whitespace-nowrap">{asset.label}</span>
+                            </div>
+                          </div>
+                          <div className="flex gap-3">
+                            {[25, 50, 75, 100].map((pct) => (
+                              <button key={pct} type="button"
+                                onClick={() => {
+                                  (async () => {
+                                    const m = await resolveInlineMaxAmount(activeManageTab, asset.id);
+                                    const cap = amountForMaxButton(m);
+                                    setManageAmountInput(((cap * pct) / 100).toFixed(2));
+                                  })();
+                                }}
+                                className="flex-1 py-3.5 text-sm font-medium text-slate-400 rounded-xl hover:text-slate-200 transition-colors min-h-[48px]"
+                                style={{ border: '1px solid rgba(255,255,255,0.1)' }}>
+                                {pct}%
+                              </button>
+                            ))}
+                          </div>
+                          <button
+                            onClick={async () => {
+                              const raw = Number(manageAmountInput);
+                              const inlineMax = getInlineMaxAmount(activeManageTab, asset.id);
+                              const amountToUse = Number.isFinite(raw) && raw > 0 ? Math.min(raw, inlineMax) : 0;
+                              if (!amountToUse) return;
+                              setModalAmountInput(String(amountToUse));
+                              if (asset.id === 'usdc') setAmountUsdc(amountToUse);
+                              else if (asset.id === 'usad') setAmountUsad(amountToUse);
+                              else setAmount(amountToUse);
+                              setInlineTxContext({ tab: activeManageTab, asset: asset.id });
+                              const txAction = activeManageTab === 'Supply' ? 'deposit' : activeManageTab === 'Withdraw' ? 'withdraw' : activeManageTab === 'Borrow' ? 'borrow' : 'repay';
+                              if (asset.id === 'aleo') await handleAction(txAction as any, amountToUse);
+                              else if (asset.id === 'usdc') await handleActionUsdc(txAction as any, amountToUse);
+                              else await handleActionUsad(txAction as any, amountToUse);
+                            }}
+                            disabled={(() => {
+                              const r = Number(manageAmountInput);
+                              const m = getInlineMaxAmount(activeManageTab, asset.id);
+                              return loading || !Number.isFinite(r) || !amountWithinMax(r, m);
+                            })()}
+                            className="w-full font-bold py-5 rounded-3xl text-xl sm:text-[1.35rem] transition-all disabled:opacity-40 disabled:cursor-not-allowed min-h-[60px] shadow-lg shadow-cyan-950/20"
+                            style={{ background: 'linear-gradient(to right, #22d3ee, #6366f1)', color: '#030712' }}
+                          >
+                            {activeManageTab} {asset.label}
+                          </button>
+                        </div>
+                        <div className="rounded-3xl p-8 lg:p-9 w-full" style={{ backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
+                          <h3 className="text-base font-semibold text-slate-200 font-mono tracking-tight mb-8">Transaction Overview</h3>
+                          {(() => {
+                            const preview = computeInlinePreview(activeManageTab, asset.id, Number(manageAmountInput));
+                            const isThisInline = inlineTxContext?.tab === activeManageTab && inlineTxContext?.asset === asset.id;
+                            return (
+                              <div className="space-y-7 text-sm">
+                                <div>
+                                  <p className="text-xs font-mono uppercase tracking-wider text-slate-500 mb-2">{preview.remainingAfterLabel}</p>
+                                  <p className="font-mono text-xl text-white tracking-tight">{preview.remainingAfter.toFixed(2)} {preview.assetSymbol}</p>
+                                </div>
+                                <div>
+                                  <p className="text-xs font-mono uppercase tracking-wider text-slate-500 mb-2">Est. weighted collateral (USD)</p>
+                                  <p className="font-mono text-xl text-white tracking-tight">${preview.postWeightedCollateralUsd.toFixed(2)}</p>
+                                </div>
+                                <div>
+                                  <p className="text-xs font-mono uppercase tracking-wider text-slate-500 mb-2">Est. total debt (USD)</p>
+                                  <p className="font-mono text-xl text-white tracking-tight">${preview.postTotalDebtUsd.toFixed(2)}</p>
+                                </div>
+                                {isThisInline && loading && (
+                                  <div className="flex items-center gap-2 text-sm text-slate-500 pt-2">
+                                    <span className="loading loading-spinner loading-sm" />
+                                    <span>{statusMessage || 'Processing...'}</span>
+                                  </div>
+                                )}
+                                {isThisInline && txFinalized && txId && (
+                                  <a href={getProvableExplorerTxUrl(txId)} target="_blank" rel="noopener noreferrer" className="text-cyan-400 text-sm font-mono block pt-2 hover:text-cyan-300">View in explorer ↗</a>
+                                )}
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+              <div className="px-8 py-4 flex items-center text-xs text-slate-600 font-mono" style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                Showing 3 supported assets on Aleo
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* Transaction History (same readiness gate as portfolio so the whole dashboard loads together) */}
+        {connected && dashboardDataReady && (
+          <section className="mb-10">
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-xl font-bold text-white">Transaction History</h3>
+              <div className="flex gap-2">
+                <button onClick={fetchTransactionHistory} disabled={txHistoryLoading || !address}
+                  className="px-4 py-1.5 rounded-lg text-xs font-mono text-slate-400 hover:text-white transition-colors disabled:opacity-40" style={dashGlass}>
+                  {txHistoryLoading ? 'Loading…' : 'REFRESH'}
+                </button>
+              </div>
+            </div>
+            {txHistoryError ? (
+              <div className="rounded-2xl p-6 text-sm" style={{ backgroundColor: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)' }}>
+                <p className="font-medium text-amber-400">Could not load transaction history</p>
+                <p className="mt-1 text-amber-300/70">{txHistoryError}</p>
+              </div>
+            ) : (
+              <div className="rounded-[32px] overflow-hidden" style={dashGlass}>
+                <table className="w-full text-left border-collapse">
                   <thead>
-                    <tr>
-                      <th className="text-base-content/70 font-medium">Date</th>
-                      <th className="text-base-content/70 font-medium">Type</th>
-                      <th className="text-base-content/70 font-medium">Asset</th>
-                      <th className="text-base-content/70 font-medium">Amount</th>
-                      <th className="text-base-content/70 font-medium min-w-[220px]">Transaction</th>
+                    <tr className="font-mono text-xs text-slate-400 uppercase tracking-widest" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}>
+                      <th className="px-8 py-4 font-medium">Type</th>
+                      <th className="px-8 py-4 font-medium">Asset</th>
+                      <th className="px-8 py-4 font-medium">Amount</th>
+                      <th className="px-8 py-4 font-medium">Date</th>
+                      <th className="px-8 py-4 font-medium text-left">Transaction</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {(() => {
+                    {txHistoryLoading && txHistory.length === 0 ? (
+                      <tr><td colSpan={5} className="py-8 text-center text-slate-500 text-sm">Loading transactions…</td></tr>
+                    ) : txHistory.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="py-20 text-center">
+                          <div className="flex flex-col items-center gap-3">
+                            <div className="w-12 h-12 rounded-xl border border-white/5 flex items-center justify-center" style={{ backgroundColor: 'rgba(30,41,59,0.2)' }}>
+                              <svg className="w-6 h-6 text-slate-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12" /><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /></svg>
+                            </div>
+                            <p className="text-slate-500 font-medium">No transactions found</p>
+                            <p className="text-xs text-slate-600 font-mono">ENCRYPTED HISTORY WILL APPEAR ONCE WALLET IS CONNECTED</p>
+                          </div>
+                        </td>
+                      </tr>
+                    ) : (() => {
                       const pageSize = 10;
                       const totalPages = Math.max(1, Math.ceil(txHistory.length / pageSize));
-                      const currentPage = Math.min(txHistoryPage, totalPages);
-                      const startIndex = (currentPage - 1) * pageSize;
-                      const pageItems = txHistory.slice(startIndex, startIndex + pageSize);
-                      return pageItems.map((row) => (
-                        <tr key={row.id}>
-                          <td className="text-base-content/90">
-                            {new Date(row.created_at).toLocaleString()}
+                      const cur = Math.min(txHistoryPage, totalPages);
+                      const start = (cur - 1) * pageSize;
+                      return txHistory.slice(start, start + pageSize).map((row) => (
+                        <tr key={row.id} style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }} className="hover:bg-white/5 transition-colors">
+                          <td className="px-8 py-5 capitalize text-slate-300">{row.type}</td>
+                          <td className="px-8 py-5 text-slate-300">
+                            <div className="flex items-center gap-3">
+                              <img
+                                src={
+                                  row.asset === 'usdcx'
+                                    ? '/logos/usdc.svg'
+                                    : row.asset === 'usad' || row.asset === 'usadx'
+                                      ? '/logos/usad.svg'
+                                      : '/logos/aleo-dark.svg'
+                                }
+                                alt={row.asset === 'usdcx' ? 'USDCx' : row.asset === 'usad' || row.asset === 'usadx' ? 'USAD' : 'ALEO'}
+                                className="w-7 h-7 rounded-lg"
+                              />
+                              <span>{row.asset === 'usdcx' ? 'USDCx' : row.asset === 'usad' || row.asset === 'usadx' ? 'USAD' : 'ALEO'}</span>
+                            </div>
                           </td>
-                          <td className="capitalize">{row.type}</td>
-                          <td>
-                            {row.asset === 'usdcx' ? (
-                              <AssetBadge asset="USDCx" compact />
-                            ) : row.asset === 'usad' || row.asset === 'usadx' ? (
-                              <AssetBadge asset="USAD" compact />
-                            ) : row.asset === 'aleo' ? (
-                              <AssetBadge asset="ALEO" compact />
-                            ) : (
-                              String(row.asset).toUpperCase()
-                            )}
-                          </td>
-                          <td>
-                            {Number(row.amount).toLocaleString(undefined, {
-                              minimumFractionDigits: 2,
-                              maximumFractionDigits: 6,
-                            })}
-                          </td>
-                          <td className="align-middle">
-                            <TxHistoryTrxPills
-                              txId={row.tx_id}
-                              explorerUrl={row.explorer_url}
-                              vaultExplorerUrl={row.vault_explorer_url}
-                              type={row.type}
-                              asset={row.asset}
-                              getProvableExplorerTxUrl={getProvableExplorerTxUrl}
-                            />
+                          <td className="px-8 py-5 font-mono text-slate-300">{Number(row.amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}</td>
+                          <td className="px-8 py-5 text-slate-500 text-sm">{new Date(row.created_at).toLocaleString()}</td>
+                          <td className="px-8 py-5 align-top text-left">
+                            <TxHistoryTrxPills txId={row.tx_id} explorerUrl={row.explorer_url} vaultExplorerUrl={row.vault_explorer_url} type={row.type} asset={row.asset} getProvableExplorerTxUrl={getProvableExplorerTxUrl} />
                           </td>
                         </tr>
                       ));
                     })()}
                   </tbody>
                 </table>
+                {txHistory.length > 10 && (() => {
+                  const pageSize = 10;
+                  const totalPages = Math.max(1, Math.ceil(txHistory.length / pageSize));
+                  const cur = Math.min(txHistoryPage, totalPages);
+                  return (
+                    <div className="flex items-center justify-between px-8 py-4 text-xs text-slate-500 font-mono" style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                      <span>Showing {(cur - 1) * pageSize + 1}–{Math.min(cur * pageSize, txHistory.length)} of {txHistory.length}</span>
+                      <div className="flex gap-2">
+                        <button disabled={cur === 1} onClick={() => setTxHistoryPage(p => Math.max(1, p - 1))} className="px-3 py-1 rounded-lg disabled:opacity-40" style={dashGlass}>Prev</button>
+                        <span className="px-2 py-1">Page {cur} of {totalPages}</span>
+                        <button disabled={cur === totalPages} onClick={() => setTxHistoryPage(p => Math.min(totalPages, p + 1))} className="px-3 py-1 rounded-lg disabled:opacity-40" style={dashGlass}>Next</button>
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
-              {txHistory.length > 10 && (
-                <div className="flex items-center justify-between mt-3 text-xs text-base-content/70">
-                  {(() => {
-                    const pageSize = 10;
-                    const totalPages = Math.max(1, Math.ceil(txHistory.length / pageSize));
-                    const currentPage = Math.min(txHistoryPage, totalPages);
-                    const startIndex = (currentPage - 1) * pageSize;
-                    const endIndex = Math.min(startIndex + pageSize, txHistory.length);
-                    return (
-                      <>
-                        <span>
-                          Showing {startIndex + 1}–{endIndex} of {txHistory.length} transactions
-                        </span>
-                        <div className="flex items-center gap-2">
-                          <Button
-                            variant="ghost"
-                            size="small"
-                            disabled={currentPage === 1}
-                            onClick={() => setTxHistoryPage((p) => Math.max(1, p - 1))}
-                          >
-                            Previous
-                          </Button>
-                          <span>
-                            Page {currentPage} of {totalPages}
-                          </span>
-                          <Button
-                            variant="ghost"
-                            size="small"
-                            disabled={currentPage === totalPages}
-                            onClick={() =>
-                              setTxHistoryPage((p) => Math.min(totalPages, p + 1))
-                            }
-                          >
-                            Next
-                          </Button>
-                        </div>
-                      </>
-                    );
-                  })()}
-                </div>
-              )}
-            </>
-          )}
-        </div>
+            )}
+          </section>
         )}
 
-      </div>
-
-      {isDevAppEnv && (
-        <div className="rounded-xl bg-base-200 p-6 space-y-4 border-2 border-info">
-          <h2 className="text-xl font-semibold">📊 Frontend Diagnostics & Logs</h2>
-          <p className="text-sm opacity-70">
-            View, analyze, and export all frontend logs and record diagnostics
-          </p>
-
-          <div className="flex flex-wrap gap-2">
-            <Button
-              onClick={() => {
-                const summary = frontendLogger.getSummary();
-                setLogsSummary(summary);
-                setShowLogsPanel(true);
-              }}
-              variant="ghost"
-              size="small"
-            >
-              📋 View Summary
-            </Button>
-            <Button
-              onClick={() => frontendLogger.downloadLogsAsFile('text')}
-              variant="ghost"
-              size="small"
-            >
-              💾 Download Logs (TXT)
-            </Button>
-            <Button
-              onClick={() => frontendLogger.downloadRecordDiagnosticsAsFile('json')}
-              variant="ghost"
-              size="small"
-            >
-              📦 Download Records (JSON)
-            </Button>
-            <Button
-              onClick={() => frontendLogger.downloadAllAsFile('json')}
-              variant="ghost"
-              size="small"
-            >
-              📁 Download All (JSON)
-            </Button>
-            <Button
-              onClick={() => {
-                if (requestRecords && publicKey) {
-                  debugAllRecords(requestRecords, publicKey).then((results) => {
-                    console.log('Diagnostic results:', results);
-                    setStatusMessage('✅ Diagnostic complete. Check console for details.');
-                  });
-                } else {
-                  setStatusMessage('❌ Wallet not connected');
-                }
-              }}
-              variant="ghost"
-              size="small"
-              disabled={!connected}
-            >
-              🔍 Run Diagnosis
-            </Button>
-            <Button
-              onClick={() => {
-                frontendLogger.clearLogs();
-                frontendLogger.clearRecordDiagnostics();
-                setLogsSummary(null);
-                setStatusMessage('✅ Logs cleared');
-              }}
-              variant="ghost"
-              size="small"
-            >
-              🗑️ Clear Logs
-            </Button>
+        {/* Dev diagnostics panel */}
+        {isDevAppEnv && (
+          <div className="rounded-2xl p-6 space-y-4 mb-10" style={{ ...dashGlass, border: '2px solid rgba(6,182,212,0.3)' }}>
+            <h2 className="text-xl font-semibold text-white">📊 Frontend Diagnostics & Logs</h2>
+            <div className="flex flex-wrap gap-2">
+              {[
+                { label: '📋 View Summary', onClick: () => { setLogsSummary(frontendLogger.getSummary()); setShowLogsPanel(true); } },
+                { label: '💾 Download Logs (TXT)', onClick: () => frontendLogger.downloadLogsAsFile('text') },
+                { label: '📦 Download Records (JSON)', onClick: () => frontendLogger.downloadRecordDiagnosticsAsFile('json') },
+                { label: '📁 Download All (JSON)', onClick: () => frontendLogger.downloadAllAsFile('json') },
+                { label: '🗑️ Clear Logs', onClick: () => { frontendLogger.clearLogs(); frontendLogger.clearRecordDiagnostics(); setLogsSummary(null); setStatusMessage('✅ Logs cleared'); } },
+              ].map(btn => (
+                <button key={btn.label} onClick={btn.onClick} className="px-4 py-2 rounded-xl text-sm text-slate-300 hover:text-white transition-colors" style={dashGlass}>{btn.label}</button>
+              ))}
+              <button onClick={() => { if (requestRecords && publicKey) { debugAllRecords(requestRecords, publicKey).then(r => { console.log('Diagnostic results:', r); setStatusMessage('✅ Diagnostic complete.'); }); } else { setStatusMessage('❌ Wallet not connected'); } }} disabled={!connected} className="px-4 py-2 rounded-xl text-sm text-slate-300 hover:text-white transition-colors disabled:opacity-40" style={dashGlass}>🔍 Run Diagnosis</button>
+            </div>
+            {showLogsPanel && logsSummary && (
+              <div className="rounded-xl p-4 space-y-2 max-h-96 overflow-y-auto" style={{ backgroundColor: 'rgba(255,255,255,0.03)' }}>
+                <h3 className="font-semibold text-white">📊 Session Summary</h3>
+                <div className="grid grid-cols-2 gap-2 text-sm text-slate-400">
+                  <div>Total Logs: <span className="text-white font-semibold">{logsSummary.totalLogs}</span></div>
+                  <div>Errors: <span className="text-red-400 font-semibold">{logsSummary.errors}</span></div>
+                  <div>Warnings: <span className="text-amber-400 font-semibold">{logsSummary.warnings}</span></div>
+                  <div>Duration: <span className="text-white font-semibold">{(logsSummary.sessionDuration / 1000).toFixed(1)}s</span></div>
+                </div>
+              </div>
+            )}
           </div>
+        )}
 
-          {showLogsPanel && logsSummary && (
-            <div className="bg-base-300 p-4 rounded-lg space-y-2 max-h-96 overflow-y-auto">
-              <h3 className="font-semibold">📊 Session Summary</h3>
-              <div className="grid grid-cols-2 gap-2 text-sm">
-                <div>
-                  <span className="opacity-70">Total Logs:</span>
-                  <p className="font-semibold">{logsSummary.totalLogs}</p>
-                </div>
-                <div>
-                  <span className="opacity-70">Errors:</span>
-                  <p className="font-semibold text-error">{logsSummary.errors}</p>
-                </div>
-                <div>
-                  <span className="opacity-70">Warnings:</span>
-                  <p className="font-semibold text-warning">{logsSummary.warnings}</p>
-                </div>
-                <div>
-                  <span className="opacity-70">Regular Logs:</span>
-                  <p className="font-semibold">{logsSummary.logs}</p>
-                </div>
-                <div>
-                  <span className="opacity-70">Diagnostics:</span>
-                  <p className="font-semibold">{logsSummary.totalDiagnostics}</p>
-                </div>
-                <div>
-                  <span className="opacity-70">Duration:</span>
-                  <p className="font-semibold">
-                    {(logsSummary.sessionDuration / 1000).toFixed(1)}s
+        {/* Status / tx details */}
+        {isDevAppEnv ? (
+          <>
+            {statusMessage && (
+              <div className={`rounded-lg px-4 py-3 text-sm mb-4 ${statusMessage.includes('error') || statusMessage.includes('Failed') ? 'text-red-400 bg-red-500/10 border border-red-500/30' : 'text-slate-300 bg-white/5 border border-white/10'}`}>
+                {statusMessage}
+              </div>
+            )}
+            {txId && (
+              <div className="rounded-xl p-4 max-w-xl mb-4" style={dashGlass}>
+                <h3 className="font-semibold text-white mb-2">Last Transaction ID {txFinalized && <span className="ml-2 text-xs text-emerald-400 border border-emerald-400/30 px-2 py-0.5 rounded-full">Finalized</span>}</h3>
+                <pre className="text-xs text-slate-400 break-all p-2 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.03)' }}>{txId}</pre>
+                {txFinalized && isExplorerHash(txId) && (
+                  <a href={getProvableExplorerTxUrl(txId)} target="_blank" rel="noopener noreferrer" className="text-cyan-400 text-sm mt-2 inline-block hover:text-cyan-300">View on Provable Explorer →</a>
+                )}
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            {loading && (
+              <div className="fixed inset-0 z-40 flex items-center justify-center p-6" style={{ backgroundColor: 'rgba(0,0,0,0.55)' }}>
+                <div
+                  className="rounded-3xl px-12 py-12 sm:px-16 sm:py-14 flex flex-col items-center justify-center gap-6 min-w-[min(100%,22rem)] sm:min-w-[28rem] max-w-[90vw] shadow-2xl shadow-black/40 border border-white/10"
+                  style={dashGlass}
+                >
+                  <span className="loading loading-spinner loading-lg text-cyan-400 scale-150" />
+                  <p className="text-lg sm:text-xl font-semibold text-white tracking-tight text-center">Processing transaction…</p>
+                  <p className="text-sm sm:text-base text-slate-400 text-center max-w-sm leading-relaxed">
+                    Please confirm in your wallet if prompted. This may take a minute on Aleo.
                   </p>
                 </div>
               </div>
-              <p className="text-xs opacity-70 pt-2">
-                💡 Download logs to share with developers for debugging
-              </p>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Status + last transaction details */}
-      {isDevAppEnv ? (
-        <>
-          {statusMessage && (
-            <div
-              className={`alert ${
-                statusMessage.includes('error') || statusMessage.includes('Failed')
-                  ? 'alert-error'
-                  : 'alert-info'
-              }`}
-            >
-              <span>{statusMessage}</span>
-            </div>
-          )}
-
-          {txId && (
-            <div className="rounded-xl bg-base-200 p-4 max-w-xl">
-              <h3 className="font-semibold mb-2">
-                Last Transaction ID
-                {txFinalized && (
-                  <span className="ml-2 badge badge-success badge-sm">Finalized</span>
-                )}
-              </h3>
-              <pre className="text-xs whitespace-pre-wrap break-all bg-base-300 p-2 rounded">
-                {txId}
-              </pre>
-              {txFinalized && isExplorerHash(txId) ? (
-                <a
-                  href={getProvableExplorerTxUrl(txId)}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="link link-primary text-sm mt-2 inline-block"
-                >
-                  View on Provable Explorer →
-                </a>
-              ) : txFinalized ? (
-                <p className="text-xs opacity-70 mt-2">
-                  Transaction finalized. This ID comes from Leo Wallet and may not be a full on-chain
-                  transaction hash. You can track it in the wallet activity view.
-                </p>
-              ) : (
-                <p className="text-xs opacity-70 mt-2">
-                  Waiting for transaction to finalize... The explorer link will appear once confirmed.
-                </p>
-              )}
-            </div>
-          )}
-
-          {vaultWithdrawTxId && (
-            <div className="rounded-xl bg-base-200 p-4 max-w-xl border-l-4 border-success">
-              <h3 className="font-semibold mb-2">Vault transfer (credits to your wallet)</h3>
-              <p className="text-xs opacity-80 mb-2">
-                Backend sent ALEO from the pool vault to your wallet. Transaction:
-              </p>
-              <pre className="text-xs whitespace-pre-wrap break-all bg-base-300 p-2 rounded mb-2">
-                {vaultWithdrawTxId}
-              </pre>
-              <a
-                href={getProvableExplorerTxUrl(vaultWithdrawTxId)}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="link link-primary text-sm inline-block"
-              >
-                View on Provable Explorer →
-              </a>
-            </div>
-          )}
-
-          {vaultBorrowTxId && (
-            <div className="rounded-xl bg-base-200 p-4 max-w-xl border-l-4 border-info">
-              <h3 className="font-semibold mb-2">Vault borrow (credits to your wallet)</h3>
-              <p className="text-xs opacity-80 mb-2">
-                Backend sent borrowed ALEO from the pool vault to your wallet. Transaction:
-              </p>
-              <pre className="text-xs whitespace-pre-wrap break-all bg-base-300 p-2 rounded mb-2">
-                {vaultBorrowTxId}
-              </pre>
-              <a
-                href={getProvableExplorerTxUrl(vaultBorrowTxId)}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="link link-primary text-sm inline-block"
-              >
-                View on Provable Explorer →
-              </a>
-            </div>
-          )}
-        </>
-      ) : (
-        <>
-          {/* Simple loading overlay for prod */}
-          {loading && (
-            <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40">
-              <div className="rounded-xl bg-base-200 px-6 py-4 flex flex-col items-center gap-2 shadow-lg">
-                <span className="loading loading-spinner loading-md" />
-                <p className="text-sm opacity-80">Processing transaction...</p>
+            )}
+            {statusMessage && !loading && (
+              <div className="fixed bottom-4 right-4 z-40 rounded-xl px-4 py-2 text-sm text-slate-300" style={dashGlass}>
+                {statusMessage}
               </div>
-            </div>
-          )}
-
-          {/* Minimal toast-style status message for prod (bottom-right) */}
-          {statusMessage && !loading && (
-            <div className="fixed bottom-4 right-4 z-40 rounded-lg bg-base-200 px-4 py-2 shadow-lg text-sm">
-              {statusMessage}
-            </div>
-          )}
-        </>
-      )}
+            )}
+          </>
+        )}
+      </main>
     </div>
   );
 };
