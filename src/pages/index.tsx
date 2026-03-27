@@ -1,6 +1,7 @@
 import type { NextPageWithLayout } from '@/types';
 import { NextSeo } from 'next-seo';
 import Layout from '@/layouts/_layout';
+import Link from 'next/link';
 import { useRouter } from 'next/router';
 import React, { useState, useEffect } from 'react';
 
@@ -487,7 +488,7 @@ const RoadmapSection = () => (
 
 // ─── Footer / CTA ─────────────────────────────────────────────────────────────
 
-const PageFooter = ({ onEnterApp }: { onEnterApp: () => void }) => (
+const PageFooter = () => (
   <footer className="w-full relative" style={{ background: '#020408', borderTop: '1px solid rgba(255,255,255,0.05)', zIndex: 10 }}>
     <div className="mx-auto px-6 md:px-12 py-16" style={{ maxWidth: '1440px' }}>
       <div className="rounded-3xl p-8 md:p-12 flex flex-col md:flex-row items-center justify-between gap-8 relative overflow-hidden" style={customStyles.glassPanel}>
@@ -498,35 +499,52 @@ const PageFooter = ({ onEnterApp }: { onEnterApp: () => void }) => (
             Interact with the Xyra lending pool on Aleo Testnet today.
           </p>
         </div>
-        <button
+        <Link
           id="footer-enter-app-btn"
-          onClick={onEnterApp}
-          className="font-bold rounded-xl transition-colors"
-          style={{ position: 'relative', zIndex: 10, padding: '12px 32px', background: 'white', color: '#030712', boxShadow: '0 0 20px rgba(255,255,255,0.2)', flexShrink: 0, fontFamily: "'IBM Plex Sans', sans-serif" }}
+          href="/dashboard"
+          className="relative inline-flex h-10 overflow-hidden rounded-full p-px focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500/50 shrink-0"
+          style={{ padding: '1px' }}
         >
-          Launch Testnet App
-        </button>
+          <span
+            style={{
+              position: 'absolute',
+              inset: '-1000%',
+              animation: 'spin 2s linear infinite',
+              background: 'conic-gradient(from 90deg at 50% 50%, #030712 0%, #0ea5e9 50%, #030712 100%)',
+            }}
+          />
+          <span
+            className="inline-flex h-full w-full cursor-pointer items-center justify-center rounded-full text-sm font-medium text-white"
+            style={{
+              background: '#0B1221',
+              padding: '4px 20px',
+              backdropFilter: 'blur(24px)',
+              fontFamily: "'Space Grotesk', sans-serif",
+              position: 'relative',
+              zIndex: 1,
+            }}
+          >
+            Launch Testnet App
+          </span>
+        </Link>
       </div>
     </div>
 
-    <div className="mx-auto px-6 md:px-12 py-8 flex flex-col md:flex-row items-center justify-between gap-6" style={{ maxWidth: '1440px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-      <div className="flex items-center gap-2">
-        <div className="w-6 h-6 rounded-md flex items-center justify-center" style={{ background: '#0B1221', border: '1px solid rgba(255,255,255,0.1)' }}>
-          <FeatherIcon name="box" style={{ width: 12, height: 12, color: '#94a3b8' }} />
-        </div>
-        <span className="text-sm" style={{ fontFamily: "'IBM Plex Mono', monospace", color: '#64748b' }}>© 2024 Xyra Finance</span>
-      </div>
-      <div className="flex gap-8 text-sm font-medium" style={{ color: '#94a3b8' }}>
-        {['Terms', 'Privacy', 'Audit'].map((item) => (
-          <a key={item} href="#" className="transition-colors hover:text-white" style={{ color: '#94a3b8' }}>{item}</a>
-        ))}
-      </div>
-      <div className="flex gap-4">
-        {['twitter', 'github', 'disc'].map((icon) => (
-          <a key={icon} href="#" className="rounded-full flex items-center justify-center transition-all" style={{ width: 40, height: 40, background: '#0B1221', border: '1px solid rgba(255,255,255,0.05)', color: '#94a3b8' }}>
-            <FeatherIcon name={icon} style={{ width: 16, height: 16 }} />
-          </a>
-        ))}
+    <div
+      className="mx-auto px-6 md:px-12 py-8 flex items-center justify-start"
+      style={{ maxWidth: '1440px', borderTop: '1px solid rgba(255,255,255,0.05)' }}
+    >
+      <div className="flex items-center gap-3">
+        <img
+          src="/xyra-logo.png"
+          alt="Xyra Finance"
+          width={28}
+          height={28}
+          className="h-7 w-auto object-contain shrink-0 opacity-90"
+        />
+        <span className="text-sm" style={{ fontFamily: "'IBM Plex Mono', monospace", color: '#64748b' }}>
+          © {new Date().getFullYear()} Xyra Finance
+        </span>
       </div>
     </div>
   </footer>
@@ -617,7 +635,7 @@ const MainPage: NextPageWithLayout = () => {
           <RoadmapSection />
         </main>
 
-        <PageFooter onEnterApp={handleEnterApp} />
+        <PageFooter />
       </div>
     </>
   );

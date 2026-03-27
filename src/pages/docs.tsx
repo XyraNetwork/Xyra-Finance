@@ -121,6 +121,12 @@ const Sidebar = ({ activeSection }: { activeSection: string }) => {
             <a href="#overview" style={linkStyle('overview')}>
               <BookOpenIcon className="w-4 h-4" /> Overview
             </a>
+            <a href="#features" style={linkStyle('features')}>
+              <LayersIcon className="w-4 h-4" /> Features
+            </a>
+            <a href="#roadmap" style={linkStyle('roadmap')}>
+              <TrendingUpIcon className="w-4 h-4" /> Roadmap
+            </a>
             <a href="#wallet" style={linkStyle('wallet')}>
               <UserIcon className="w-4 h-4" /> Wallet Behavior
             </a>
@@ -167,6 +173,8 @@ const OnThisPage = () => (
     <h5 className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.2em] mb-4 font-sans">On this page</h5>
     <nav className="flex flex-col gap-3 text-xs border-l border-white/5 pl-4 font-sans">
       <a href="#overview" className="text-slate-400 hover:text-cyan-400 transition-colors">Overview</a>
+      <a href="#features" className="text-slate-400 hover:text-cyan-400 transition-colors">Features</a>
+      <a href="#roadmap" className="text-slate-400 hover:text-cyan-400 transition-colors">Roadmap</a>
       <a href="#wallet" className="text-slate-400 hover:text-cyan-400 transition-colors">Wallet Behavior</a>
       <a href="#dashboard" className="text-slate-400 hover:text-cyan-400 transition-colors">Dash & Markets</a>
       <a href="#lending" className="text-slate-400 hover:text-cyan-400 transition-colors">Lending Program</a>
@@ -188,7 +196,7 @@ const DocsPage: NextPageWithLayout = () => {
 
   useEffect(() => {
     const handleScroll = () => {
-      const sections = ['overview', 'wallet', 'dashboard', 'lending', 'privacy', 'transaction', 'supabase', 'vault', 'development'];
+      const sections = ['overview', 'features', 'roadmap', 'wallet', 'dashboard', 'lending', 'privacy', 'transaction', 'supabase', 'vault', 'development'];
       let current = 'overview';
       sections.forEach((id) => {
         const el = document.getElementById(id);
@@ -220,22 +228,54 @@ const DocsPage: NextPageWithLayout = () => {
             High-level <span style={customStyles.textGradientCyan}>Overview</span>
           </h1>
           <p className="text-xl text-slate-400 leading-relaxed mb-8">
-            This page describes the current testnet app: a <strong>single</strong> lending program (
-            <span className="font-mono text-cyan-400">xyra_lending_v6.aleo</span> by default) with{' '}
-            <strong>three assets</strong> (ALEO credits, USDCx, USAD),{' '}
-            <strong>cross‑asset collateral and borrowing</strong> in USD terms on-chain, the
-            dashboard/Markets UX, wallet permissions, Supabase history, and the vault backend for payouts.
+            This page describes the current testnet app. On-chain lending logic lives in{' '}
+            <span className="font-mono text-cyan-400">program/src/main.leo</span> (deploy name varies; e.g.{' '}
+            <span className="font-mono text-cyan-400">xyra_lending_v6.aleo</span>). The UI can show{' '}
+            <strong>multiple reserve rows</strong> (ALEO, USDCx, USAD) when your env points at a{' '}
+            <strong>unified multi-asset deployment</strong>—there are <strong>no separate USD-denominated Leo program folders</strong> in this repo; optional{' '}
+            <span className="font-mono text-cyan-400">NEXT_PUBLIC_*</span> IDs exist so the wallet and Markets can list extra program names when you split deployments.
+            Risk and health use the rate model and oracles implemented in the program, not a separate &quot;USD program&quot; tree.
           </p>
 
           <div className="p-8 rounded-2xl space-y-4" style={customStyles.glassPanel}>
-            <p className="font-medium text-white mb-4">The app is an Aave-style experience on Aleo testnet, wired to one pool program that tracks multiple assets and enforces a single health constraint across them.</p>
+            <p className="font-medium text-white mb-4">The app is an Aave-style experience on Aleo testnet: supply/borrow flows, utilization-based APY, and (when enabled) a single health constraint across reserves defined in the deployed program.</p>
             <ul className="list-disc list-inside space-y-2 text-sm text-slate-400">
               <li><span className="font-semibold text-white">Views:</span> Dashboard, Markets, and Docs as tabs on /dashboard.</li>
               <li><span className="font-semibold text-white">Wallet:</span> Shield wallet (Provable adapter) — connect from the header.</li>
-              <li><span className="font-semibold text-white">Assets in one program:</span> deposits and borrows for ALEO, USDCx, and USAD, each keyed as 0field, 1field, and 2field.</li>
-              <li><span className="font-semibold text-white">Cross-asset lending:</span> borrow and repay checks use <strong>oracle prices</strong> and per-asset LTV so total debt (USD) must stay within total weighted collateral (USD).</li>
+              <li><span className="font-semibold text-white">Reserves in one program:</span> when unified, deposits and borrows for multiple assets share one pool contract; asset ids are defined in Leo (e.g. 0field, 1field, 2field).</li>
+              <li><span className="font-semibold text-white">Cross-asset risk:</span> borrow/withdraw paths use <strong>oracle prices</strong>, per-asset LTV, and program rules so total debt stays within allowed collateral.</li>
               <li><span className="font-semibold text-white">Private data UX:</span> shield icons and tooltips on sensitive columns and actions.</li>
               <li><span className="font-semibold text-white">Transaction history:</span> Supabase transaction_history by wallet address; optional vault tx links after the pool tx finalizes.</li>
+            </ul>
+          </div>
+        </section>
+
+        <section id="features" className="scroll-mt-32 mb-20">
+          <h2 className="text-3xl font-bold mb-8 flex items-center gap-3 text-white">
+            <LayersIcon className="w-8 h-8 text-cyan-400" />
+            Current features
+          </h2>
+          <div className="p-8 rounded-2xl space-y-4" style={customStyles.glassPanel}>
+            <ul className="list-disc list-inside space-y-3 text-sm text-slate-400">
+              <li><span className="font-semibold text-white">Leo:</span> deposit, borrow, repay, withdraw, accrue interest, utilization-based rates in <span className="font-mono text-cyan-400">program/src/main.leo</span>; offline lending-math tests under <span className="font-mono text-cyan-400">program/lending_math_tests</span>.</li>
+              <li><span className="font-semibold text-white">Dashboard:</span> portfolio summary, per-reserve rows with Supply/Borrow APY, expandable Manage flows, validation and processing overlay, loading skeletons.</li>
+              <li><span className="font-semibold text-white">Markets:</span> on-chain aggregates, live RPC block height / network status.</li>
+              <li><span className="font-semibold text-white">History:</span> Supabase-backed transaction history with explorer (and optional vault) links.</li>
+              <li><span className="font-semibold text-white">Backend:</span> vault queue, credit payouts after finalized pool txs, CORS for split deploys.</li>
+            </ul>
+          </div>
+        </section>
+
+        <section id="roadmap" className="scroll-mt-32 mb-20">
+          <h2 className="text-3xl font-bold mb-8 flex items-center gap-3 text-white">
+            <TrendingUpIcon className="w-8 h-8 text-indigo-400" />
+            Roadmap
+          </h2>
+          <div className="p-8 rounded-2xl space-y-4" style={customStyles.glassPanel}>
+            <ul className="list-disc list-inside space-y-3 text-sm text-slate-400">
+              <li><span className="font-semibold text-white">Architecture:</span> move toward a <strong>dual-pool, Aave-style</strong> layout with <strong>rigorous interest-rate models</strong>—that pattern is the strongest foundation for a serious money market.</li>
+              <li><span className="font-semibold text-white">Explore:</span> <strong>flash loan</strong> support (design and safety work TBD).</li>
+              <li><span className="font-semibold text-white">Later:</span> liquidations, governance, richer oracles, and additional assets as the stack matures.</li>
             </ul>
           </div>
         </section>
@@ -263,7 +303,7 @@ const DocsPage: NextPageWithLayout = () => {
           </h2>
           <div className="p-8 rounded-2xl space-y-4" style={customStyles.glassPanel}>
             <ul className="list-disc list-inside space-y-3 text-sm text-slate-400">
-              <li><span className="font-semibold text-white">Dashboard</span> shows a unified summary (total collateral, borrowable estimate, total debt, health factor) and <strong>per-asset</strong> panels for ALEO, USDCx, and USAD.</li>
+              <li><span className="font-semibold text-white">Dashboard</span> shows a unified summary (total collateral, borrowable estimate, total debt, health factor) and <strong>per-reserve</strong> rows for each configured market.</li>
               <li><span className="font-semibold text-white">Cross-asset checks:</span> before borrow/withdraw, the UI can consult on-chain caps and /vault-balances to prevent transaction failures.</li>
               <li><span className="font-semibold text-white">Markets</span> shows public on-chain aggregates (totals, utilization, APYs) and a reserve overview table.</li>
             </ul>
@@ -277,21 +317,21 @@ const DocsPage: NextPageWithLayout = () => {
           </h2>
           <div className="p-8 rounded-2xl space-y-4" style={customStyles.glassPanel}>
             <p className="text-sm text-slate-400"><span className="font-semibold text-white">Source:</span> <span className="font-mono text-purple-400">program/src/main.leo</span> (deploy name <span className="font-mono text-purple-400">xyra_lending_v6.aleo</span>).</p>
-            <p className="text-sm text-slate-400"><span className="font-semibold text-white">Single program, three logical assets:</span> mappings are keyed by asset_id. Each asset has its own supply/borrow indices, utilization, fees, LTV, liquidation parameters, and price for USD normalization.</p>
-            <p className="text-sm text-slate-400"><span className="font-semibold text-white">Cross-asset borrow health:</span> finalize_borrow loads all three positions, converts supplies to weighted collateral USD and borrows to debt USD using asset_price and LTV.</p>
+            <p className="text-sm text-slate-400"><span className="font-semibold text-white">Single program, multiple logical reserves:</span> mappings are keyed by asset_id. Each reserve has its own supply/borrow indices, utilization, fees, LTV, liquidation parameters, and oracle price for risk normalization.</p>
+            <p className="text-sm text-slate-400"><span className="font-semibold text-white">Cross-asset borrow health:</span> finalize_borrow loads positions, converts supplies to weighted collateral and borrows to debt using asset_price and LTV per the program&apos;s model.</p>
             
             <div className="mt-4 p-4 rounded-xl bg-black/20 text-sm font-mono text-slate-300">
-              <span className="text-white">Frontend program IDs:</span>
+              <span className="text-white">Frontend program IDs (env):</span>
               <ul className="list-disc list-inside mt-2 space-y-1 ml-4 text-xs break-all">
-                <li>ALEO pool: {LENDING_POOL_PROGRAM_ID}</li>
-                <li>USDCx pool: {USDC_LENDING_POOL_PROGRAM_ID}</li>
-                <li>USAD pool: {USAD_LENDING_POOL_PROGRAM_ID}</li>
+                <li>Primary: {LENDING_POOL_PROGRAM_ID}</li>
+                <li>USDCx slot: {USDC_LENDING_POOL_PROGRAM_ID}</li>
+                <li>USAD slot: {USAD_LENDING_POOL_PROGRAM_ID}</li>
               </ul>
             </div>
             {unifiedPools ? (
-              <p className="text-xs text-slate-500 italic mt-2">All three resolve to the same program ID (unified deployment).</p>
+              <p className="text-xs text-slate-500 italic mt-2">All three env vars resolve to the same program ID (unified deployment).</p>
             ) : (
-              <p className="text-xs text-slate-500 italic mt-2">USDC/USAD IDs differ from the main ID — you are using separate deployments.</p>
+              <p className="text-xs text-slate-500 italic mt-2">Optional slots differ from the primary ID — multiple program deployments or legacy wiring.</p>
             )}
             
             <p className="text-sm text-slate-400"><span className="font-semibold text-white">APY model:</span> utilization-based rates per asset computed from on-chain totals and parameters.</p>
@@ -359,7 +399,7 @@ const DocsPage: NextPageWithLayout = () => {
           <div className="p-8 rounded-2xl space-y-4" style={customStyles.glassPanel}>
             <p className="text-sm text-slate-400">The Node server in <span className="font-mono text-cyan-400">backend/</span> holds the vault wallet and sends user payouts from on-chain programs after the pool records the borrow/withdraw intent.</p>
             <ul className="list-disc list-inside space-y-2 text-sm text-slate-400">
-               <li><span className="font-semibold text-white">Vault transfers</span> for ALEO, USDCx, and USAD via Provable SDK.</li>
+               <li><span className="font-semibold text-white">Vault transfers</span> for supported asset types (e.g. Aleo credits / configured tokens) via Provable SDK.</li>
                <li><span className="font-semibold text-white">GET /vault-balances</span> — public vault balances per token program.</li>
                <li><span className="font-semibold text-white">Vault watcher</span> — polls Supabase for rows needing a vault tx.</li>
                <li><span className="font-semibold text-white">Optional oracle</span> — backend can poll spot prices and broadcast set_asset_price.</li>
