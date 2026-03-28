@@ -9,8 +9,8 @@ Xyra Finance is a **privacy-first lending and borrowing protocol** on Aleo—ins
 ## Overview
 
 - **Problem:** Public DeFi lending exposes balances and strategies, attracts MEV and liquidation sniping, and is unsuitable for institutions and regulated entities.
-- **Solution:** A full lending protocol on Aleo where **deposits, borrows, repayments, withdrawals, and interest** are tracked on-chain, **user positions stay private** (Aleo records), and pool-level metrics (TVL, utilization, APY) remain provable.
-- **Current status:** Two lending pools (ALEO and USDCx) with deposit, borrow, repay, withdraw, interest accrual, and a **vault backend** that sends credits/tokens to users after on-chain finalization. A **Next.js dApp** provides Dashboard, Markets, and Docs views with wallet connection, transaction history (Supabase), and APY tooltips.
+- **Solution:** Lending pools on Aleo where **deposits, borrows, repayments, withdrawals, and interest** are enforced on-chain, **user positions stay private** (Aleo records), and pool-level metrics (TVL, utilization, APY) stay queryable via RPC.
+- **Current status:** **Native ALEO lending** (deposit, borrow, repay, withdraw, interest accrual) implemented in the main Leo program, with a **Node/Express vault backend** that releases **Aleo credits** to users after on-chain finalization. The **Next.js** dApp provides a landing page, **Dashboard**, **Markets**, **Docs**, optional **Admin**, and **transaction history** (Supabase) with Provable wallet (Shield) integration. Optional env wiring can point the UI at additional program IDs for future markets—the canonical on-chain lending logic for this repo lives under **`program/`** (ALEO-denominated, not USD-native programs).
 
 ---
 
@@ -18,51 +18,58 @@ Xyra Finance is a **privacy-first lending and borrowing protocol** on Aleo—ins
 
 | Path | Description |
 |------|-------------|
-| **`/`** | Next.js frontend (dashboard, Markets, Docs, wallet integration, transaction history) |
-| **`program/`** | Leo programs: ALEO pool and USDCx pool (e.g. `lending_pool_v86.aleo`, `lending_pool_usdce_v86.aleo`) |
-| **`backend/`** | Express vault server: POST `/withdraw`, `/borrow`, `/withdraw-usdc`, `/borrow-usdc`; in-process queue for concurrency |
-| **`supabase/`** | Schema for `transaction_history` (wallet, tx_id, type, asset, amount, vault_tx_id, vault_explorer_url) |
-| **`docs/`** | Second-wave submission, Wave 3/4 ideas; **`backend/docs/CONCURRENCY.md`** for vault queue behavior |
+| **`/`** | Next.js 15 frontend: landing, dashboard, markets, docs, wallet, RPC helpers (`src/components/aleo/rpc.ts`) |
+| **`program/`** | Leo program: ALEO lending pool (`src/main.leo`), lending math tests |
+| **`backend/`** | Express server: vault transfers, optional vault watcher, CORS, Supabase updates |
+| **`supabase/`** | SQL schema for `transaction_history` (wallet, tx, asset, vault links) |
+| **`docs/`** | Submission notes, wave ideas; **`backend/docs/CONCURRENCY.md`** for vault queue |
+
+Program IDs are configured via **`NEXT_PUBLIC_*`** env vars (see below), not hardcoded to a single deployment name.
 
 ---
 
 ## Features (current)
 
-### Leo programs
+### Leo programs (`program/`)
 
-- **ALEO pool** and **USDCx pool**: deposit, borrow, repay, withdraw, accrue interest, utilization-based rate model.
-- **Public pool state:** total_supplied, total_borrowed, interest indices, utilization.
-- **Private user activity:** UserActivity records (total_deposits, total_withdrawals, total_borrows, total_repayments) in private mappings.
-- **Transitions:** deposit, borrow, repay, withdraw, accrue_interest, plus helpers (get_address_hash, get_user_activity).
+- **Money-market core:** deposit, borrow, repay, withdraw, accrue interest, utilization-based borrow/supply dynamics—implemented in **`program/src/main.leo`** (ALEO-denominated pool, not a USD-native mint).
+- **Public pool state:** totals, indices, utilization; on-chain mappings for caps and parameters where deployed.
+- **Private user activity:** shielded records for user flows on Aleo.
+- **Lending math tests:** `program/lending_math_tests` with offline **`leo test`** for rate/index math.
 
-### Frontend (Next.js)
+### Frontend (Next.js + React 19)
 
-- **Dashboard / Markets / Docs** views (single app; wallet state preserved across views).
-- **Assets to supply & borrow:** ALEO and USDCx with Supply APY / Borrow APY and info tooltips.
-- **Your supplies & borrows:** Private columns with loading spinners; Supply, Borrow, Withdraw, Repay with amount validation and “Available to borrow” for borrow modals.
-- **Transaction modals:** Processing → “View in explorer” and “View vault transfer” (when vault tx is returned); no vault message before the program tx is confirmed.
-- **Transaction history:** Paginated (10 per page), stored in Supabase with optional vault tx link; asset shown as ALEO / USDCx.
-- **Markets:** Reserve overview table (total supplied, borrowed, liquidity, Supply APY, Borrow APY) with optional vault explorer link when `NEXT_PUBLIC_VAULT_ADDRESS` is set.
-- **Docs:** In-app documentation (wallet, flows, APY, Supabase, vault backend, env).
+- **Landing (`/`):** Hero, product narrative, CTA into the app.
+- **Dashboard (`/dashboard`):** Portfolio summary (collateral, borrowable, debt, health factor), **per-asset rows** for configured markets with wallet balance, supplied/borrowed amounts, **Supply/Borrow APY** under position columns, expandable **Manage** (Supply / Withdraw / Borrow / Repay) with amount validation, previews, and transaction flow (empty state + wallet connect when disconnected).
+- **Markets (`/markets`):** Pool-facing metrics, APY, vault hints where relevant, **live network status** (latest block height and RPC endpoint via Aleo JSON-RPC).
+- **Docs (`/docs`):** In-app documentation.
+- **Wallet:** Provable **Shield** adapter, modal-based connect, session persistence (`WalletPersistence`).
+- **Transaction history:** Paginated history; Supabase-backed; explorer links and optional vault transfer metadata.
+- **UX polish:** Full-page loading states on the dashboard, larger “processing transaction” overlay during submits, consistent pointer affordances (`src/assets/css/globals.css`), Tailwind CSS v4 + DaisyUI.
 
-### Backend (Express)
+### Backend (Express, ESM)
 
-- **Vault endpoints:** POST `/withdraw`, `/borrow` (ALEO credits), `/withdraw-usdc`, `/borrow-usdc` (USDCx), `/withdraw-usad`, `/borrow-usad` (USAD).
-- **In-process queue:** Vault operations run through a queue (default concurrency 1) to avoid RPC overload and vault key contention when many users hit at once. See **`backend/docs/CONCURRENCY.md`**.
-- **CORS:** Configurable via `CORS_ORIGIN` (comma-separated) for production frontends (e.g. Vercel).
+- **Vault endpoints** that pay out **Aleo credits** after finalized on-chain steps (see `backend/src/server.js` and processors); behavior can extend per deployment.
+- **Queue:** Serialized vault work with configurable concurrency; see **`backend/docs/CONCURRENCY.md`**.
+- **Optional:** Vault watcher, price hooks (`backend/.env.example`).
+- **CORS:** `CORS_ORIGIN` for split frontend/backend deploys.
 
 ### Data (Supabase)
 
-- **transaction_history:** wallet_address, tx_id, type (deposit/withdraw/borrow/repay), asset (aleo/usdcx/usad), amount, program_id, explorer_url, vault_tx_id, vault_explorer_url. RLS for anon SELECT/INSERT with publishable key.
+- **`transaction_history`:** wallet, tx id, type, asset tag, amounts, explorer URLs, optional `vault_tx_id` / `vault_explorer_url`. Client reads use the publishable key; inserts/updates that need elevated trust go through the backend with the service role.
 
 ---
 
 ## Tech stack
 
-- **Frontend:** Next.js, React, `@provablehq/aleo-wallet-adaptor-react`, Supabase client.
-- **Programs:** Leo (Aleo); target Aleo Testnet.
-- **Backend:** Node.js, Express, `cors`, `dotenv`, Provable SDK.
-- **Data:** Supabase (Postgres, RLS, publishable key for frontend).
+| Layer | Stack |
+|--------|--------|
+| **App** | Next.js 15, React 19, TypeScript, Tailwind CSS 4, DaisyUI, next-seo, react-query |
+| **Wallet** | `@provablehq/aleo-wallet-adaptor-react`, Shield adapter, wallet modal UI |
+| **Chain** | Aleo **Testnet** (`CURRENT_NETWORK` in `src/types/index.ts`), JSON-RPC (`latest/height`, `getMappingValue`, etc.) |
+| **Programs** | Leo, `leo build` / `leo test` |
+| **Backend** | Node.js, Express, `@provablehq/sdk`, optional Supabase service role |
+| **Data** | Supabase (Postgres, RLS) |
 
 ---
 
@@ -72,49 +79,43 @@ Xyra Finance is a **privacy-first lending and borrowing protocol** on Aleo—ins
 
 ```bash
 cp .env.example .env
-# Edit .env: NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_PUB_KEY;
-# optional: NEXT_PUBLIC_BACKEND_URL, NEXT_PUBLIC_VAULT_ADDRESS
+# Fill NEXT_PUBLIC_SUPABASE_* , NEXT_PUBLIC_BACKEND_URL, NEXT_PUBLIC_LENDING_POOL_PROGRAM_ID, etc.
 npm install
 npm run dev
+# → http://localhost:3000
 ```
 
-- **NEXT_PUBLIC_BACKEND_URL:** Backend base URL for vault calls. For production (e.g. Vercel), set to your deployed backend (e.g. `https://your-app.railway.app`).
+The default **`npm run dev`** script clears `.next` via **Yarn** (`yarn delete-local-modules && next dev`). If you do not have Yarn, use: `npm run delete-local-modules && npx next dev`, or install Yarn and run `yarn install && yarn dev`.
 
 ### 2. Backend (vault server)
 
 ```bash
 cd backend
 cp .env.example .env
-# Edit .env: ALEO_RPC_URL, VAULT_ADDRESS, VAULT_PRIVATE_KEY;
-# for production frontend: CORS_ORIGIN=https://xyra-finance.vercel.app (or comma-separated list)
+# ALEO_RPC_URL, VAULT_*, SUPABASE_* , RECORD_TRANSACTION_SECRET, CORS_ORIGIN for production
 npm install
 npm run dev
+# default port from server config (often 4000)
 ```
-
-- **CORS_ORIGIN:** Required when the frontend is on a different domain (e.g. Vercel). Comma-separated for multiple origins.
-- **VAULT_QUEUE_CONCURRENCY:** Default 1; optional 2–3 if RPC supports limited parallelism (see `backend/docs/CONCURRENCY.md`).
 
 ### 3. Leo programs
 
 ```bash
-cd program
-leo build
+cd program && leo build
 ```
 
-**Lending math unit tests** (no token dependencies; mirrors `finalize_borrow` USD checks in `src/main.leo`):
+**Lending math tests** (CI-friendly):
 
 ```bash
-cd program/lending_math_tests
-leo test --offline
-# or from repo root: npm run test:lending-math
+npm run test:lending-math
+# or: cd program/lending_math_tests && leo test --offline
 ```
-
-Running `leo test` from `program/` pulls `credits` / stablecoin deps and may fail while loading the local ledger; use `lending_math_tests` for CI-style checks.
 
 ### 4. Supabase
 
-- Create a project and run **`supabase/schema.sql`** in the SQL Editor (creates `transaction_history`, indexes, RLS).
-- Use Project → Settings → API for `NEXT_PUBLIC_SUPABASE_URL` and the publishable key (`NEXT_PUBLIC_SUPABASE_PUB_KEY`).
+- Run **`supabase/schema.sql`** in the SQL Editor.
+- Frontend: Project URL + **publishable** key.
+- Backend: **service role** key for updates that the browser must not perform alone.
 
 ---
 
@@ -125,55 +126,64 @@ Running `leo test` from `program/` pulls `credits` / stablecoin deps and may fai
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `NEXT_PUBLIC_SUPABASE_URL` | Yes | Supabase project URL |
-| `NEXT_PUBLIC_SUPABASE_PUB_KEY` | Yes | Supabase publishable (anon) key |
-| `NEXT_PUBLIC_BACKEND_URL` | No | Vault backend URL (default `http://localhost:4000`) |
-| `NEXT_PUBLIC_VAULT_ADDRESS` | No | Shown as vault explorer link on Markets page |
-| `NEXT_PUBLIC_APP_ENV` | No | e.g. `prod` |
+| `NEXT_PUBLIC_SUPABASE_PUB_KEY` | Yes | Publishable (anon) key for client reads |
+| `NEXT_PUBLIC_BACKEND_URL` | Recommended | Backend base URL (vault + APIs) |
+| `NEXT_PUBLIC_LENDING_POOL_PROGRAM_ID` | Recommended | Deployed ALEO pool program id |
+| `NEXT_PUBLIC_USDC_LENDING_POOL_PROGRAM_ID` | Optional | Extra program id for an additional market row; omit if unused or same as main lending id |
+| `NEXT_PUBLIC_USAD_LENDING_POOL_PROGRAM_ID` | Optional | Same pattern for another market slot; omit if unused |
+| `RECORD_TRANSACTION_SECRET` | Recommended (prod) | Shared secret for server routes that call backend `/record-transaction` |
+| `NEXT_PUBLIC_VAULT_ADDRESS` | Optional | Shown in Markets / explorer links |
+| `NEXT_PUBLIC_ADMIN_ADDRESS` | Optional | Admin tab / privileged UI when set |
+| `NEXT_PUBLIC_APP_ENV` | Optional | e.g. `prod` |
+
+See **`.env.example`** for the full list and comments.
 
 ### Backend (`backend/.env`)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ALEO_RPC_URL` | Yes | Aleo RPC endpoint (e.g. Provable) |
-| `VAULT_ADDRESS` | Yes | Vault wallet address |
-| `VAULT_PRIVATE_KEY` | Yes | Vault private key (never commit) |
-| `CORS_ORIGIN` | Yes for prod | Allowed frontend origin(s), comma-separated |
-| `VAULT_QUEUE_CONCURRENCY` | No | Default 1; 2–3 if RPC allows |
-| `WITHDRAW_FEE_CREDITS` / `BORROW_FEE_CREDITS` | No | Optional fees for vault→user transfers |
-| USDC block vars | No | Optional for USDC record search |
+| `ALEO_RPC_URL` | Yes | Aleo / Provable-compatible RPC |
+| `VAULT_ADDRESS` | Yes | Vault public address |
+| `VAULT_PRIVATE_KEY` | Yes | **Secret** — never commit |
+| `SUPABASE_URL` | Recommended | Same project as frontend |
+| `SUPABASE_SERVICE_ROLE_KEY` | Recommended | Server-side updates |
+| `RECORD_TRANSACTION_SECRET` | Recommended | Must match frontend server secret |
+| `CORS_ORIGIN` | Yes (split deploy) | Comma-separated allowed origins |
+| `VAULT_QUEUE_CONCURRENCY` | Optional | Default `1`; see concurrency doc |
 
 ---
 
 ## Deployment
 
-- **Frontend (Vercel):** Set `NEXT_PUBLIC_BACKEND_URL` to your deployed backend URL. Redeploy after adding env vars.
-- **Backend:** Set `CORS_ORIGIN` to your frontend origin(s), e.g. `https://xyra-finance.vercel.app`. Multiple origins: comma-separated. Redeploy after changing CORS or queue settings.
+- **Frontend (e.g. Vercel):** Set all `NEXT_PUBLIC_*` and server-only secrets (e.g. `RECORD_TRANSACTION_SECRET`) in the host dashboard. Point `NEXT_PUBLIC_BACKEND_URL` at your live API.
+- **Backend:** Set `CORS_ORIGIN` to your frontend origin(s). Redeploy after changing secrets or queue settings.
 
 ---
 
 ## Concurrency (many users at once)
 
-The vault backend uses an **in-process queue** so that many simultaneous withdraw/borrow requests do not overload the RPC or the single vault key. Requests are processed in order (default one at a time). For details and tuning, see **`backend/docs/CONCURRENCY.md`**.
+Vault work runs through an **in-process queue** (default concurrency **1**) to protect the RPC and a single vault key. Tune only if you understand RPC limits—see **`backend/docs/CONCURRENCY.md`**.
 
 ---
 
 ## Roadmap
 
-- **Phase 1 (current):** Single-asset-style ALEO and USDCx pools, over-collateralized borrowing, vault-backed transfers, dashboard + Markets + Docs, transaction history, APY and concurrency handling.
-- **Phase 2+:** Multi-asset pools, liquidations, governance, flash loans, staking, oracles. See **`docs/WAVE_3_AND_WAVE_4_IDEAS.md`**.
+- **Now:** Testnet lending loop end-to-end, vault-backed credit payouts, dashboard + markets + history, docs, Shield wallet flows.
+- **Product direction:** Pursue a **dual-pool, Aave-style** architecture with **rigorous interest-rate models**—that design remains the strongest foundation for a serious money market on Aleo.
+- **Explore:** **Flash loan** support (design and safety constraints TBD).
+- **Later:** Liquidations, governance, richer oracles, more assets and pool types—see notes under **`docs/`**.
 
 ---
 
 ## Contributing
 
-- Run `leo build` and `leo test` in `program/` for contract changes.
-- Keep backward compatibility in mind for upgrades.
-- For larger changes (new modules, risk engine, position manager), keep contracts small and documented.
+- Run **`npm run lint`** and **`npm run test:lending-math`** (and `leo build` in `program/` when contracts change).
+- Do not commit `.env`, private keys, or service-role keys.
 
 ---
 
 ## Links
 
-- **Live app:** [https://xyra-finance.vercel.app/](https://xyra-finance.vercel.app/)
-- **Second-wave summary:** `docs/SECOND_WAVE_SUBMISSION.md`
+- **App:** [xyra-finance.vercel.app](https://xyra-finance.vercel.app/)
 - **Backend concurrency:** `backend/docs/CONCURRENCY.md`
+- **Supabase client notes:** `src/utils/supabase/README.md`

@@ -5,20 +5,113 @@ import {
   getLendingPoolState,
   getUsdcLendingPoolState,
   getUsadLendingPoolState,
-  computeAleoPoolAPY,
-  computeUsdcPoolAPY,
-  computeUsadPoolAPY,
+  getPoolApyFractionsFromChain,
+  resolvePoolApyDisplay,
   getAssetPriceForProgram,
+  getLatestBlockHeight,
   LENDING_POOL_PROGRAM_ID,
   USDC_LENDING_POOL_PROGRAM_ID,
   USAD_LENDING_POOL_PROGRAM_ID,
 } from '@/components/aleo/rpc';
+import { CURRENT_RPC_URL } from '@/types';
 import { InfoTooltip } from '@/components/ui/InfoTooltip';
-import { SectionHeader } from '@/components/ui/SectionHeader';
-import { StatusChip } from '@/components/ui/StatusChip';
-import { AssetBadge } from '@/components/ui/AssetBadge';
 
 const SCALE = 1_000_000;
+
+const customStyles = {
+  glassPanel: {
+    background: 'linear-gradient(145deg, rgba(15, 23, 42, 0.4) 0%, rgba(3, 7, 18, 0.6) 100%)',
+    backdropFilter: 'blur(12px)',
+    border: '1px solid rgba(255, 255, 255, 0.05)',
+  },
+};
+
+const FeatherIcon = ({ name, className = '', style = {} }: { name: string, className?: string, style?: React.CSSProperties }) => {
+  const icons: Record<string, React.ReactNode> = {
+    hexagon: (
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} style={style}>
+        <polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2" />
+      </svg>
+    ),
+    activity: (
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} style={style}>
+        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+      </svg>
+    ),
+    shield: (
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} style={style}>
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+      </svg>
+    ),
+    'dollar-sign': (
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} style={style}>
+        <line x1="12" y1="1" x2="12" y2="23" />
+        <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+      </svg>
+    ),
+  };
+  return <>{icons[name] || null}</>;
+};
+
+const StatCard = ({ label, value }: { label: string, value: string | React.ReactNode }) => (
+  <div style={customStyles.glassPanel} className="p-4 rounded-2xl border-white/5">
+    <div className="text-[10px] text-slate-500 uppercase mb-1 font-mono">{label}</div>
+    <div className="text-lg font-bold text-white font-mono">{value}</div>
+  </div>
+);
+
+function rpcHostLabel(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url.replace(/^https?:\/\//i, '').split('/')[0] || url;
+  }
+}
+
+const MarketRow = ({ market, isLast }: { market: any, isLast: boolean }) => {
+  const [hovered, setHovered] = useState(false);
+
+  return (
+    <tr
+      className={`${!isLast ? 'border-b border-white/5' : ''}`}
+      style={{
+        transition: 'all 0.2s ease',
+        background: hovered ? 'rgba(255, 255, 255, 0.02)' : 'transparent',
+        borderColor: hovered ? 'rgba(6, 182, 212, 0.2)' : undefined,
+      }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      <td className="px-8 py-8">
+        <div className="flex items-center gap-4">
+          <div className={`w-10 h-10 rounded-xl ${market.iconBg} border ${market.iconBorder} flex items-center justify-center p-2`}>
+            {market.image ? (
+              <img src={market.image} alt={market.name} className="w-full h-full object-contain" />
+            ) : (
+              <FeatherIcon name={market.icon} className={`${market.iconColor} w-full h-full`} />
+            )}
+          </div>
+          <div>
+            <div className="text-white font-bold">{market.name}</div>
+            <div className="text-[10px] text-slate-500 font-mono">{market.subtitle}</div>
+          </div>
+        </div>
+      </td>
+      <td className="px-6 py-8 text-right font-mono text-sm text-slate-300">
+        {market.supplied} <span className="text-[10px] text-slate-500">{market.suppliedUnit}</span>
+      </td>
+      <td className="px-6 py-8 text-right font-mono text-sm text-slate-300">
+        {market.borrowed} <span className="text-[10px] text-slate-500">{market.borrowedUnit}</span>
+      </td>
+      <td className="px-6 py-8 text-right font-mono text-sm text-slate-300">
+        {market.available} <span className="text-[10px] text-slate-500">{market.availableUnit}</span>
+      </td>
+      <td className="px-6 py-8 text-right font-mono text-sm text-slate-300">{market.vault}</td>
+      <td className="px-6 py-8 text-right font-mono text-base font-bold text-cyan-400">{market.supplyApy}</td>
+      <td className="px-8 py-8 text-right font-mono text-base font-bold text-indigo-400">{market.borrowApy}</td>
+    </tr>
+  );
+};
 
 export function MarketsView() {
   const [loading, setLoading] = useState(true);
@@ -45,6 +138,9 @@ export function MarketsView() {
   const [priceUsdUsdcx, setPriceUsdUsdcx] = useState<number | null>(null);
   const [priceUsdUsad, setPriceUsdUsad] = useState<number | null>(null);
 
+  const [networkBlockHeight, setNetworkBlockHeight] = useState<number | null>(null);
+  const [networkRpcStatus, setNetworkRpcStatus] = useState<'loading' | 'ok' | 'error'>('loading');
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -65,9 +161,14 @@ export function MarketsView() {
         const tsUsad = Number(usadState.totalSupplied ?? 0) || 0;
         const tbUsad = Number(usadState.totalBorrowed ?? 0) || 0;
 
-        const { supplyAPY: sApyAleo, borrowAPY: bApyAleo } = computeAleoPoolAPY(tsAleo, tbAleo);
-        const { supplyAPY: sApyUsdc, borrowAPY: bApyUsdc } = computeUsdcPoolAPY(tsUsdc, tbUsdc);
-        const { supplyAPY: sApyUsad, borrowAPY: bApyUsad } = computeUsadPoolAPY(tsUsad, tbUsad);
+        const [chainAleo, chainUsdc, chainUsad] = await Promise.all([
+          getPoolApyFractionsFromChain(LENDING_POOL_PROGRAM_ID, '0field'),
+          getPoolApyFractionsFromChain(USDC_LENDING_POOL_PROGRAM_ID, '1field'),
+          getPoolApyFractionsFromChain(USAD_LENDING_POOL_PROGRAM_ID, '2field'),
+        ]);
+        const { supplyAPY: sApyAleo, borrowAPY: bApyAleo } = resolvePoolApyDisplay(tsAleo, tbAleo, chainAleo);
+        const { supplyAPY: sApyUsdc, borrowAPY: bApyUsdc } = resolvePoolApyDisplay(tsUsdc, tbUsdc, chainUsdc);
+        const { supplyAPY: sApyUsad, borrowAPY: bApyUsad } = resolvePoolApyDisplay(tsUsad, tbUsad, chainUsad);
 
         setAleoTotalSupplied(tsAleo / SCALE);
         setAleoTotalBorrowed(tbAleo / SCALE);
@@ -143,6 +244,42 @@ export function MarketsView() {
     };
   }, []);
 
+  /** Live RPC: latest block height + status (was never wired — UI stayed on "Checking…"). */
+  useEffect(() => {
+    let cancelled = false;
+    const rpcUrl = CURRENT_RPC_URL;
+
+    const refresh = async () => {
+      console.info('[MarketsView][network] Polling chain height…', { rpcUrl });
+      try {
+        const h = await getLatestBlockHeight();
+        if (cancelled) return;
+        console.info('[MarketsView][network] Height result', { height: h, ok: h > 0 });
+        if (h > 0) {
+          setNetworkBlockHeight(h);
+          setNetworkRpcStatus('ok');
+        } else {
+          setNetworkBlockHeight(null);
+          setNetworkRpcStatus('error');
+          console.warn('[MarketsView][network] Invalid height (0). Check console for [getLatestBlockHeight] logs.');
+        }
+      } catch (e) {
+        if (!cancelled) {
+          console.error('[MarketsView][network] Unexpected error', e);
+          setNetworkBlockHeight(null);
+          setNetworkRpcStatus('error');
+        }
+      }
+    };
+
+    void refresh();
+    const interval = setInterval(refresh, 45_000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
   const aleoAvailable = Math.max(0, aleoTotalSupplied - aleoTotalBorrowed);
   const usdcAvailable = Math.max(0, usdcTotalSupplied - usdcTotalBorrowed);
   const fmtVault = (bal: number, priceUsd: number | null) => {
@@ -151,106 +288,200 @@ export function MarketsView() {
     return usd == null ? bal.toFixed(4) : `${bal.toFixed(4)} (~$${usd.toFixed(2)})`;
   };
 
-  return (
-    <div className="flex justify-center pt-16 sm:pt-20">
-      <div className="w-full max-w-6xl space-y-6 px-4">
-        <SectionHeader
-          title="Markets"
-          subtitle="Unified pool telemetry for ALEO, USDCx, and USAD. Public data."
-          badge="Aleo Testnet"
-          rightSlot={<StatusChip label="Live on-chain metrics" variant="info" />}
-        />
+  const formatLargeUsd = (val: number | null) => {
+    if (vaultPricesLoading || val == null) return '—';
+    if (val >= 1_000_000) return `$${(val / 1_000_000).toFixed(2)}M`;
+    if (val >= 1_000) return `$${(val / 1_000).toFixed(2)}K`;
+    return `$${val.toFixed(2)}`;
+  };
 
-        <div className="privacy-card rounded-xl bg-base-200 border border-base-300 overflow-hidden">
-          <div className="p-4 border-b border-base-300">
-            <h2 className="text-lg font-semibold">
-              Reserve overview
-              {process.env.NEXT_PUBLIC_VAULT_ADDRESS?.trim() ? (
-                <>
-                  {' '}
-                  (
-                  <a
-                    href={`https://testnet.explorer.provable.com/address/${process.env.NEXT_PUBLIC_VAULT_ADDRESS.trim()}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="link link-primary"
-                  >
-                    Vault
-                  </a>
-                  )
-                </>
-              ) : null}
-            </h2>
-            <p className="text-xs text-base-content/70 mt-0.5">
-              Supply and borrow APY, total supplied, total borrowed, available liquidity, and vault wallet balance.
+  const tvl = aleoTotalSupplied * (priceUsdAleo ?? 0) + usdcTotalSupplied * (priceUsdUsdcx ?? 0) + usadTotalSupplied * (priceUsdUsad ?? 0);
+  const totalBorrowedUsd = aleoTotalBorrowed * (priceUsdAleo ?? 0) + usdcTotalBorrowed * (priceUsdUsdcx ?? 0) + usadTotalBorrowed * (priceUsdUsad ?? 0);
+
+  const marketsData = [
+    {
+      id: 1,
+      icon: 'hexagon',
+      image: '/logos/aleo-dark.svg',
+      iconBg: 'bg-cyan-500/10',
+      iconBorder: 'border-cyan-500/20',
+      iconColor: 'text-cyan-400',
+      name: 'ALEO',
+      subtitle: 'Native Privacy Token',
+      supplied: aleoTotalSupplied.toFixed(2),
+      suppliedUnit: 'ALEO',
+      borrowed: aleoTotalBorrowed.toFixed(2),
+      borrowedUnit: 'ALEO',
+      available: aleoAvailable.toFixed(2),
+      availableUnit: 'ALEO',
+      vault: fmtVault(vaultAleoBalance, priceUsdAleo),
+      supplyApy: `${aleoSupplyAPY.toFixed(2)}%`,
+      borrowApy: `${aleoBorrowAPY.toFixed(2)}%`,
+    },
+    {
+      id: 2,
+      icon: 'dollar-sign',
+      image: '/logos/usdc.svg',
+      iconBg: 'bg-indigo-500/10',
+      iconBorder: 'border-indigo-500/20',
+      iconColor: 'text-indigo-400',
+      name: 'USDCx',
+      subtitle: 'Shielded USDC Wrapper',
+      supplied: usdcTotalSupplied.toFixed(2),
+      suppliedUnit: 'USDCx',
+      borrowed: usdcTotalBorrowed.toFixed(2),
+      borrowedUnit: 'USDCx',
+      available: usdcAvailable.toFixed(2),
+      availableUnit: 'USDCx',
+      vault: fmtVault(vaultUsdcxBalance, priceUsdUsdcx),
+      supplyApy: `${usdcSupplyAPY.toFixed(2)}%`,
+      borrowApy: `${usdcBorrowAPY.toFixed(2)}%`,
+    },
+    {
+      id: 3,
+      icon: 'shield',
+      image: '/logos/usad.svg',
+      iconBg: 'bg-purple-500/10',
+      iconBorder: 'border-purple-500/20',
+      iconColor: 'text-purple-400',
+      name: 'USAD',
+      subtitle: 'Algorithmic Dark Stable',
+      supplied: usadTotalSupplied.toFixed(2),
+      suppliedUnit: 'USAD',
+      borrowed: usadTotalBorrowed.toFixed(2),
+      borrowedUnit: 'USAD',
+      available: Math.max(0, usadTotalSupplied - usadTotalBorrowed).toFixed(2),
+      availableUnit: 'USAD',
+      vault: fmtVault(vaultUsadBalance, priceUsdUsad),
+      supplyApy: `${usadSupplyAPY.toFixed(2)}%`,
+      borrowApy: `${usadBorrowAPY.toFixed(2)}%`,
+    },
+  ];
+
+  return (
+    <main className="relative z-10 pt-4 pb-20 max-w-[1440px] mx-auto px-4 sm:px-8">
+      <header className="mb-12">
+        <div className="flex flex-col md:flex-row md:items-end justify-between gap-6">
+          <div>
+            <div className="flex items-center gap-3 mb-4">
+              <div
+                style={customStyles.glassPanel}
+                className="px-3 py-1 rounded-full border border-cyan-500/30 flex items-center gap-2"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-cyan-500 animate-pulse"></span>
+                <span className="text-[10px] font-mono font-bold text-cyan-400 uppercase tracking-widest">Aleo Testnet</span>
+              </div>
+              <div className="flex items-center gap-1.5 text-slate-500 font-mono text-[10px] uppercase tracking-wider">
+                <FeatherIcon name="activity" className="w-3 h-3" />
+                Live on-chain metrics
+              </div>
+            </div>
+            <h1 className="text-5xl font-bold tracking-tight text-white mb-2" style={{ fontFamily: "'IBM Plex Sans', sans-serif" }}>Markets</h1>
+            <p className="text-slate-400 font-light max-w-xl">
+              Unified pool telemetry across the Aleo dark pool. Real-time reserve analytics for shielded liquidity providers and borrowers.
             </p>
           </div>
-          {loading ? (
-            <div className="flex items-center justify-center py-16">
-              <span className="loading loading-spinner loading-lg text-primary" />
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 font-mono">
+            <StatCard label="Total Value Locked" value={formatLargeUsd(tvl)} />
+            <StatCard label="Total Borrowed" value={formatLargeUsd(totalBorrowedUsd)} />
+            <div className="hidden sm:block">
+              <StatCard label="Total Assets" value="3" />
             </div>
-          ) : (
+          </div>
+        </div>
+      </header>
+
+      {loading ? (
+        <div className="flex items-center justify-center py-16">
+          <span className="loading loading-spinner text-cyan-400" />
+        </div>
+      ) : (
+        <div>
+          <div style={customStyles.glassPanel} className="rounded-[2rem] overflow-hidden border border-white/5 shadow-2xl">
             <div className="overflow-x-auto">
-              <table className="table table-zebra w-full">
+              <table className="w-full text-left border-collapse">
                 <thead>
-                  <tr className="border-base-300">
-                    <th className="bg-base-300/50 font-semibold">Asset</th>
-                    <th className="bg-base-300/50 font-semibold">Total supplied</th>
-                    <th className="bg-base-300/50 font-semibold">Total borrowed</th>
-                    <th className="bg-base-300/50 font-semibold">Available</th>
-                    <th className="bg-base-300/50 font-semibold">
-                      Vault balance
-                      <InfoTooltip tip="Backend vault wallet public balance for this asset (from token program mappings). Not pool liquidity." />
-                    </th>
-                    <th className="bg-base-300/50 font-semibold">
-                      Supply APY
-                      <InfoTooltip
-                        tip="Supply APY is the yearly interest earned by suppliers to this pool. It depends on utilization (total borrowed divided by total supplied) and a reserve factor that keeps some interest in the protocol."
-                      />
-                    </th>
-                    <th className="bg-base-300/50 font-semibold">
-                      Borrow APY
-                      <InfoTooltip
-                        tip="Borrow APY is the yearly interest paid by borrowers. It increases as pool utilization (total borrowed divided by total supplied) goes up."
-                      />
-                    </th>
+                  <tr className="border-b border-white/5 bg-white/[0.02]">
+                    <th className="px-8 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest">Asset</th>
+                    <th className="px-6 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest text-right">Total Supplied</th>
+                    <th className="px-6 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest text-right">Total Borrowed</th>
+                    <th className="px-6 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest text-right">Available</th>
+                    <th className="px-6 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest text-right">Vault Balance <InfoTooltip tip="Backend vault wallet public balance for this asset. Not pool liquidity." /></th>
+                    <th className="px-6 py-6 text-[10px] font-mono font-bold text-cyan-400 uppercase tracking-widest text-right">Supply APY</th>
+                    <th className="px-8 py-6 text-[10px] font-mono font-bold text-indigo-400 uppercase tracking-widest text-right">Borrow APY</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr className="border-base-300">
-                    <td><AssetBadge asset="ALEO" compact /></td>
-                    <td>{aleoTotalSupplied.toFixed(4)}</td>
-                    <td>{aleoTotalBorrowed.toFixed(4)}</td>
-                    <td>{aleoAvailable.toFixed(4)}</td>
-                    <td>{fmtVault(vaultAleoBalance, priceUsdAleo)}</td>
-                    <td className="text-success">{aleoSupplyAPY.toFixed(2)}%</td>
-                    <td className="text-warning">{aleoBorrowAPY.toFixed(2)}%</td>
-                  </tr>
-                  <tr className="border-base-300">
-                    <td><AssetBadge asset="USDCx" compact /></td>
-                    <td>{usdcTotalSupplied.toFixed(4)}</td>
-                    <td>{usdcTotalBorrowed.toFixed(4)}</td>
-                    <td>{usdcAvailable.toFixed(4)}</td>
-                    <td>{fmtVault(vaultUsdcxBalance, priceUsdUsdcx)}</td>
-                    <td className="text-success">{usdcSupplyAPY.toFixed(2)}%</td>
-                    <td className="text-warning">{usdcBorrowAPY.toFixed(2)}%</td>
-                  </tr>
-                  <tr className="border-base-300">
-                    <td><AssetBadge asset="USAD" compact /></td>
-                    <td>{usadTotalSupplied.toFixed(4)}</td>
-                    <td>{usadTotalBorrowed.toFixed(4)}</td>
-                    <td>{Math.max(0, usadTotalSupplied - usadTotalBorrowed).toFixed(4)}</td>
-                    <td>{fmtVault(vaultUsadBalance, priceUsdUsad)}</td>
-                    <td className="text-success">{usadSupplyAPY.toFixed(2)}%</td>
-                    <td className="text-warning">{usadBorrowAPY.toFixed(2)}%</td>
-                  </tr>
+                  {marketsData.map((market, index) => (
+                    <MarketRow key={market.id} market={market} isLast={index === marketsData.length - 1} />
+                  ))}
                 </tbody>
               </table>
             </div>
-          )}
+          </div>
+        </div>
+      )}
+
+      <div className="mt-12 grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div style={customStyles.glassPanel} className="p-8 rounded-3xl border-white/5">
+          <h4 className="text-sm font-bold text-white mb-4 flex items-center gap-2">
+            <FeatherIcon name="shield" className="w-4 h-4 text-cyan-400" />
+            Privacy Guarantee
+          </h4>
+          <p className="text-sm text-slate-400 leading-relaxed">
+            All market metrics above represent aggregate pool data. Individual position sizes, health factors, and liquidation thresholds are entirely shielded via zero-knowledge proofs on the Aleo network. Solvency is mathematically proven without data exposure.
+          </p>
+        </div>
+        <div style={customStyles.glassPanel} className="p-8 rounded-3xl border-white/5 flex flex-col justify-center">
+          <div className="flex items-center justify-between mb-4 gap-3">
+            <span className="text-xs font-mono text-slate-500 uppercase tracking-widest">Network Status</span>
+            <span
+              className={`text-xs font-mono shrink-0 ${
+                networkRpcStatus === 'ok'
+                  ? 'text-emerald-400'
+                  : networkRpcStatus === 'loading'
+                    ? 'text-slate-400'
+                    : 'text-amber-400'
+              }`}
+            >
+              {networkRpcStatus === 'ok'
+                ? 'Operational'
+                : networkRpcStatus === 'loading'
+                  ? 'Checking…'
+                  : 'Unavailable'}
+            </span>
+          </div>
+          <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ background: 'rgba(255,255,255,0.05)' }}>
+            <div
+              className={`h-full rounded-full transition-all duration-500 ${
+                networkRpcStatus === 'ok'
+                  ? 'w-full bg-gradient-to-r from-cyan-500 to-indigo-500'
+                  : networkRpcStatus === 'loading'
+                    ? 'w-2/3 animate-pulse bg-gradient-to-r from-cyan-500/60 to-indigo-500/60'
+                    : 'w-1/3 bg-amber-500/70'
+              }`}
+            />
+          </div>
+          <div className="mt-4 flex flex-col sm:flex-row sm:justify-between sm:items-start gap-2 text-[10px] font-mono text-slate-500">
+            <span>
+              Block:{' '}
+              <span className="text-slate-300 tabular-nums">
+                {networkRpcStatus === 'loading' && networkBlockHeight == null
+                  ? '…'
+                  : networkBlockHeight != null
+                    ? `#${networkBlockHeight.toLocaleString()}`
+                    : '—'}
+              </span>
+            </span>
+            <span className="sm:text-right break-all" title={CURRENT_RPC_URL}>
+              RPC:{' '}
+              <span className="text-slate-400">{rpcHostLabel(CURRENT_RPC_URL)}</span>
+            </span>
+          </div>
         </div>
       </div>
-    </div>
+    </main>
   );
 }
 

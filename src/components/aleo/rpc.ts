@@ -1909,7 +1909,15 @@ export async function getPrivateUsadBalance(
 export async function getLatestBlockHeight(): Promise<number> {
   const toNum = (v: any): number => {
     if (v === undefined || v === null) return 0;
+    if (typeof v === 'bigint') {
+      const x = Number(v);
+      return Number.isFinite(x) ? x : 0;
+    }
     if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'string' && v.trim() !== '') {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : 0;
+    }
     if (typeof v === 'object' && v !== null) {
       const n = v.result ?? v.height ?? v.block_height ?? v.value;
       return toNum(n);
@@ -1917,16 +1925,77 @@ export async function getLatestBlockHeight(): Promise<number> {
     const n = Number(v);
     return Number.isFinite(n) ? n : 0;
   };
+
+  const logPrefix = '[getLatestBlockHeight]';
+
   try {
     const h = await client.request('latest/height', {});
-    return toNum(h);
-  } catch (e) {
+    const n = toNum(h);
+    if (n > 0) {
+      if (typeof window !== 'undefined') {
+        console.debug(`${logPrefix} OK via JSON-RPC client`, { raw: h, height: n, url: CURRENT_RPC_URL });
+      }
+      return n;
+    }
+    console.warn(`${logPrefix} client returned non-positive height`, { raw: h, parsed: n, url: CURRENT_RPC_URL });
+  } catch (e: any) {
+    console.warn(`${logPrefix} latest/height (client) failed`, {
+      message: e?.message ?? String(e),
+      url: CURRENT_RPC_URL,
+    });
     try {
       const h = await client.request('getLatestBlockHeight', {});
-      return toNum(h);
+      const n = toNum(h);
+      if (n > 0) {
+        console.debug(`${logPrefix} OK via getLatestBlockHeight`, { raw: h, height: n });
+        return n;
+      }
+    } catch (e2: any) {
+      console.warn(`${logPrefix} getLatestBlockHeight failed`, { message: e2?.message ?? String(e2) });
+    }
+  }
+
+  // Direct fetch: same endpoint as the JSON-RPC client (avoids rare client parsing quirks; clearer errors in DevTools).
+  try {
+    const res = await fetch(CURRENT_RPC_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'height-fallback',
+        method: 'latest/height',
+        params: {},
+      }),
+    });
+    const text = await res.text();
+    let json: any;
+    try {
+      json = JSON.parse(text);
     } catch {
+      console.error(`${logPrefix} fetch: non-JSON body`, { status: res.status, text: text.slice(0, 200) });
       return 0;
     }
+    if (!res.ok) {
+      console.error(`${logPrefix} fetch: HTTP error`, { status: res.status, body: json });
+      return 0;
+    }
+    if (json.error) {
+      console.error(`${logPrefix} fetch: JSON-RPC error`, json.error);
+      return 0;
+    }
+    const n = toNum(json.result);
+    if (n > 0) {
+      console.debug(`${logPrefix} OK via fetch fallback`, { height: n, url: CURRENT_RPC_URL });
+    } else {
+      console.warn(`${logPrefix} fetch: unexpected result`, { result: json.result, full: json });
+    }
+    return n;
+  } catch (e: any) {
+    console.error(`${logPrefix} fetch fallback failed (CORS or network?)`, {
+      message: e?.message ?? String(e),
+      url: CURRENT_RPC_URL,
+    });
+    return 0;
   }
 }
 
@@ -2065,15 +2134,15 @@ export async function getSuitableUsdcTokenRecord(
       );
       continue;
     }
-    if (val === BigInt(0)) {
+      if (val === BigInt(0)) {
       console.log(`${logPrefix} Record[${i}] skipped (amount is 0)`);
-      continue;
-    }
+        continue;
+      }
     console.log(`${logPrefix} Record[${i}] amount: ${String(val)} micro (need >= ${String(amountU128)}): ${val >= amountU128}`);
-    if (val >= amountU128) {
+      if (val >= amountU128) {
       console.log(`${logPrefix} Using record[${i}] for deposit/repay`);
-      return rec;
-    }
+        return rec;
+      }
   }
 
   console.warn(
@@ -2399,7 +2468,7 @@ export async function lendingRepayUsad(
           tokenInputPreview:
             typeof tokenInput === 'string' ? tokenInput.slice(0, 100) : typeof tokenInput,
           hints: [
-            'finalize_repay asserts amount <= on-chain accrued debt; UI can lag interest — try a smaller repay.',
+            'Cross-asset repay: finalize_repay_any applies payment USD to all debts in order (ALEO→USDCx→USAD); excess payment stays as pool liquidity. UI can lag interest — try a slightly smaller amount if rejected.',
             'Invalid Merkle proofs for test_usad_stablecoin transfer_private_to_public will reject.',
             'NEXT_PUBLIC_* pool program id must match the deployed pool you initialized.',
           ],
@@ -3052,6 +3121,77 @@ export async function getUsadLendingPoolState(): Promise<{
   borrowIndex: string | null;
 }> {
   return getLendingPoolStateForProgram(USAD_LENDING_POOL_PROGRAM_ID, '2field');
+}
+
+function parseMappingU64Response(res: unknown): number | null {
+  if (res == null) return null;
+  const raw = (res as { value?: unknown })?.value ?? res;
+  if (raw == null) return null;
+  const str = String(raw);
+  const m = str.match(/(\d[\d_]*)/);
+  if (!m) return null;
+  const n = Number(m[1].replace(/_/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Read `supply_apy` / `borrow_apy` mappings written by `finalize_accrue` (xyra_lending_v6.aleo).
+ * Values are annual APR in basis points (SCALE=10_000): 200 => 2% => fraction 0.02.
+ */
+export async function getPoolApyFractionsFromChain(
+  programId: string,
+  assetKey: string,
+): Promise<{ supplyAPY: number; borrowAPY: number } | null> {
+  try {
+    const [sRes, bRes] = await Promise.all([
+      client.request('getMappingValue', {
+        program_id: programId,
+        mapping_name: 'supply_apy',
+        key: assetKey,
+      }),
+      client.request('getMappingValue', {
+        program_id: programId,
+        mapping_name: 'borrow_apy',
+        key: assetKey,
+      }),
+    ]);
+    const sBps = parseMappingU64Response(sRes);
+    const bBps = parseMappingU64Response(bRes);
+    if (sBps == null && bBps == null) return null;
+    const BPS = 10_000;
+    return {
+      supplyAPY: sBps != null ? sBps / BPS : 0,
+      borrowAPY: bBps != null ? bBps / BPS : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Prefer on-chain APY from mappings; fall back to utilization formula when mappings are missing
+ * or still zero while the pool has deposits (before first accrue).
+ */
+export function resolvePoolApyDisplay(
+  totalSupplied: number,
+  totalBorrowed: number,
+  chain: { supplyAPY: number; borrowAPY: number } | null,
+): { supplyAPY: number; borrowAPY: number } {
+  const computed = computeAleoPoolAPY(totalSupplied, totalBorrowed);
+  if (chain == null) return computed;
+  const bothZero = chain.borrowAPY < 1e-12 && chain.supplyAPY < 1e-12;
+  if (bothZero && totalSupplied > 0) return computed;
+  // Some pools can briefly expose stale `supply_apy=0` while `borrow_apy` is already non-zero.
+  // In that case, keep borrow from chain but derive supply from utilization for display.
+  const shouldBackfillSupplyFromComputed =
+    totalSupplied > 0 &&
+    totalBorrowed > 0 &&
+    chain.borrowAPY > 1e-12 &&
+    chain.supplyAPY < 1e-12;
+  return {
+    supplyAPY: shouldBackfillSupplyFromComputed ? computed.supplyAPY : chain.supplyAPY,
+    borrowAPY: chain.borrowAPY,
+  };
 }
 
 // --- v91 interest/APY constants (match program lending_pool_v91.aleo) ---
