@@ -4,6 +4,25 @@
  * Stores them for debugging and local reference
  */
 
+/** `JSON.stringify` throws on `bigint` (e.g. mapping probes); use this for storage / message text. */
+function jsonReplacerBigInt(_key: string, value: unknown): unknown {
+  if (typeof value === 'bigint') return value.toString();
+  return value;
+}
+
+export function safeJsonStringify(value: unknown, space?: string | number): string {
+  return JSON.stringify(value, jsonReplacerBigInt, space);
+}
+
+function cloneJsonSafe<T>(value: T): T {
+  if (value === null || typeof value !== 'object') return value;
+  try {
+    return JSON.parse(safeJsonStringify(value)) as T;
+  } catch {
+    return value;
+  }
+}
+
 export interface LogEntry {
   timestamp: string;
   level: 'log' | 'error' | 'warn' | 'info' | 'debug';
@@ -95,9 +114,9 @@ class FrontendLogger {
   private addLog(level: LogEntry['level'], data: any[], stackTrace?: string) {
     const message = data
       .map((item) => {
-        if (typeof item === 'object') {
+        if (typeof item === 'object' && item !== null) {
           try {
-            return JSON.stringify(item);
+            return safeJsonStringify(item);
           } catch (e) {
             return String(item);
           }
@@ -106,11 +125,14 @@ class FrontendLogger {
       })
       .join(' ');
 
+    const dataSafe =
+      data.length === 1 ? cloneJsonSafe(data[0]) : data.map((d) => cloneJsonSafe(d));
+
     const logEntry: LogEntry = {
       timestamp: new Date().toISOString(),
       level,
       message,
-      data: data.length === 1 ? data[0] : data,
+      data: dataSafe.length === 1 ? dataSafe[0] : dataSafe,
       stackTrace,
     };
 
@@ -122,7 +144,7 @@ class FrontendLogger {
     }
 
     // Also store in localStorage for persistence
-    this.storeInLocalStorage('frontend_logs_session', JSON.stringify(this.logs.slice(-100)));
+    this.storeInLocalStorage('frontend_logs_session', safeJsonStringify(this.logs.slice(-100)));
   }
 
   /**
@@ -156,7 +178,7 @@ class FrontendLogger {
     // Store in localStorage
     this.storeInLocalStorage(
       'frontend_record_diagnostics',
-      JSON.stringify(this.recordDiagnostics.slice(-20))
+      safeJsonStringify(this.recordDiagnostics.slice(-20))
     );
   }
 
@@ -202,7 +224,7 @@ class FrontendLogger {
       text += `[${index + 1}] ${log.timestamp} [${log.level.toUpperCase()}]\n`;
       text += `    Message: ${log.message}\n`;
       if (log.data && typeof log.data === 'object') {
-        text += `    Data: ${JSON.stringify(log.data, null, 2)}\n`;
+        text += `    Data: ${safeJsonStringify(log.data, 2)}\n`;
       }
       if (log.stackTrace) {
         text += `    Stack: ${log.stackTrace}\n`;
@@ -229,13 +251,13 @@ class FrontendLogger {
       text += `Wallet Address: ${diag.walletAddress || 'Not provided'}\n\n`;
 
       text += `--- CREDITS RECORDS (${diag.creditsRecords.length}) ---\n`;
-      text += JSON.stringify(diag.creditsRecords, null, 2) + '\n\n';
+      text += safeJsonStringify(diag.creditsRecords, 2) + '\n\n';
 
       text += `--- LENDING POOL RECORDS (${diag.lendingPoolRecords.length}) ---\n`;
-      text += JSON.stringify(diag.lendingPoolRecords, null, 2) + '\n\n';
+      text += safeJsonStringify(diag.lendingPoolRecords, 2) + '\n\n';
 
       text += `--- ALL RECORDS (${diag.allRecords.length}) ---\n`;
-      text += JSON.stringify(diag.allRecords, null, 2) + '\n\n';
+      text += safeJsonStringify(diag.allRecords, 2) + '\n\n';
 
       if (diag.errors.length > 0) {
         text += `--- ERRORS ---\n`;
@@ -261,7 +283,7 @@ class FrontendLogger {
    * Export all data as JSON
    */
   exportAllAsJSON(): string {
-    return JSON.stringify(
+    return safeJsonStringify(
       {
         logsExportTime: new Date().toISOString(),
         totalLogs: this.logs.length,
@@ -269,7 +291,6 @@ class FrontendLogger {
         totalRecordDiagnostics: this.recordDiagnostics.length,
         recordDiagnostics: this.recordDiagnostics,
       },
-      null,
       2
     );
   }
@@ -290,7 +311,7 @@ class FrontendLogger {
   downloadRecordDiagnosticsAsFile(format: 'text' | 'json' = 'text') {
     const content =
       format === 'json'
-        ? JSON.stringify(this.recordDiagnostics, null, 2)
+        ? safeJsonStringify(this.recordDiagnostics, 2)
         : this.exportRecordDiagnosticsAsText();
     const filename = `record-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.${format === 'json' ? 'json' : 'txt'}`;
 

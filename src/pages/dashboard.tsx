@@ -116,19 +116,42 @@ function txHistoryAssetVaultLabel(asset: string): string {
  * UI strings / Max (toFixed(2)) match portfolio math from USD÷price (avoids only 1.60
  * working when displayed max is 1.61 due to float drift).
  */
-function amountWithinMax(amount: number, max: number): boolean {
+function amountWithinMax(amount: number, max: number, slackMicro = 0): boolean {
   if (!Number.isFinite(amount) || !Number.isFinite(max)) return false;
   if (amount <= 0 || max < 0) return false;
   const SCALE = 1_000_000;
-  return Math.round(amount * SCALE) <= Math.round(max * SCALE);
+  return Math.round(amount * SCALE) <= Math.round(max * SCALE) + slackMicro;
 }
 
-/** Subtracted from computed max when using Max / % presets so the input stays below on-chain limits (rounding / float). */
-const MAX_BUTTON_BUFFER = 0.01;
+/**
+ * Merge mapping `getAleoPoolUserEffectivePosition` with wallet record aggregates (micro units).
+ * `effectiveMicro === 0` is still a number, so `effective ?? wallet` incorrectly ignores receipts.
+ */
+function effectiveMicroOrWalletAggregate(
+  effectiveMicro: number | null,
+  walletMicroStr: string,
+): number {
+  const w = Number(walletMicroStr) || 0;
+  const e = effectiveMicro;
+  if (e != null && e > 0) return e;
+  if (w > 0) return w;
+  if (e != null) return e;
+  return 0;
+}
 
-function amountForMaxButton(rawMax: number): number {
-  if (!Number.isFinite(rawMax) || rawMax <= 0) return 0;
-  return Math.max(0, rawMax - MAX_BUTTON_BUFFER);
+/** Prefer mapping `user_scaled_*` when RPC returns &gt; 0; else wallet receipts (mappings can lag or mis-read). */
+function chainMicroOrWalletMicro(chainMicro: bigint | undefined, walletMicro: number): number {
+  if (chainMicro != null && chainMicro > BigInt(0)) return Number(chainMicro);
+  return walletMicro;
+}
+
+/** Temporary: extra micro-units in `amountWithinMax` for Borrow / Repay at Max (remove after testing). */
+const BORROW_REPAY_MAX_TEST_SLACK_MICRO = 50;
+
+/** Borrow Max: 2-decimal floor capped at `max` so the input never rounds above headroom. */
+function borrowMaxInputAmount(max: number): number {
+  if (!Number.isFinite(max) || max <= 0) return 0;
+  return Math.min(Math.floor(max * 100) / 100, max);
 }
 
 /** Cross-asset repay: value of `amountAsset` in USD must not exceed total portfolio debt (same rounding as amountWithinMax). */
@@ -355,7 +378,7 @@ const DashboardPage: NextPageWithLayout = () => {
   const [actionModalMode, setActionModalMode] = useState<'withdraw' | 'deposit' | 'borrow' | 'repay'>('withdraw');
   const [actionModalAsset, setActionModalAsset] = useState<'aleo' | 'usdc' | 'usad'>('aleo');
   const [actionModalSubmitted, setActionModalSubmitted] = useState(false);
-  const [expandedAsset, setExpandedAsset] = useState<'aleo' | 'usdc' | 'usad' | null>('aleo');
+  const [expandedAsset, setExpandedAsset] = useState<'aleo' | 'usdc' | 'usad' | null>(null);
   const [activeManageTab, setActiveManageTab] = useState<'Supply' | 'Withdraw' | 'Borrow' | 'Repay'>('Supply');
   const [manageAmountInput, setManageAmountInput] = useState('');
   const [inlineTxContext, setInlineTxContext] = useState<{
@@ -702,7 +725,7 @@ const DashboardPage: NextPageWithLayout = () => {
 
       // Fetch lending_pool_v8.aleo records and update user position
       await fetchRecordsInBackground(LENDING_POOL_PROGRAM_ID);
-
+      
       console.log('📋 fetchAllUserRecords: All records fetched successfully');
     } catch (error: any) {
       console.warn('📋 fetchAllUserRecords: Error fetching records:', error?.message);
@@ -807,10 +830,10 @@ const DashboardPage: NextPageWithLayout = () => {
   const numericTotalRepayments = Number(totalRepayments) || 0;
   const principalSupplied = Math.max(0, numericTotalDeposits - numericTotalWithdrawals);
   const principalBorrowed = Math.max(0, numericTotalBorrows - numericTotalRepayments);
-  const effectiveSuppliedVal =
-    effectiveUserSupplied != null ? effectiveUserSupplied : Number(userSupplied) || 0;
-  const effectiveBorrowedVal =
-    effectiveUserBorrowed != null ? effectiveUserBorrowed : Number(userBorrowed) || 0;
+  const walletMicroAleoSup = effectiveMicroOrWalletAggregate(effectiveUserSupplied, userSupplied);
+  const walletMicroAleoBor = effectiveMicroOrWalletAggregate(effectiveUserBorrowed, userBorrowed);
+  const effectiveSuppliedVal = chainMicroOrWalletMicro(chainBorrowCaps?.realSupplyMicroAleo, walletMicroAleoSup);
+  const effectiveBorrowedVal = chainMicroOrWalletMicro(chainBorrowCaps?.realBorrowMicroAleo, walletMicroAleoBor);
   const liNum = liquidityIndex != null ? Number(liquidityIndex) : null;
   const biNum = borrowIndex != null ? Number(borrowIndex) : null;
   const liFactor =
@@ -841,10 +864,16 @@ const DashboardPage: NextPageWithLayout = () => {
   const numericTotalRepaymentsUsdc = Number(totalRepaymentsUsdc) || 0;
   const principalSuppliedUsdc = Math.max(0, numericTotalDepositsUsdc - numericTotalWithdrawalsUsdc);
   const principalBorrowedUsdc = Math.max(0, numericTotalBorrowsUsdc - numericTotalRepaymentsUsdc);
-  const effectiveSuppliedUsdcVal =
-    effectiveUserSuppliedUsdc != null ? effectiveUserSuppliedUsdc : Number(userSuppliedUsdc) || 0;
-  const effectiveBorrowedUsdcVal =
-    effectiveUserBorrowedUsdc != null ? effectiveUserBorrowedUsdc : Number(userBorrowedUsdc) || 0;
+  const walletMicroUsdcSup = effectiveMicroOrWalletAggregate(effectiveUserSuppliedUsdc, userSuppliedUsdc);
+  const walletMicroUsdcBor = effectiveMicroOrWalletAggregate(effectiveUserBorrowedUsdc, userBorrowedUsdc);
+  const effectiveSuppliedUsdcVal = chainMicroOrWalletMicro(
+    chainBorrowCaps?.realSupplyMicroUsdcx,
+    walletMicroUsdcSup,
+  );
+  const effectiveBorrowedUsdcVal = chainMicroOrWalletMicro(
+    chainBorrowCaps?.realBorrowMicroUsdcx,
+    walletMicroUsdcBor,
+  );
   const liUsdcNum = liquidityIndexUsdc != null ? Number(liquidityIndexUsdc) : null;
   const biUsdcNum = borrowIndexUsdc != null ? Number(borrowIndexUsdc) : null;
   const liUsdcFactor =
@@ -955,32 +984,38 @@ const DashboardPage: NextPageWithLayout = () => {
     }
   };
 
-  /** Replicates `finalize_borrow` caps from chain mappings (same program id for unified v3). */
-  const refreshChainBorrowCaps = useCallback(async () => {
-    if (!publicKey) {
+  /** Portfolio USD + per-asset max borrow/withdraw from mappings (same math as `finalize_*`). Retries wasm/RPC cold start. */
+  const CHAIN_CAPS_RETRY_MS = [0, 120, 320, 700];
+  const refreshChainPortfolioCaps = useCallback(async () => {
+    const addr = publicKey?.trim();
+    if (!addr) {
       setChainBorrowCaps(null);
-      return;
-    }
-    try {
-      const caps = await getCrossCollateralBorrowCapsFromChain(LENDING_POOL_PROGRAM_ID, publicKey);
-      setChainBorrowCaps(caps);
-    } catch {
-      setChainBorrowCaps(null);
-    }
-  }, [publicKey]);
-
-  /** Replicates `finalize_withdraw` caps from chain mappings (cross-asset withdraw). */
-  const refreshChainWithdrawCaps = useCallback(async () => {
-    if (!publicKey) {
       setChainWithdrawCaps(null);
       return;
     }
-    try {
-      const caps = await getCrossCollateralWithdrawCapsFromChain(LENDING_POOL_PROGRAM_ID, publicKey);
-      setChainWithdrawCaps(caps);
-    } catch {
-      setChainWithdrawCaps(null);
+    for (let i = 0; i < CHAIN_CAPS_RETRY_MS.length; i++) {
+      const ms = CHAIN_CAPS_RETRY_MS[i];
+      if (ms > 0) await new Promise((r) => setTimeout(r, ms));
+      try {
+        const [borrow, withdraw] = await Promise.all([
+          getCrossCollateralBorrowCapsFromChain(LENDING_POOL_PROGRAM_ID, addr),
+          getCrossCollateralWithdrawCapsFromChain(LENDING_POOL_PROGRAM_ID, addr),
+        ]);
+        if (borrow && withdraw) {
+          setChainBorrowCaps(borrow);
+          setChainWithdrawCaps(withdraw);
+          return;
+        }
+        if (isDevAppEnv) {
+          console.warn('[chain caps] borrow or withdraw null', { borrow: !!borrow, withdraw: !!withdraw });
+        }
+      } catch (e) {
+        if (isDevAppEnv) console.warn('[chain caps] attempt failed', i, e);
+      }
     }
+    if (isDevAppEnv) console.warn('[chain caps] all retries exhausted for', addr);
+    setChainBorrowCaps(null);
+    setChainWithdrawCaps(null);
   }, [publicKey]);
 
   const refreshPoolState = async (includeUserPosition: boolean = false) => {
@@ -1016,8 +1051,7 @@ const DashboardPage: NextPageWithLayout = () => {
           if (requestRecords) {
             getPrivateCreditsBalance(requestRecords, decrypt).then(setPrivateAleoBalance).catch(() => setPrivateAleoBalance(null));
           }
-          await refreshChainBorrowCaps();
-          await refreshChainWithdrawCaps();
+          await refreshChainPortfolioCaps();
         } catch (error) {
           console.warn('Failed to refresh user position from records:', error);
           setUserSupplied('0');
@@ -1031,7 +1065,8 @@ const DashboardPage: NextPageWithLayout = () => {
           setChainBorrowCaps(null);
           setChainWithdrawCaps(null);
         }
-      } else {
+      } else if (!publicKey?.trim()) {
+        // Guest / disconnected: clear per-wallet rows and portfolio caps.
         setUserSupplied('0');
         setUserBorrowed('0');
         setTotalDeposits('0');
@@ -1044,6 +1079,7 @@ const DashboardPage: NextPageWithLayout = () => {
         setChainBorrowCaps(null);
         setChainWithdrawCaps(null);
       }
+      // Pool-only refresh while wallet connected: do not zero user rows or clear chain caps (see refreshChainPortfolioCaps effect).
     } catch (e) {
       console.error('Failed to fetch pool state', e);
       setStatusMessage('Failed to fetch pool state. Check console for details.');
@@ -1082,8 +1118,7 @@ const DashboardPage: NextPageWithLayout = () => {
             setEffectiveUserBorrowedUsdc(null);
           }
           getPrivateUsdcBalance(requestRecords, decrypt).then(setPrivateUsdcBalance).catch(() => setPrivateUsdcBalance(null));
-          await refreshChainBorrowCaps();
-          await refreshChainWithdrawCaps();
+          await refreshChainPortfolioCaps();
         } catch (error) {
           console.warn('Failed to refresh USDC user position:', error);
           setUserSuppliedUsdc('0');
@@ -1098,7 +1133,7 @@ const DashboardPage: NextPageWithLayout = () => {
           setChainBorrowCaps(null);
           setChainWithdrawCaps(null);
         }
-      } else {
+      } else if (!publicKey?.trim()) {
         setEffectiveUserSuppliedUsdc(null);
         setEffectiveUserBorrowedUsdc(null);
         setPrivateUsdcBalance(null);
@@ -1149,8 +1184,7 @@ const DashboardPage: NextPageWithLayout = () => {
             effectiveBorrow_usad: effective?.effectiveBorrowDebt ?? null,
             privateBalance_usad: privUsad,
           });
-          await refreshChainBorrowCaps();
-          await refreshChainWithdrawCaps();
+          await refreshChainPortfolioCaps();
         } catch (error) {
           console.warn('Failed to refresh USAD user position:', error);
           setUserSuppliedUsad('0');
@@ -1165,19 +1199,30 @@ const DashboardPage: NextPageWithLayout = () => {
           setChainBorrowCaps(null);
           setChainWithdrawCaps(null);
         }
-      } else {
+      } else if (!publicKey?.trim()) {
         setEffectiveUserSuppliedUsad(null);
         setEffectiveUserBorrowedUsad(null);
         setPrivateUsadBalance(null);
         setChainBorrowCaps(null);
         setChainWithdrawCaps(null);
       }
+      // Pool-only refresh while wallet connected: do not clear user rows or chain caps (same as USDC).
     } catch (e) {
       console.error('Failed to fetch USAD pool state', e);
     } finally {
       setIsRefreshingUsadState(false);
     }
   };
+
+  /** Hero / portfolio USD from unified lending mappings (address + RPC only; no private records). */
+  useEffect(() => {
+    if (!connected || !publicKey?.trim()) {
+      setChainBorrowCaps(null);
+      setChainWithdrawCaps(null);
+      return;
+    }
+    void refreshChainPortfolioCaps();
+  }, [connected, publicKey, refreshChainPortfolioCaps]);
 
   // One-time pool state fetch on page load/refresh and when wallet connects.
   // This DOES NOT touch private records / requestRecords to avoid extra wallet prompts.
@@ -1317,7 +1362,7 @@ const DashboardPage: NextPageWithLayout = () => {
       console.log('========================================\n');
       return;
     }
-
+    
     if (!publicKey) {
       const error = 'Public key not available. Please reconnect your wallet.';
       setStatusMessage(error);
@@ -1327,12 +1372,12 @@ const DashboardPage: NextPageWithLayout = () => {
     }
 
     const amountToUse = typeof amountOverride === 'number' ? amountOverride : amount;
-
+    
     try {
       setLoading(true);
       setStatusMessage(`Executing ${action}...`);
       setAmountError(null);
-
+      
       if (amountToUse <= 0) {
         throw new Error('Amount must be greater than zero.');
       }
@@ -1393,8 +1438,8 @@ const DashboardPage: NextPageWithLayout = () => {
 
       // Frontend limit checks (Aleo pool):
       // Program and mappings use micro-ALEO (u64). Convert to ALEO (credits) for comparisons with `amount`.
-      const netSuppliedMicro = effectiveUserSupplied ?? (Number(userSupplied) || 0);
-      const netBorrowedMicro = effectiveUserBorrowed ?? (Number(userBorrowed) || 0);
+      const netSuppliedMicro = effectiveMicroOrWalletAggregate(effectiveUserSupplied, userSupplied);
+      const netBorrowedMicro = effectiveMicroOrWalletAggregate(effectiveUserBorrowed, userBorrowed);
       const poolSuppliedMicro = Number(totalSupplied) || 0;
       const poolBorrowedMicro = Number(totalBorrowed) || 0;
 
@@ -1506,7 +1551,7 @@ const DashboardPage: NextPageWithLayout = () => {
       setTxId(null);
       setTxFinalized(false);
       setStatusMessage('Transaction submitted. Waiting for finalization…');
-
+      
       console.log('📤 Transaction ID:', tx);
       console.log('⏳ Starting finalization polling...');
 
@@ -1615,7 +1660,16 @@ const DashboardPage: NextPageWithLayout = () => {
       setAmount(0);
       console.log('📋 Refreshing pool and user position after transaction finalization...');
       try {
+        // Cross-asset repay updates every asset's scaled borrow on-chain; refresh all rows.
+        if (action === 'repay') {
+          await Promise.all([
+            refreshPoolState(true),
+            refreshUsdcPoolState(true),
+            refreshUsadPoolState(true),
+          ]);
+        } else {
         await refreshPoolState(true);
+        }
         if (action === 'withdraw' || action === 'borrow') {
           setStatusMessage('Transaction finalized! Vault transfer will be done in 1–5 min — check status in Transaction History.');
         } else {
@@ -1633,11 +1687,11 @@ const DashboardPage: NextPageWithLayout = () => {
       if (process.env.NODE_ENV === 'development') {
         console.warn(`[${action}]`, displayMsg, e);
       }
-
+      
       // Detect wallet cancellation/rejection
       const errorMsg = displayMsg.toLowerCase();
       const isCancelled = errorMsg.includes('cancel') || errorMsg.includes('reject') || errorMsg.includes('denied') || errorMsg.includes('user rejected');
-
+      
       if (isCancelled) {
         setStatusMessage('Transaction cancelled by user.');
         if (!isDevAppEnv) {
@@ -1839,8 +1893,8 @@ const DashboardPage: NextPageWithLayout = () => {
       }
       const amountMicro = Math.round(amountToUse * 1_000_000);
       const USDC_SCALE = 1_000_000;
-      const netSuppliedMicro = (effectiveUserSuppliedUsdc ?? Number(userSuppliedUsdc)) || 0;
-      const netBorrowedMicro = (effectiveUserBorrowedUsdc ?? Number(userBorrowedUsdc)) || 0;
+      const netSuppliedMicro = effectiveMicroOrWalletAggregate(effectiveUserSuppliedUsdc, userSuppliedUsdc);
+      const netBorrowedMicro = effectiveMicroOrWalletAggregate(effectiveUserBorrowedUsdc, userBorrowedUsdc);
       const poolSuppliedMicro = Number(totalSuppliedUsdc) || 0;
       const poolBorrowedMicro = Number(totalBorrowedUsdc) || 0;
       const netSuppliedHuman = netSuppliedMicro / USDC_SCALE;
@@ -2037,7 +2091,15 @@ const DashboardPage: NextPageWithLayout = () => {
       }
       setAmountUsdc(0);
       try {
+        if (action === 'repay') {
+          await Promise.all([
+            refreshPoolState(true),
+            refreshUsdcPoolState(true),
+            refreshUsadPoolState(true),
+          ]);
+        } else {
         await refreshUsdcPoolState(true);
+        }
         setStatusMessage('Transaction finalized! Pool refreshed.');
         if (!isDevAppEnv) setTimeout(() => setStatusMessage(''), 2500);
       } catch {
@@ -2114,8 +2176,8 @@ const DashboardPage: NextPageWithLayout = () => {
 
       const amountMicro = Math.round(amountToUse * 1_000_000);
       const USAD_SCALE = 1_000_000;
-      const netSuppliedMicro = (effectiveUserSuppliedUsad ?? Number(userSuppliedUsad)) || 0;
-      const netBorrowedMicro = (effectiveUserBorrowedUsad ?? Number(userBorrowedUsad)) || 0;
+      const netSuppliedMicro = effectiveMicroOrWalletAggregate(effectiveUserSuppliedUsad, userSuppliedUsad);
+      const netBorrowedMicro = effectiveMicroOrWalletAggregate(effectiveUserBorrowedUsad, userBorrowedUsad);
       const poolSuppliedMicro = Number(totalSuppliedUsad) || 0;
       const poolBorrowedMicro = Number(totalBorrowedUsad) || 0;
 
@@ -2323,7 +2385,15 @@ const DashboardPage: NextPageWithLayout = () => {
 
       setAmountUsad(0);
       try {
-        await refreshUsadPoolState(true);
+        if (action === 'repay') {
+          await Promise.all([
+            refreshPoolState(true),
+            refreshUsdcPoolState(true),
+            refreshUsadPoolState(true),
+          ]);
+        } else {
+          await refreshUsadPoolState(true);
+        }
         setStatusMessage('Transaction finalized! Pool refreshed.');
         if (!isDevAppEnv) setTimeout(() => setStatusMessage(''), 2500);
       } catch {
@@ -2361,7 +2431,7 @@ const DashboardPage: NextPageWithLayout = () => {
       setStatusMessage(`Creating ${testCreditsAmount} test credits...`);
 
       const tx = await createTestCredits(requestTransaction, publicKey, testCreditsAmount);
-
+      
       setTxId(null);
       setTxFinalized(false);
       setStatusMessage('Test credits creation submitted. Waiting for finalization…');
@@ -2373,19 +2443,19 @@ const DashboardPage: NextPageWithLayout = () => {
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
-
+        
         if (transactionStatus) {
           try {
             const status = await transactionStatus(tx);
             console.log(`🧪 Create Test Credits: Poll attempt ${attempt}/${maxAttempts}, status:`, status);
-
+            
             if (status && (status.status === 'Finalized' || (status as any).finalized)) {
               finalized = true;
               const resolvedId = (typeof status === 'object' && (status as any).transactionId) || tx;
               setTxId(isExplorerHash(resolvedId) ? resolvedId : null);
               setTxFinalized(true);
               setStatusMessage(`✅ Test credits created successfully! You should now have a Credits record with ${testCreditsAmount} credits (${testCreditsAmount * 1_000_000} microcredits) in your wallet.`);
-
+              
               // Fetch records in background to update UI
               fetchRecordsInBackground();
               break;
@@ -2440,7 +2510,7 @@ const DashboardPage: NextPageWithLayout = () => {
       setStatusMessage(`Testing deposit with ${amount} credits...`);
 
       const tx = await depositTestReal(requestTransaction, publicKey, amount, requestRecords);
-
+      
       setTxId(null);
       setTxFinalized(false);
       setStatusMessage('Deposit test submitted. Waiting for finalization…');
@@ -2452,19 +2522,19 @@ const DashboardPage: NextPageWithLayout = () => {
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
-
+        
         if (transactionStatus) {
           try {
             const status = await transactionStatus(tx);
             console.log(`🧪 Deposit Test Real: Poll attempt ${attempt}/${maxAttempts}, status:`, status);
-
+            
             if (status && (status.status === 'Finalized' || (status as any).finalized)) {
               finalized = true;
               const resolvedId = (typeof status === 'object' && (status as any).transactionId) || tx;
               setTxId(isExplorerHash(resolvedId) ? resolvedId : null);
               setTxFinalized(true);
               setStatusMessage(`✅ Deposit test completed successfully! The test validates that real Aleo credits records work correctly. If this succeeded, your Credits record format is correct.`);
-
+              
               // Fetch records in background to update UI
               fetchRecordsInBackground();
               break;
@@ -2514,7 +2584,7 @@ const DashboardPage: NextPageWithLayout = () => {
       setStatusMessage('Accruing interest...');
 
       const tx = await lendingAccrueInterest(executeTransaction);
-
+      
       setTxId(null);
       setTxFinalized(false);
       setStatusMessage('Interest accrual submitted. Waiting for finalization…');
@@ -2526,36 +2596,36 @@ const DashboardPage: NextPageWithLayout = () => {
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
+        
+          try {
+            const statusResult = await transactionStatus(tx);
+            console.log(`📊 Accrue interest status (attempt ${attempt}):`, statusResult);
 
-        try {
-          const statusResult = await transactionStatus(tx);
-          console.log(`📊 Accrue interest status (attempt ${attempt}):`, statusResult);
+            const statusText =
+              typeof statusResult === 'string'
+                ? statusResult
+                : (statusResult as any)?.status ?? '';
+            const statusLower = (statusText || '').toLowerCase();
 
-          const statusText =
-            typeof statusResult === 'string'
-              ? statusResult
-              : (statusResult as any)?.status ?? '';
-          const statusLower = (statusText || '').toLowerCase();
-
-          if (statusLower === 'finalized' || statusLower === 'accepted') {
-            finalized = true;
+            if (statusLower === 'finalized' || statusLower === 'accepted') {
+              finalized = true;
             const resolvedId =
               (typeof statusResult === 'object' && (statusResult as any).transactionId) || tx;
-            setTxId(isExplorerHash(resolvedId) ? resolvedId : null);
-            setTxFinalized(true);
-            // Fetch records in background after interest accrual finalizes
-            if (requestRecords && publicKey) {
-              console.log('📋 Interest accrual finalized - fetching records in background...');
-              fetchRecordsInBackground(LENDING_POOL_PROGRAM_ID);
+              setTxId(isExplorerHash(resolvedId) ? resolvedId : null);
+              setTxFinalized(true);
+              // Fetch records in background after interest accrual finalizes
+              if (requestRecords && publicKey) {
+                console.log('📋 Interest accrual finalized - fetching records in background...');
+                fetchRecordsInBackground(LENDING_POOL_PROGRAM_ID);
+              }
+              break;
             }
-            break;
-          }
-          setStatusMessage(
-            `Interest accrual ${statusText || 'pending'}... (attempt ${attempt}/${maxAttempts})`,
-          );
-        } catch (e) {
+            setStatusMessage(
+              `Interest accrual ${statusText || 'pending'}... (attempt ${attempt}/${maxAttempts})`,
+            );
+          } catch (e) {
           // If transactionStatus fails, continue polling; assume finalized at max wait.
-          console.warn('Failed to check transaction status:', e);
+            console.warn('Failed to check transaction status:', e);
           if (attempt === maxAttempts) {
             finalized = true;
           }
@@ -2585,11 +2655,11 @@ const DashboardPage: NextPageWithLayout = () => {
       }
     } catch (e: any) {
       console.error('Accrue interest error:', e);
-
+      
       // Detect wallet cancellation/rejection
       const errorMsg = String(e?.message || e || '').toLowerCase();
       const isCancelled = errorMsg.includes('cancel') || errorMsg.includes('reject') || errorMsg.includes('denied') || errorMsg.includes('user rejected');
-
+      
       if (isCancelled) {
         setStatusMessage('Transaction cancelled by user.');
         if (!isDevAppEnv) {
@@ -2712,13 +2782,27 @@ const DashboardPage: NextPageWithLayout = () => {
     };
   }, [isDevAppEnv]);
 
-  // Display values for merged Aave-style view (human units)
-  const supplyBalanceAleo = ((effectiveUserSupplied ?? Number(userSupplied)) || 0) / 1_000_000;
-  const supplyBalanceUsdc = ((effectiveUserSuppliedUsdc ?? Number(userSuppliedUsdc)) || 0) / 1_000_000;
-  const supplyBalanceUsad = ((effectiveUserSuppliedUsad ?? Number(userSuppliedUsad)) || 0) / 1_000_000;
-  const borrowDebtAleo = ((effectiveUserBorrowed ?? Number(userBorrowed)) || 0) / 1_000_000;
-  const borrowDebtUsdc = ((effectiveUserBorrowedUsdc ?? Number(userBorrowedUsdc)) || 0) / 1_000_000;
-  const borrowDebtUsad = ((effectiveUserBorrowedUsad ?? Number(userBorrowedUsad)) || 0) / 1_000_000;
+  // Display values for merged Aave-style view (human units).
+  // Prefer unified pool mappings via chain caps (same as finalize_*) — wallet records often lag after deposit.
+  const MICRO = 1_000_000;
+  const supplyAleoWallet = effectiveMicroOrWalletAggregate(effectiveUserSupplied, userSupplied) / MICRO;
+  const supplyUsdcWallet = effectiveMicroOrWalletAggregate(effectiveUserSuppliedUsdc, userSuppliedUsdc) / MICRO;
+  const supplyUsadWallet = effectiveMicroOrWalletAggregate(effectiveUserSuppliedUsad, userSuppliedUsad) / MICRO;
+  const borrowAleoWallet = effectiveMicroOrWalletAggregate(effectiveUserBorrowed, userBorrowed) / MICRO;
+  const borrowUsdcWallet = effectiveMicroOrWalletAggregate(effectiveUserBorrowedUsdc, userBorrowedUsdc) / MICRO;
+  const borrowUsadWallet = effectiveMicroOrWalletAggregate(effectiveUserBorrowedUsad, userBorrowedUsad) / MICRO;
+  const supplyBalanceAleo =
+    chainMicroOrWalletMicro(chainBorrowCaps?.realSupplyMicroAleo, supplyAleoWallet * MICRO) / MICRO;
+  const supplyBalanceUsdc =
+    chainMicroOrWalletMicro(chainBorrowCaps?.realSupplyMicroUsdcx, supplyUsdcWallet * MICRO) / MICRO;
+  const supplyBalanceUsad =
+    chainMicroOrWalletMicro(chainBorrowCaps?.realSupplyMicroUsad, supplyUsadWallet * MICRO) / MICRO;
+  const borrowDebtAleo =
+    chainMicroOrWalletMicro(chainBorrowCaps?.realBorrowMicroAleo, borrowAleoWallet * MICRO) / MICRO;
+  const borrowDebtUsdc =
+    chainMicroOrWalletMicro(chainBorrowCaps?.realBorrowMicroUsdcx, borrowUsdcWallet * MICRO) / MICRO;
+  const borrowDebtUsad =
+    chainMicroOrWalletMicro(chainBorrowCaps?.realBorrowMicroUsad, borrowUsadWallet * MICRO) / MICRO;
   const totalSupplyBalance = supplyBalanceAleo + supplyBalanceUsdc + supplyBalanceUsad; // mixed units for count only
   const totalBorrowDebt = borrowDebtAleo + borrowDebtUsdc + borrowDebtUsad;
   // V2 cross-collateral portfolio estimates (UI-only; contract is source of truth).
@@ -2766,10 +2850,10 @@ const DashboardPage: NextPageWithLayout = () => {
     chainBorrowCaps != null
       ? Math.max(0, Number(chainBorrowCaps.totalCollateralUsd) / 1_000_000)
       : weightedCollateralUsd;
-  const healthFactor =
-    totalDebtUsdForHf > 1e-9
-      ? weightedCollateralUsdForHf / totalDebtUsdForHf
-      : null;
+  /** Ratio-style HF; `null` when no meaningful debt (or debt rounds to $0.00 in the UI). */
+  const healthFactorFromUsd = (weightedUsd: number, debtUsd: number): number | null =>
+    debtUsd > 1e-9 && Number(debtUsd.toFixed(2)) > 0 ? weightedUsd / debtUsd : null;
+  const healthFactor = healthFactorFromUsd(weightedCollateralUsdForHf, totalDebtUsdForHf);
 
   // Suggested "repay max" per selected repay asset.
   // Repay is cross-asset; when chain-derived totals are unavailable, fall back to the UI's
@@ -2786,7 +2870,10 @@ const DashboardPage: NextPageWithLayout = () => {
   const repaySuggestedUsadHuman =
     USAD_PRICE_USD > 0 ? portfolioDebtUsdForRepay / USAD_PRICE_USD : 0;
 
-  const hasAnyDebt = borrowDebtAleo > 0 || borrowDebtUsdc > 0 || borrowDebtUsad > 0;
+  const hasAnyDebt =
+    chainBorrowCaps != null
+      ? chainBorrowCaps.totalDebtUsd > BigInt(0)
+      : borrowDebtAleo > 0 || borrowDebtUsdc > 0 || borrowDebtUsad > 0;
 
   // Simple loading flags for balances
   const walletBalancesLoading = connected && !userPositionInitialized;
@@ -2943,9 +3030,9 @@ const DashboardPage: NextPageWithLayout = () => {
             : availableWithdrawUsad
         : actionModalMode === 'repay'
           ? Math.min(privateBalanceModal, repaySuggestedModalHuman)
-          : actionModalMode === 'borrow'
+        : actionModalMode === 'borrow'
             ? modalBorrowPortfolioMax
-            : debtBalanceModal;
+          : debtBalanceModal;
 
   const remainingSupply = actionModalMode === 'withdraw'
     ? Math.max(0, modalMaxAmount - modalAmount)
@@ -2955,7 +3042,7 @@ const DashboardPage: NextPageWithLayout = () => {
         ? debtBalanceModal + modalAmount
         : actionModalMode === 'repay'
           ? remainingDebtSelectedAssetAfterRepay
-          : Math.max(0, debtBalanceModal - modalAmount);
+        : Math.max(0, debtBalanceModal - modalAmount);
 
   // Estimated post-action portfolio for modal preview (V2 cross-collateral UX).
   const postSupplyAleo =
@@ -3023,7 +3110,7 @@ const DashboardPage: NextPageWithLayout = () => {
       : postDebtAleo * ALEO_PRICE_USD +
       postDebtUsdc * USDCX_PRICE_USD +
       postDebtUsad * USAD_PRICE_USD;
-  const postHealthFactor = postTotalDebtUsd > 0 ? postWeightedCollateralUsd / postTotalDebtUsd : null;
+  const postHealthFactor = healthFactorFromUsd(postWeightedCollateralUsd, postTotalDebtUsd);
 
   type ManageTab = 'Supply' | 'Withdraw' | 'Borrow' | 'Repay';
   type AssetKey = 'aleo' | 'usdc' | 'usad';
@@ -3106,7 +3193,7 @@ const DashboardPage: NextPageWithLayout = () => {
         ? remainingDebtUsdAfterRepay
         : postDebtAleo * ALEO_PRICE_USD + postDebtUsdc * USDCX_PRICE_USD + postDebtUsad * USAD_PRICE_USD;
 
-    const postHealthFactor = postTotalDebtUsd > 0 ? postWeightedCollateralUsd / postTotalDebtUsd : null;
+    const postHealthFactor = healthFactorFromUsd(postWeightedCollateralUsd, postTotalDebtUsd);
 
     const remainingAfter =
       tab === 'Supply'
@@ -3260,7 +3347,7 @@ const DashboardPage: NextPageWithLayout = () => {
   };
 
   useEffect(() => {
-    if (!connected) return;
+    if (!connected || !dashboardDataReady) return;
     console.log('[Portfolio pricing] resolved prices', {
       aleo: { usd: ALEO_PRICE_USD, source: ALEO_PRICE_SOURCE, raw: assetPriceAleo },
       usdcx: { usd: USDCX_PRICE_USD, source: USDCX_PRICE_SOURCE, raw: assetPriceUsdc },
@@ -3268,6 +3355,7 @@ const DashboardPage: NextPageWithLayout = () => {
     });
   }, [
     connected,
+    dashboardDataReady,
     ALEO_PRICE_USD,
     USDCX_PRICE_USD,
     USAD_PRICE_USD,
@@ -3279,9 +3367,10 @@ const DashboardPage: NextPageWithLayout = () => {
     assetPriceUsad,
   ]);
 
+  /** UI-row estimate only (per-asset supplied × price). Hero metrics use `chainBorrowCaps` when set. */
   useEffect(() => {
-    if (!connected) return;
-    console.log('[Portfolio estimate] collateral and weighted collateral', {
+    if (!connected || !dashboardDataReady) return;
+    console.log('[Portfolio estimate] per-asset USD from displayed supply/borrow (chain-backed when caps loaded)', {
       totalCollateralUsd,
       weightedCollateralUsd,
       breakdown: {
@@ -3310,6 +3399,7 @@ const DashboardPage: NextPageWithLayout = () => {
     });
   }, [
     connected,
+    dashboardDataReady,
     totalCollateralUsd,
     weightedCollateralUsd,
     supplyBalanceAleo,
@@ -3423,25 +3513,28 @@ const DashboardPage: NextPageWithLayout = () => {
                     </div>
                     <div className="flex items-center justify-between mt-2 text-sm text-slate-500">
                       <span>
-                        {actionModalMode === 'withdraw'
+                      {actionModalMode === 'withdraw'
                           ? `Available Withdrawable: ${modalMaxAmount.toFixed(2)} ${actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'}`
-                          : actionModalMode === 'deposit'
+                        : actionModalMode === 'deposit'
                             ? `Wallet: ${privateBalanceModal.toFixed(2)}`
-                            : actionModalMode === 'borrow'
+                          : actionModalMode === 'borrow'
                               ? `Max borrow: ${modalBorrowPortfolioMax.toFixed(4)} ${actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'}`
                               : `Max repay: ${repaySuggestedModalHuman.toFixed(4)} ${actionModalAsset === 'aleo' ? 'ALEO' : actionModalAsset === 'usdc' ? 'USDCx' : 'USAD'}`}
                       </span>
-                      <button
-                        type="button"
+                        <button
+                          type="button"
                         className="text-xs font-bold text-cyan-400 hover:text-cyan-300 transition-colors ml-2"
-                        onClick={() => {
+                          onClick={() => {
                           const maxVal = actionModalMode === 'withdraw'
                             ? (actionModalAsset === 'aleo' ? availableWithdrawAleo : actionModalAsset === 'usdc' ? availableWithdrawUsdc : availableWithdrawUsad)
                             : actionModalMode === 'deposit' ? privateBalanceModal
                               : actionModalMode === 'repay' ? Math.min(privateBalanceModal, repaySuggestedModalHuman)
                                 : actionModalMode === 'borrow' ? modalBorrowPortfolioMax
-                                  : debtBalanceModal;
-                          const adjusted = amountForMaxButton(maxVal);
+                                    : debtBalanceModal;
+                          const adjusted =
+                            actionModalMode === 'borrow'
+                              ? borrowMaxInputAmount(maxVal)
+                              : maxVal;
                           setModalAmountInput(adjusted.toFixed(2));
                           if (actionModalAsset === 'usdc') setAmountUsdc(adjusted);
                           else if (actionModalAsset === 'usad') setAmountUsad(adjusted);
@@ -3463,13 +3556,13 @@ const DashboardPage: NextPageWithLayout = () => {
                         <span>{actionModalMode === 'borrow' ? 'Total debt after (USD est.)' : 'Remaining total debt (USD est.)'}</span>
                         <span className="text-white font-mono">
                           ${(actionModalMode === 'borrow' ? postTotalDebtUsd : remainingDebtUsdAfterRepay).toFixed(2)}
-                        </span>
-                      </div>
+                      </span>
+                    </div>
                     )}
                     <div className="flex justify-between text-sm text-slate-400">
                       <span>Est. weighted collateral (USD)</span>
                       <span className="text-white font-mono">${postWeightedCollateralUsd.toFixed(2)}</span>
-                    </div>
+                  </div>
                     {(actionModalMode !== 'borrow' && actionModalMode !== 'repay') && (
                       <div className="flex justify-between text-sm text-slate-400">
                         <span>Est. total debt (USD)</span>
@@ -3485,9 +3578,9 @@ const DashboardPage: NextPageWithLayout = () => {
                     {postHealthFactor != null && postHealthFactor < 1 && (
                       <div className="rounded-lg px-3 py-2 text-xs text-red-400" style={{ backgroundColor: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)' }}>
                         Estimated health factor is below 1.0. This action is likely to fail on-chain.
-                      </div>
-                    )}
                   </div>
+                    )}
+                    </div>
                   {(actionModalAsset === 'aleo' ? amountError : actionModalAsset === 'usdc' ? amountErrorUsdc : amountErrorUsad) && (
                     <div className="rounded-lg px-4 py-3 text-sm text-red-400" style={{ backgroundColor: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)' }}>
                       {actionModalAsset === 'aleo' ? amountError : actionModalAsset === 'usdc' ? amountErrorUsdc : amountErrorUsad}
@@ -3498,7 +3591,7 @@ const DashboardPage: NextPageWithLayout = () => {
                   )}
                   <button
                     type="button"
-                    disabled={loading || !modalAmount || modalAmount <= 0 || !amountWithinMax(modalAmount, modalMaxAmount)}
+                    disabled={loading || !modalAmount || modalAmount <= 0 || !amountWithinMax(modalAmount, modalMaxAmount, actionModalMode === 'borrow' || actionModalMode === 'repay' ? BORROW_REPAY_MAX_TEST_SLACK_MICRO : 0)}
                     onClick={async () => {
                       if (actionModalAsset === 'usdc') await handleActionUsdc(actionModalMode);
                       else if (actionModalAsset === 'usad') await handleActionUsad(actionModalMode);
@@ -3508,7 +3601,7 @@ const DashboardPage: NextPageWithLayout = () => {
                     style={{ background: 'linear-gradient(to right, #22d3ee, #6366f1)', color: '#030712' }}
                   >
                     {loading ? <span className="loading loading-spinner loading-sm" /> : null}
-                    {!modalAmount || modalAmount <= 0 ? 'Enter an amount' : !amountWithinMax(modalAmount, modalMaxAmount) ? 'Amount too high' : actionModalTitle}
+                    {!modalAmount || modalAmount <= 0 ? 'Enter an amount' : !amountWithinMax(modalAmount, modalMaxAmount, actionModalMode === 'borrow' || actionModalMode === 'repay' ? BORROW_REPAY_MAX_TEST_SLACK_MICRO : 0) ? 'Amount too high' : actionModalTitle}
                   </button>
                 </>
               ) : (
@@ -3589,10 +3682,10 @@ const DashboardPage: NextPageWithLayout = () => {
               <div className="relative mb-8">
                 <div className="w-24 h-24 rounded-full border border-white/5 flex items-center justify-center" style={{ backgroundColor: 'rgba(30,41,59,0.3)', animation: 'float 6s ease-in-out infinite' }}>
                   <svg className="w-10 h-10" style={{ color: '#475569' }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><line x1="17" y1="8" x2="23" y2="14" /><line x1="23" y1="8" x2="17" y2="14" /></svg>
-                </div>
+            </div>
                 <div className="absolute -bottom-2 -right-2 w-10 h-10 rounded-full border border-cyan-500/30 flex items-center justify-center" style={{ ...dashGlass, backgroundColor: '#030712' }}>
                   <svg className="w-5 h-5 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></svg>
-                </div>
+            </div>
               </div>
               <h2 className="text-2xl font-bold mb-3 text-white">Please, connect your wallet</h2>
               <p className="text-slate-400 max-w-md mx-auto mb-10">
@@ -3662,8 +3755,8 @@ const DashboardPage: NextPageWithLayout = () => {
               ))}
               <div className="px-8 py-4 flex items-center" style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
                 <div className="h-3 w-52 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }} />
+                </div>
               </div>
-            </div>
 
             <section className="mb-10">
               <div className="flex items-center justify-between mb-6">
@@ -3745,14 +3838,14 @@ const DashboardPage: NextPageWithLayout = () => {
                         <div className="flex items-center gap-3 min-w-0">
                           <img src={asset.image} alt={asset.label} className="w-8 h-8 rounded-lg shrink-0" />
                           <p className="font-semibold text-white truncate">{asset.label}</p>
-                        </div>
+                </div>
                     <div className="font-mono text-slate-300">{asset.wallet.toFixed(2)}</div>
                     <div className="flex flex-col gap-0.5">
                       <span className="font-mono text-cyan-400">{asset.supplied.toFixed(2)}</span>
                       <span className="font-mono text-xs text-cyan-400/75 tabular-nums normal-case tracking-normal">
                         APY: {(asset.sApy * 100).toFixed(2)}%
                       </span>
-                    </div>
+              </div>
                     <div className="flex flex-col gap-0.5">
                       <span className="font-mono text-indigo-400">{asset.borrowed.toFixed(2)}</span>
                       <span className="font-mono text-xs text-indigo-400/75 tabular-nums normal-case tracking-normal">
@@ -3822,7 +3915,7 @@ const DashboardPage: NextPageWithLayout = () => {
                                       <span>
                                         Available Withdrawable (USD):{' '}
                                         <span className="tabular-nums text-slate-200">${portfolioWithdrawUsd.toFixed(2)}</span>
-                                      </span>
+                            </span>
                                       <InfoTooltip variant="onDark" tip={withdrawOnlyTip} />
                                     </div>
                                   )}
@@ -3841,7 +3934,7 @@ const DashboardPage: NextPageWithLayout = () => {
                                         <span>
                                           Total Debt (USD):{' '}
                                           <span className="tabular-nums text-indigo-300">${totalDebtUsdForHf.toFixed(2)}</span>
-                                        </span>
+                            </span>
                                         <InfoTooltip variant="onDark" tip={totalDebtTip} />
                                       </div>
                                       <div className="flex items-center justify-end gap-0.5 text-slate-400">
@@ -3867,7 +3960,9 @@ const DashboardPage: NextPageWithLayout = () => {
                               <button
                                 onClick={async () => {
                                   const m = await resolveInlineMaxAmount(activeManageTab, asset.id);
-                                  setManageAmountInput(amountForMaxButton(m).toFixed(2));
+                                  const fill =
+                                    activeManageTab === 'Borrow' ? borrowMaxInputAmount(m) : m;
+                                  setManageAmountInput(fill.toFixed(2));
                                 }}
                                 type="button"
                                 className="text-sm font-bold text-cyan-400 hover:text-cyan-300 px-4 py-2.5 rounded-xl transition-colors uppercase tracking-wide"
@@ -3883,7 +3978,8 @@ const DashboardPage: NextPageWithLayout = () => {
                                 onClick={() => {
                                   (async () => {
                                     const m = await resolveInlineMaxAmount(activeManageTab, asset.id);
-                                    const cap = amountForMaxButton(m);
+                                    const cap =
+                                      activeManageTab === 'Borrow' ? borrowMaxInputAmount(m) : m;
                                     setManageAmountInput(((cap * pct) / 100).toFixed(2));
                                   })();
                                 }}
@@ -3912,11 +4008,15 @@ const DashboardPage: NextPageWithLayout = () => {
                             disabled={(() => {
                               const r = Number(manageAmountInput);
                               const m = getInlineMaxAmount(activeManageTab, asset.id);
+                              const borrowRepaySlack =
+                                activeManageTab === 'Borrow' || activeManageTab === 'Repay'
+                                  ? BORROW_REPAY_MAX_TEST_SLACK_MICRO
+                                  : 0;
                               return (
                                 loading ||
                                 !Number.isFinite(r) ||
                                 (activeManageTab === 'Repay' && !hasAnyDebt) ||
-                                !amountWithinMax(r, m)
+                                !amountWithinMax(r, m, borrowRepaySlack)
                               );
                             })()}
                             className="w-full font-bold py-5 rounded-3xl text-xl sm:text-[1.35rem] transition-all disabled:opacity-40 disabled:cursor-not-allowed min-h-[60px] shadow-lg shadow-cyan-950/20"
@@ -3924,7 +4024,7 @@ const DashboardPage: NextPageWithLayout = () => {
                           >
                             {activeManageTab} {asset.label}
                           </button>
-                        </div>
+                </div>
                         <div className="rounded-3xl p-8 lg:p-9 w-full" style={{ backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
                           <h3 className="text-base font-semibold text-slate-200 font-mono tracking-tight mb-8">Transaction Overview</h3>
                           {(() => {
@@ -3938,7 +4038,7 @@ const DashboardPage: NextPageWithLayout = () => {
                                       {activeManageTab === 'Borrow' ? 'Total debt after (USD est.)' : 'Remaining total debt (USD est.)'}
                                     </p>
                                     <p className="font-mono text-xl text-white tracking-tight">${preview.postTotalDebtUsd.toFixed(2)}</p>
-                                  </div>
+              </div>
                                 ) : (
                                   <div>
                                     <p className="text-xs font-mono uppercase tracking-wider text-slate-500 mb-2">{preview.remainingAfterLabel}</p>
@@ -3964,12 +4064,12 @@ const DashboardPage: NextPageWithLayout = () => {
                                 {isThisInline && txFinalized && txId && (
                                   <a href={getProvableExplorerTxUrl(txId)} target="_blank" rel="noopener noreferrer" className="text-cyan-400 text-sm font-mono block pt-2 hover:text-cyan-300">View in explorer ↗</a>
                                 )}
-                              </div>
+                </div>
                             );
                           })()}
-                        </div>
-                      </div>
-                    </div>
+              </div>
+            </div>
+          </div>
                   )}
                 </div>
               ))}
@@ -3990,13 +4090,13 @@ const DashboardPage: NextPageWithLayout = () => {
                   className="px-4 py-1.5 rounded-lg text-xs font-mono text-slate-400 hover:text-white transition-colors disabled:opacity-40" style={dashGlass}>
                   {txHistoryLoading ? 'Loading…' : 'REFRESH'}
                 </button>
-              </div>
+          </div>
             </div>
-            {txHistoryError ? (
+          {txHistoryError ? (
               <div className="rounded-2xl p-6 text-sm" style={{ backgroundColor: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)' }}>
                 <p className="font-medium text-amber-400">Could not load transaction history</p>
                 <p className="mt-1 text-amber-300/70">{txHistoryError}</p>
-              </div>
+            </div>
             ) : (
               <div className="rounded-[32px] overflow-hidden" style={dashGlass}>
                 <table className="w-full text-left border-collapse">
@@ -4059,30 +4159,30 @@ const DashboardPage: NextPageWithLayout = () => {
                   </tbody>
                 </table>
                 {txHistory.length > 10 && (() => {
-                  const pageSize = 10;
-                  const totalPages = Math.max(1, Math.ceil(txHistory.length / pageSize));
+                    const pageSize = 10;
+                    const totalPages = Math.max(1, Math.ceil(txHistory.length / pageSize));
                   const cur = Math.min(txHistoryPage, totalPages);
-                  return (
+                    return (
                     <div className="flex items-center justify-between px-8 py-4 text-xs text-slate-500 font-mono" style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
                       <span>Showing {(cur - 1) * pageSize + 1}–{Math.min(cur * pageSize, txHistory.length)} of {txHistory.length}</span>
                       <div className="flex gap-2">
                         <button disabled={cur === 1} onClick={() => setTxHistoryPage(p => Math.max(1, p - 1))} className="px-3 py-1 rounded-lg disabled:opacity-40" style={dashGlass}>Prev</button>
                         <span className="px-2 py-1">Page {cur} of {totalPages}</span>
                         <button disabled={cur === totalPages} onClick={() => setTxHistoryPage(p => Math.min(totalPages, p + 1))} className="px-3 py-1 rounded-lg disabled:opacity-40" style={dashGlass}>Next</button>
-                      </div>
+                        </div>
                     </div>
-                  );
-                })()}
-              </div>
-            )}
+                    );
+                  })()}
+                </div>
+              )}
           </section>
-        )}
+          )}
 
         {/* Dev diagnostics panel */}
-        {isDevAppEnv && (
+      {isDevAppEnv && (
           <div className="rounded-2xl p-6 space-y-4 mb-10" style={{ ...dashGlass, border: '2px solid rgba(6,182,212,0.3)' }}>
             <h2 className="text-xl font-semibold text-white">📊 Frontend Diagnostics & Logs</h2>
-            <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap gap-2">
               {[
                 { label: '📋 View Summary', onClick: () => { setLogsSummary(frontendLogger.getSummary()); setShowLogsPanel(true); } },
                 { label: '💾 Download Logs (TXT)', onClick: () => frontendLogger.downloadLogsAsFile('text') },
@@ -4093,8 +4193,8 @@ const DashboardPage: NextPageWithLayout = () => {
                 <button key={btn.label} onClick={btn.onClick} className="px-4 py-2 rounded-xl text-sm text-slate-300 hover:text-white transition-colors" style={dashGlass}>{btn.label}</button>
               ))}
               <button onClick={() => { if (requestRecords && publicKey) { debugAllRecords(requestRecords, publicKey).then(r => { console.log('Diagnostic results:', r); setStatusMessage('✅ Diagnostic complete.'); }); } else { setStatusMessage('❌ Wallet not connected'); } }} disabled={!connected} className="px-4 py-2 rounded-xl text-sm text-slate-300 hover:text-white transition-colors disabled:opacity-40" style={dashGlass}>🔍 Run Diagnosis</button>
-            </div>
-            {showLogsPanel && logsSummary && (
+          </div>
+          {showLogsPanel && logsSummary && (
               <div className="rounded-xl p-4 space-y-2 max-h-96 overflow-y-auto" style={{ backgroundColor: 'rgba(255,255,255,0.03)' }}>
                 <h3 className="font-semibold text-white">📊 Session Summary</h3>
                 <div className="grid grid-cols-2 gap-2 text-sm text-slate-400">
@@ -4103,32 +4203,32 @@ const DashboardPage: NextPageWithLayout = () => {
                   <div>Warnings: <span className="text-amber-400 font-semibold">{logsSummary.warnings}</span></div>
                   <div>Duration: <span className="text-white font-semibold">{(logsSummary.sessionDuration / 1000).toFixed(1)}s</span></div>
                 </div>
-              </div>
-            )}
-          </div>
-        )}
+            </div>
+          )}
+        </div>
+      )}
 
         {/* Status / tx details */}
-        {isDevAppEnv ? (
-          <>
-            {statusMessage && (
+      {isDevAppEnv ? (
+        <>
+          {statusMessage && (
               <div className={`rounded-lg px-4 py-3 text-sm mb-4 ${statusMessage.includes('error') || statusMessage.includes('Failed') ? 'text-red-400 bg-red-500/10 border border-red-500/30' : 'text-slate-300 bg-white/5 border border-white/10'}`}>
                 {statusMessage}
-              </div>
-            )}
-            {txId && (
+            </div>
+          )}
+          {txId && (
               <div className="rounded-xl p-4 max-w-xl mb-4" style={dashGlass}>
                 <h3 className="font-semibold text-white mb-2">Last Transaction ID {txFinalized && <span className="ml-2 text-xs text-emerald-400 border border-emerald-400/30 px-2 py-0.5 rounded-full">Finalized</span>}</h3>
                 <pre className="text-xs text-slate-400 break-all p-2 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.03)' }}>{txId}</pre>
                 {txFinalized && isExplorerHash(txId) && (
                   <a href={getProvableExplorerTxUrl(txId)} target="_blank" rel="noopener noreferrer" className="text-cyan-400 text-sm mt-2 inline-block hover:text-cyan-300">View on Provable Explorer →</a>
-                )}
-              </div>
-            )}
-          </>
-        ) : (
-          <>
-            {loading && (
+              )}
+            </div>
+          )}
+        </>
+      ) : (
+        <>
+          {loading && (
               <div className="fixed inset-0 z-40 flex items-center justify-center p-6" style={{ backgroundColor: 'rgba(0,0,0,0.55)' }}>
                 <div
                   className="rounded-3xl px-12 py-12 sm:px-16 sm:py-14 flex flex-col items-center justify-center gap-6 min-w-[min(100%,22rem)] sm:min-w-[28rem] max-w-[90vw] shadow-2xl shadow-black/40 border border-white/10"
@@ -4139,16 +4239,16 @@ const DashboardPage: NextPageWithLayout = () => {
                   <p className="text-sm sm:text-base text-slate-400 text-center max-w-sm leading-relaxed">
                     Please confirm in your wallet if prompted. This may take a minute on Aleo.
                   </p>
-                </div>
               </div>
-            )}
-            {statusMessage && !loading && (
+            </div>
+          )}
+          {statusMessage && !loading && (
               <div className="fixed bottom-4 right-4 z-40 rounded-xl px-4 py-2 text-sm text-slate-300" style={dashGlass}>
-                {statusMessage}
-              </div>
-            )}
-          </>
-        )}
+              {statusMessage}
+            </div>
+          )}
+        </>
+      )}
       </main>
     </div>
   );

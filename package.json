@@ -37,6 +37,7 @@
     "browserify-fs": "^1.0.0",
     "classnames": "2.5.1",
     "daisyui": "5.5.14",
+    "eventemitter3": "^5.0.1",
     "json-rpc-2.0": "^1.6.0",
     "minimatch": "^10.1.1",
     "next": "15.2.8",
