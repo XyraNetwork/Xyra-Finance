@@ -226,7 +226,7 @@ const DocsPage: NextPageWithLayout = () => {
           </div>
           <h1 className="text-5xl font-bold mb-8 text-white">
             High-level <span style={customStyles.textGradientCyan}>Overview</span>
-          </h1>
+        </h1>
           <p className="text-xl text-slate-400 leading-relaxed mb-8">
             This page describes the current testnet app. On-chain lending logic lives in{' '}
             <span className="font-mono text-cyan-400">program/src/main.leo</span> (deploy name varies; e.g.{' '}
@@ -246,9 +246,9 @@ const DocsPage: NextPageWithLayout = () => {
               <li><span className="font-semibold text-white">Cross-asset risk:</span> borrow/withdraw paths use <strong>oracle prices</strong>, per-asset LTV, and program rules so total debt stays within allowed collateral.</li>
               <li><span className="font-semibold text-white">Private data UX:</span> shield icons and tooltips on sensitive columns and actions.</li>
               <li><span className="font-semibold text-white">Transaction history:</span> Supabase transaction_history by wallet address; optional vault tx links after the pool tx finalizes.</li>
-            </ul>
-          </div>
-        </section>
+          </ul>
+        </div>
+      </section>
 
         <section id="features" className="scroll-mt-32 mb-20">
           <h2 className="text-3xl font-bold mb-8 flex items-center gap-3 text-white">
@@ -262,9 +262,9 @@ const DocsPage: NextPageWithLayout = () => {
               <li><span className="font-semibold text-white">Markets:</span> on-chain aggregates, live RPC block height / network status.</li>
               <li><span className="font-semibold text-white">History:</span> Supabase-backed transaction history with explorer (and optional vault) links.</li>
               <li><span className="font-semibold text-white">Backend:</span> vault queue, credit payouts after finalized pool txs, CORS for split deploys.</li>
-            </ul>
-          </div>
-        </section>
+          </ul>
+        </div>
+      </section>
 
         <section id="roadmap" className="scroll-mt-32 mb-20">
           <h2 className="text-3xl font-bold mb-8 flex items-center gap-3 text-white">
@@ -276,9 +276,9 @@ const DocsPage: NextPageWithLayout = () => {
               <li><span className="font-semibold text-white">Architecture:</span> move toward a <strong>dual-pool, Aave-style</strong> layout with <strong>rigorous interest-rate models</strong>—that pattern is the strongest foundation for a serious money market.</li>
               <li><span className="font-semibold text-white">Explore:</span> <strong>flash loan</strong> support (design and safety work TBD).</li>
               <li><span className="font-semibold text-white">Later:</span> liquidations, governance, richer oracles, and additional assets as the stack matures.</li>
-            </ul>
-          </div>
-        </section>
+          </ul>
+        </div>
+      </section>
 
         <section id="wallet" className="scroll-mt-32 mb-20">
           <h2 className="text-3xl font-bold mb-8 flex items-center gap-3 text-white">
@@ -292,9 +292,9 @@ const DocsPage: NextPageWithLayout = () => {
               <li><span className="font-mono text-indigo-400">decryptPermission</span> is set for automatic record decryption where the adapter supports it.</li>
               <li>Connected <span className="font-mono text-indigo-400">address</span> is used for RPC reads, executeTransaction, and history filters.</li>
               <li><span className="font-mono text-indigo-400">WalletPersistence</span> uses sessionStorage so navigating between Dashboard/Markets/Docs does not drop the connection.</li>
-            </ul>
-          </div>
-        </section>
+          </ul>
+        </div>
+      </section>
 
         <section id="dashboard" className="scroll-mt-32 mb-20">
           <h2 className="text-3xl font-bold mb-8 flex items-center gap-3 text-white">
@@ -306,9 +306,9 @@ const DocsPage: NextPageWithLayout = () => {
               <li><span className="font-semibold text-white">Dashboard</span> shows a unified summary (total collateral, borrowable estimate, total debt, health factor) and <strong>per-reserve</strong> rows for each configured market.</li>
               <li><span className="font-semibold text-white">Cross-asset checks:</span> before borrow/withdraw, the UI can consult on-chain caps and /vault-balances to prevent transaction failures.</li>
               <li><span className="font-semibold text-white">Markets</span> shows public on-chain aggregates (totals, utilization, APYs) and a reserve overview table.</li>
-            </ul>
-          </div>
-        </section>
+          </ul>
+        </div>
+      </section>
 
         <section id="lending" className="scroll-mt-32 mb-20">
           <h2 className="text-3xl font-bold mb-8 flex items-center gap-3 text-white">
@@ -364,9 +364,9 @@ const DocsPage: NextPageWithLayout = () => {
               <li>The UI polls transactionStatus until finalized, then uses the final on-chain id for explorer links and Supabase.</li>
               <li>For <strong>borrow</strong> and <strong>withdraw</strong>, the app records the row in Supabase and the backend watcher completes vault transfers.</li>
               <li>Accrue-interest actions call <span className="font-mono text-indigo-400">accrue_interest</span> with the correct literal per asset.</li>
-            </ol>
-          </div>
-        </section>
+          </ol>
+        </div>
+      </section>
 
         <section id="supabase" className="scroll-mt-32 mb-20">
           <h2 className="text-3xl font-bold mb-8 flex items-center gap-3 text-white">
@@ -382,14 +382,14 @@ const DocsPage: NextPageWithLayout = () => {
                 <li><span className="font-mono">type</span> — deposit | withdraw | borrow | repay.</li>
                 <li><span className="font-mono">asset</span> — aleo, usdcx, or usad.</li>
                 <li><span className="font-mono">vault_tx_id</span> — when vault payout completes.</li>
-             </ul>
+          </ul>
              <h3 className="font-semibold text-white mb-2">Environment</h3>
              <ul className="list-disc list-inside space-y-1 text-sm text-slate-400">
                 <li><span className="font-mono">NEXT_PUBLIC_SUPABASE_URL</span></li>
                 <li><span className="font-mono">NEXT_PUBLIC_SUPABASE_PUB_KEY</span></li>
-             </ul>
-          </div>
-        </section>
+          </ul>
+        </div>
+      </section>
 
         <section id="vault" className="scroll-mt-32 mb-20">
           <h2 className="text-3xl font-bold mb-8 flex items-center gap-3 text-white">
@@ -403,10 +403,10 @@ const DocsPage: NextPageWithLayout = () => {
                <li><span className="font-semibold text-white">GET /vault-balances</span> — public vault balances per token program.</li>
                <li><span className="font-semibold text-white">Vault watcher</span> — polls Supabase for rows needing a vault tx.</li>
                <li><span className="font-semibold text-white">Optional oracle</span> — backend can poll spot prices and broadcast set_asset_price.</li>
-            </ul>
+          </ul>
              <p className="text-xs text-slate-500 mt-2">Configure NEXT_PUBLIC_BACKEND_URL on the frontend and CORS_ORIGIN / vault env vars in backend/.env.</p>
-          </div>
-        </section>
+        </div>
+      </section>
 
         <section id="development" className="scroll-mt-32 mb-20">
           <h2 className="text-3xl font-bold mb-8 flex items-center gap-3 text-white">
@@ -419,10 +419,10 @@ const DocsPage: NextPageWithLayout = () => {
                <li>NEXT_PUBLIC_APP_ENV toggles minor UX (e.g. status message timing).</li>
                <li>Next.js Pages router, Tailwind, layout in layouts/_layout.tsx.</li>
                <li>All integrations target Aleo testnet unless changed.</li>
-             </ul>
+          </ul>
              <p className="text-xs text-slate-500 mt-4 pt-4 border-t border-white/10">Implementation entry points: src/pages/dashboard.tsx, src/components/aleo/rpc.ts, backend/src/server.js, supabase/schema.sql.</p>
-          </div>
-        </section>
+        </div>
+      </section>
 
       </main>
       <OnThisPage />

@@ -3251,7 +3251,8 @@ export const computeUsadPoolAPY = computeAleoPoolAPY;
 
 // These caches are module-level and can survive HMR in development.
 // Version them so changes to key-derivation logic don't leave stale entries.
-const USER_FIELD_HASH_SCHEME_VERSION = 'v2';
+/** Bump when user_key / position_key derivation changes (clears wasm hash caches). */
+const USER_FIELD_HASH_SCHEME_VERSION = 'v5';
 const userFieldHashCache = new Map<string, string>();
 const lendingPositionKeyCache = new Map<string, string>();
 
@@ -3270,7 +3271,201 @@ async function loadProvableWasm(): Promise<typeof import('@provablehq/wasm')> {
   return import('@provablehq/wasm');
 }
 
-/** Leo: user_key = BHP256::hash_to_field(caller). Same as xyra_lending_v3 mapping inputs. */
+/** How Leo/snarkVM feeds the field sum into BHP256 for `compute_position_key`. */
+export type PositionKeySumBitsMode = 'sumPlaintextBitsLe' | 'sumFieldBitsLe';
+
+/**
+ * Leo: `compute_position_key` uses `user_key + asset_id` as field sum, then `BHP256::hash_to_field(...)`.
+ * SnarkVM may use either the **field element** bit layout or the **plaintext** layout of that sum; deployments differ.
+ */
+export async function computePositionKeyFromUserKeyFieldStrMode(
+  userKeyFieldStr: string,
+  assetIdField: string,
+  sumBitsMode: PositionKeySumBitsMode,
+): Promise<string | null> {
+  try {
+    const { BHP256, Field } = await loadProvableWasm();
+    const bhp = new BHP256();
+    const userKey = Field.fromString(normalizeFieldLiteral(userKeyFieldStr));
+    const assetF = Field.fromString(normalizeFieldLiteral(assetIdField));
+    const sum = userKey.add(assetF);
+    const bits =
+      sumBitsMode === 'sumFieldBitsLe' ? sum.toBitsLe() : sum.toPlaintext().toBitsLe();
+    return bhp.hash(bits).toString();
+  } catch (e) {
+    console.warn('computePositionKeyFromUserKeyFieldStrMode failed:', e);
+    return null;
+  }
+}
+
+/**
+ * Leo: `compute_position_key` uses `user_key + asset_id` as field sum, then `BHP256::hash_to_field(...)`.
+ * Default: **plaintext** bits of the sum (matches most current Leo lowering).
+ */
+export async function computePositionKeyFromUserKeyFieldStr(
+  userKeyFieldStr: string,
+  assetIdField: string,
+): Promise<string | null> {
+  return computePositionKeyFromUserKeyFieldStrMode(userKeyFieldStr, assetIdField, 'sumPlaintextBitsLe');
+}
+
+/** One row from `probeUserKeyVariantsForAleoSupply` extended grid (user_key × sum→pos_key modes). */
+export type UserKeyPosKeyGridRow = {
+  label: string;
+  userKey: string;
+  posKey: string | null;
+  supply: MappingReadDebug;
+};
+
+/**
+ * Compare which `user_key` derivation matches on-chain `user_scaled_supply` for ALEO (0field).
+ * Leo `BHP256::hash_to_field(caller)` may use the address **plaintext** bit layout vs raw `Address` bits.
+ * When the two legacy paths miss but pool totals are non-zero, see **`grid`** for extra `user_key` /
+ * `sumFieldBitsLe` combinations (matches some snarkVM lowerings).
+ */
+export async function probeUserKeyVariantsForAleoSupply(
+  programId: string,
+  address: string,
+): Promise<{
+  addressBitsLe: { userKey: string; posKey: string | null; supply: MappingReadDebug };
+  plaintextBitsLe: { userKey: string; posKey: string | null; supply: MappingReadDebug } | null;
+  /** Global pool `total_deposited` for ALEO — if non-null, this program has on-chain supply state. */
+  poolTotalDepositedAleo: MappingReadDebug;
+  /**
+   * Cross-product of user_key sources × position-key sum-bit modes. First row with `supply.parsedU64 > 0`
+   * is the one to align `computeUserKeyFieldFromAddress` / `computePositionKeyFromUserKeyFieldStrMode` with.
+   */
+  grid: UserKeyPosKeyGridRow[];
+  /** First grid row with non-zero parsed supply, if any. */
+  gridFirstMatch: UserKeyPosKeyGridRow | null;
+  note: string;
+}> {
+  await loadProvableWasm();
+  const { BHP256, Address } = await loadProvableWasm();
+  const addr = Address.from_string(address.trim());
+  const bhp = new BHP256();
+
+  const ukAddrBits = bhp.hash(addr.toBitsLe()).toString();
+  const posAddr = await computePositionKeyFromUserKeyFieldStr(ukAddrBits, '0field');
+  const supAddr = posAddr
+    ? await getMappingValueDebug(programId, 'user_scaled_supply', posAddr)
+    : ({
+        mapping: 'user_scaled_supply',
+        key: '(null pos)',
+        ok: false,
+        raw: null,
+        parsedU64: null,
+        rpcError: 'null position key',
+      } satisfies MappingReadDebug);
+
+  let plaintextBitsLe: {
+    userKey: string;
+    posKey: string | null;
+    supply: MappingReadDebug;
+  } | null = null;
+  try {
+    const pt = addr.toPlaintext();
+    const ukPt = bhp.hash(pt.toBitsLe()).toString();
+    const posPt = await computePositionKeyFromUserKeyFieldStr(ukPt, '0field');
+    const supPt = posPt
+      ? await getMappingValueDebug(programId, 'user_scaled_supply', posPt)
+      : ({
+          mapping: 'user_scaled_supply',
+          key: '(null pos)',
+          ok: false,
+          raw: null,
+          parsedU64: null,
+          rpcError: 'null position key',
+        } satisfies MappingReadDebug);
+    plaintextBitsLe = { userKey: ukPt, posKey: posPt, supply: supPt };
+  } catch (e: unknown) {
+    console.warn('[probeUserKeyVariantsForAleoSupply] plaintext path failed:', e);
+  }
+
+  const poolTotalDepositedAleo = await getMappingValueDebug(programId, 'total_deposited', '0field');
+  const poolMicro = poolTotalDepositedAleo.parsedU64 ?? BigInt(0);
+
+  const grid: UserKeyPosKeyGridRow[] = [];
+  const sumModes: PositionKeySumBitsMode[] = ['sumPlaintextBitsLe', 'sumFieldBitsLe'];
+  type UkFn = () => string;
+  const userKeySources: { label: string; uk: UkFn }[] = [
+    { label: 'uk_addressToBitsLe', uk: () => bhp.hash(addr.toBitsLe()).toString() },
+    { label: 'uk_plaintextToBitsLe', uk: () => bhp.hash(addr.toPlaintext().toBitsLe()).toString() },
+    {
+      label: 'uk_plaintextToBitsRawLe',
+      uk: () => bhp.hash(addr.toPlaintext().toBitsRawLe()).toString(),
+    },
+  ];
+  for (const { label: ukLabel, uk } of userKeySources) {
+    let userKeyStr: string;
+    try {
+      userKeyStr = uk();
+    } catch {
+      continue;
+    }
+    for (const sumMode of sumModes) {
+      const posKey = await computePositionKeyFromUserKeyFieldStrMode(userKeyStr, '0field', sumMode);
+      const supply = posKey
+        ? await getMappingValueDebug(programId, 'user_scaled_supply', posKey)
+        : ({
+            mapping: 'user_scaled_supply',
+            key: '(null pos)',
+            ok: false,
+            raw: null,
+            parsedU64: null,
+            rpcError: 'null position key',
+          } satisfies MappingReadDebug);
+      grid.push({
+        label: `${ukLabel}+${sumMode}`,
+        userKey: userKeyStr,
+        posKey,
+        supply,
+      });
+    }
+  }
+
+  const gridFirstMatch =
+    grid.find((r) => (r.supply.parsedU64 ?? BigInt(0)) > BigInt(0)) ?? null;
+
+  const a = supAddr.parsedU64 ?? BigInt(0);
+  const b = plaintextBitsLe?.supply.parsedU64 ?? BigInt(0);
+  let note = '';
+  if (gridFirstMatch) {
+    note =
+      gridFirstMatch.label === 'uk_plaintextToBitsLe+sumPlaintextBitsLe'
+        ? 'On-chain supply matches **uk_plaintextToBitsLe+sumPlaintextBitsLe** — same as `computeUserKeyFieldFromAddress` (plaintext address bits) + `computePositionKeyFromUserKeyFieldStr` (sum plaintext bits).'
+        : `**grid** found non-zero \`user_scaled_supply\` at \`${gridFirstMatch.label}\` — align \`computeUserKeyFieldFromAddress\` / \`computePositionKeyFromUserKeyFieldStrMode\` with that label.`;
+  } else if (a > BigInt(0) && b === BigInt(0)) {
+    note =
+      'On-chain supply matches **address.toBitsLe()** user_key only (legacy) — prefer `computeUserKeyFieldFromAddress` (plaintext bits).';
+  } else if (b > BigInt(0) && a === BigInt(0)) {
+    note =
+      'On-chain supply matches **address.toPlaintext().toBitsLe()** user_key (`computeUserKeyFieldFromAddress`).';
+  } else if (a > BigInt(0) && b > BigInt(0)) {
+    note = 'Both legacy variants non-zero (unexpected); compare keys.';
+  } else if (poolMicro > BigInt(0)) {
+    note =
+      'Pool `total_deposited` (ALEO) is non-zero but **no** grid row has `user_scaled_supply` for this address. Either deployed bytecode differs from your Leo source (compare program id / deployment tx), or liquidity was accounted without per-user scaled rows (unexpected for this program).';
+  } else {
+    note =
+      'No user supply at either key and pool `total_deposited` (ALEO) is also empty/zero — confirm program id matches the deployment your txs targeted, or try another RPC / wait for indexer.';
+  }
+
+  return {
+    addressBitsLe: { userKey: ukAddrBits, posKey: posAddr, supply: supAddr },
+    plaintextBitsLe,
+    poolTotalDepositedAleo,
+    grid,
+    gridFirstMatch,
+    note,
+  };
+}
+
+/**
+ * Leo: `user_key = BHP256::hash_to_field(caller)` for `caller: address`.
+ * SnarkVM hashes the **plaintext** bit layout of the address (`address.toPlaintext().toBitsLe()`),
+ * not `address.toBitsLe()` (see `probeUserKeyVariantsForAleoSupply` grid `uk_plaintextToBitsLe+sumPlaintextBitsLe`).
+ */
 export async function computeUserKeyFieldFromAddress(address: string): Promise<string | null> {
   try {
     const cacheKey = `${USER_FIELD_HASH_SCHEME_VERSION}:${address}`;
@@ -3280,9 +3475,7 @@ export async function computeUserKeyFieldFromAddress(address: string): Promise<s
     const { BHP256, Address } = await loadProvableWasm();
     const bhp = new BHP256();
     const addr = Address.from_string(address);
-    // Leo's `BHP256::hash_to_field(caller)` hashes the field elements of the address.
-    // Hashing the address object directly can diverge depending on wasm bindings.
-    const userKeyField = bhp.hash(addr.toFields());
+    const userKeyField = bhp.hash(addr.toPlaintext().toBitsLe());
     const s = userKeyField.toString();
     userFieldHashCache.set(cacheKey, s);
     return s;
@@ -3307,13 +3500,8 @@ export async function computeLendingPositionMappingKey(
     }
     const userKeyStr = await computeUserKeyFieldFromAddress(address);
     if (!userKeyStr) return null;
-    const { BHP256, Field } = await loadProvableWasm();
-    const bhp = new BHP256();
-    const userKey = Field.fromString(normalizeFieldLiteral(userKeyStr));
-    const assetF = Field.fromString(normalizeFieldLiteral(assetIdField));
-    const sum = userKey.add(assetF);
-    const posKey = bhp.hash([sum]);
-    const out = posKey.toString();
+    const out = await computePositionKeyFromUserKeyFieldStr(userKeyStr, assetIdField);
+    if (!out) return null;
     lendingPositionKeyCache.set(cacheKey, out);
     return out;
   } catch (e) {
@@ -3420,23 +3608,249 @@ async function getMappingU64Big(programId: string, mappingName: string, key: str
   }
 }
 
+/** Raw JSON-RPC result for debugging (some nodes nest `value`, others return the literal on `result`). */
+function unwrapMappingRpcPayload(res: unknown): unknown {
+  if (res == null || typeof res !== 'object') return res;
+  const o = res as Record<string, unknown>;
+  if ('value' in o && o.value !== undefined) return o.value;
+  if ('result' in o && o.result !== undefined) return o.result;
+  return res;
+}
+
+export type MappingReadDebug = {
+  mapping: string;
+  key: string;
+  ok: boolean;
+  /** Raw payload after unwrap (often `12345u64` string). `null` = no mapping entry at this key. */
+  raw: unknown;
+  parsedU64: bigint | null;
+  rpcError?: string;
+  /** Full object returned by `client.request('getMappingValue', …)` (shape varies by node). */
+  rpcEnvelope?: unknown;
+};
+
+/**
+ * Single mapping read with full visibility — use when `user_scaled_*` looks wrong vs wallet records.
+ * Run from DevTools after dynamic import (see `probeLendingPositionMappings`).
+ */
+export async function getMappingValueDebug(
+  programId: string,
+  mappingName: string,
+  key: string,
+): Promise<MappingReadDebug> {
+  try {
+    const res = await client.request('getMappingValue', {
+      program_id: programId,
+      mapping_name: mappingName,
+      key,
+    });
+    const raw = unwrapMappingRpcPayload(res);
+    const base = {
+      mapping: mappingName,
+      key,
+      ok: true as const,
+      rpcEnvelope: res,
+    };
+    if (raw == null) {
+      return { ...base, raw: null, parsedU64: null };
+    }
+    const str = String(raw).replace(/u64$/i, '').trim();
+    if (!str) {
+      return { ...base, raw, parsedU64: null };
+    }
+    let parsedU64: bigint | null = null;
+    try {
+      parsedU64 = BigInt(str);
+    } catch {
+      parsedU64 = null;
+    }
+    return { ...base, raw, parsedU64 };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      mapping: mappingName,
+      key,
+      ok: false,
+      raw: null,
+      parsedU64: null,
+      rpcError: msg,
+    };
+  }
+}
+
+export type LendingMappingProbeResult = {
+  rpcUrl: string;
+  programId: string;
+  address: string;
+  userKeyField: string | null;
+  positionKeys: { assetId: string; posKey: string | null }[];
+  /** Per-asset `user_scaled_supply` at `posKey` */
+  userScaledSupply: MappingReadDebug[];
+  userScaledBorrow: MappingReadDebug[];
+  /** Sanity: global pool totals (field keys `0field` / `1field` / `2field`) */
+  totalDeposited: MappingReadDebug[];
+  supplyIndex: MappingReadDebug[];
+  caps: Awaited<ReturnType<typeof getCrossCollateralBorrowCapsFromChain>>;
+  /** Which `user_key` hash matches `user_scaled_supply` for ALEO (address bits vs plaintext bits). */
+  userKeyVariantProbe: Awaited<ReturnType<typeof probeUserKeyVariantsForAleoSupply>> | null;
+  notes: string[];
+};
+
+/**
+ * End-to-end check: wasm-derived position keys + mapping reads + caps helper.
+ * Browser console (dev, `npm run dev`): `@/` imports do not resolve in the raw console. Use:
+ * ```ts
+ * await window.__xyraBorrowDebug.probeMyMappings('aleo1...')
+ * // or
+ * await window.__xyraBorrowDebug.probeLendingPositionMappings(window.__xyraBorrowDebug.LENDING_POOL_PROGRAM_ID, 'aleo1...')
+ * ```
+ * If `userScaledSupply` is null but `totalDeposited` works, keys likely don’t match Leo `compute_position_key`.
+ */
+export async function probeLendingPositionMappings(
+  programId: string,
+  userAddress: string,
+): Promise<LendingMappingProbeResult> {
+  const notes: string[] = [];
+  const trimmed = userAddress?.trim();
+  if (!trimmed?.startsWith('aleo1')) {
+    notes.push('Address must be a bech32 aleo1… string.');
+    return {
+      rpcUrl: CURRENT_RPC_URL,
+      programId,
+      address: String(userAddress),
+      userKeyField: null,
+      positionKeys: [],
+      userScaledSupply: [],
+      userScaledBorrow: [],
+      totalDeposited: [],
+      supplyIndex: [],
+      caps: null,
+      userKeyVariantProbe: null,
+      notes,
+    };
+  }
+
+  const userKeyField = await computeUserKeyFieldFromAddress(trimmed);
+  if (!userKeyField) notes.push('computeUserKeyFieldFromAddress returned null (wasm / BHP).');
+
+  const assetIds = ['0field', '1field', '2field'] as const;
+  const positionKeys: { assetId: string; posKey: string | null }[] = [];
+  for (const a of assetIds) {
+    const pk = await computeLendingPositionMappingKey(trimmed, a);
+    positionKeys.push({ assetId: a, posKey: pk });
+    if (!pk) notes.push(`computeLendingPositionMappingKey failed for ${a}`);
+  }
+
+  const userScaledSupply: MappingReadDebug[] = [];
+  const userScaledBorrow: MappingReadDebug[] = [];
+  for (const { assetId, posKey } of positionKeys) {
+    if (!posKey) {
+      userScaledSupply.push({
+        mapping: 'user_scaled_supply',
+        key: '(null)',
+        ok: false,
+        raw: null,
+        parsedU64: null,
+        rpcError: 'missing position key',
+      });
+      continue;
+    }
+    userScaledSupply.push(await getMappingValueDebug(programId, 'user_scaled_supply', posKey));
+    userScaledBorrow.push(await getMappingValueDebug(programId, 'user_scaled_borrow', posKey));
+  }
+
+  const totalDeposited: MappingReadDebug[] = [];
+  const supplyIndex: MappingReadDebug[] = [];
+  for (const a of assetIds) {
+    totalDeposited.push(await getMappingValueDebug(programId, 'total_deposited', a));
+    supplyIndex.push(await getMappingValueDebug(programId, 'supply_index', a));
+  }
+
+  let caps: Awaited<ReturnType<typeof getCrossCollateralBorrowCapsFromChain>> = null;
+  try {
+    caps = await getCrossCollateralBorrowCapsFromChain(programId, trimmed);
+  } catch (e: unknown) {
+    notes.push(`getCrossCollateralBorrowCapsFromChain threw: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  if (caps && caps.realSupplyMicroAleo === BigInt(0) && caps.realSupplyMicroUsdcx === BigInt(0) && caps.realSupplyMicroUsad === BigInt(0)) {
+    notes.push(
+      'All realSupply* are 0 on chain reads. If wallet records show deposits, verify key derivation matches deployed Leo (BHP256::hash_to_field(address) and hash_to_field(user_key + asset_id)).',
+    );
+  }
+
+  let userKeyVariantProbe: Awaited<ReturnType<typeof probeUserKeyVariantsForAleoSupply>> | null = null;
+  try {
+    userKeyVariantProbe = await probeUserKeyVariantsForAleoSupply(programId, trimmed);
+    notes.push(userKeyVariantProbe.note);
+  } catch (e: unknown) {
+    notes.push(`probeUserKeyVariantsForAleoSupply: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  console.log('[probeLendingPositionMappings]', {
+    rpcUrl: CURRENT_RPC_URL,
+    programId,
+    address: trimmed,
+    userKeyField,
+    positionKeys,
+    userScaledSupply,
+    userScaledBorrow,
+    totalDeposited,
+    supplyIndex,
+    capsSummary: caps
+      ? {
+          realSupplyMicroAleo: caps.realSupplyMicroAleo.toString(),
+          realSupplyMicroUsdcx: caps.realSupplyMicroUsdcx.toString(),
+          realSupplyMicroUsad: caps.realSupplyMicroUsad.toString(),
+          totalDebtUsd: caps.totalDebtUsd.toString(),
+        }
+      : null,
+    userKeyVariantProbe,
+    notes,
+  });
+
+  return {
+    rpcUrl: CURRENT_RPC_URL,
+    programId,
+    address: trimmed,
+    userKeyField,
+    positionKeys,
+    userScaledSupply,
+    userScaledBorrow,
+    totalDeposited,
+    supplyIndex,
+    caps,
+    userKeyVariantProbe,
+    notes,
+  };
+}
+
 /**
  * Replicates `finalize_borrow` collateral/debt USD totals and max borrow per asset (micro units)
  * so the UI cannot exceed `assert(total_debt + new_borrow_usd <= total_collateral)`.
  */
 export type CrossCollateralChainCaps = {
+  /** LTV-weighted collateral USD (micro); same as `finalize_borrow` numerator. */
   totalCollateralUsd: bigint;
   totalDebtUsd: bigint;
   headroomUsd: bigint;
   maxBorrowMicroAleo: bigint;
   maxBorrowMicroUsdcx: bigint;
   maxBorrowMicroUsad: bigint;
+  /** Effective token amounts (micro units) from `user_scaled_*` × indices — use for UI rows when set. */
+  realSupplyMicroAleo: bigint;
+  realSupplyMicroUsdcx: bigint;
+  realSupplyMicroUsad: bigint;
+  realBorrowMicroAleo: bigint;
+  realBorrowMicroUsdcx: bigint;
+  realBorrowMicroUsad: bigint;
 };
 
 export async function getCrossCollateralBorrowCapsFromChain(
   programId: string,
   userAddress: string,
 ): Promise<CrossCollateralChainCaps | null> {
+  await loadProvableWasm();
   const [pkAleo, pkUsdcx, pkUsad] = await Promise.all([
     computeLendingPositionMappingKey(userAddress, '0field'),
     computeLendingPositionMappingKey(userAddress, '1field'),
@@ -3534,6 +3948,12 @@ export async function getCrossCollateralBorrowCapsFromChain(
     maxBorrowMicroAleo: maxMicroForPrice(headroomUsd, priceA),
     maxBorrowMicroUsdcx: maxMicroForPrice(headroomUsd, priceU),
     maxBorrowMicroUsad: maxMicroForPrice(headroomUsd, priceD),
+    realSupplyMicroAleo: realSupA,
+    realSupplyMicroUsdcx: realSupU,
+    realSupplyMicroUsad: realSupD,
+    realBorrowMicroAleo: realBorA,
+    realBorrowMicroUsdcx: realBorU,
+    realBorrowMicroUsad: realBorD,
   };
 }
 
@@ -3552,6 +3972,7 @@ export async function getCrossCollateralWithdrawCapsFromChain(
   programId: string,
   userAddress: string,
 ): Promise<CrossCollateralWithdrawCaps | null> {
+  await loadProvableWasm();
   const [pkAleo, pkUsdcx, pkUsad] = await Promise.all([
     computeLendingPositionMappingKey(userAddress, '0field'),
     computeLendingPositionMappingKey(userAddress, '1field'),
