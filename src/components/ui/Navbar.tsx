@@ -10,17 +10,18 @@ const customStyles: Record<string, React.CSSProperties> = {
     background: 'linear-gradient(145deg, rgba(15,23,42,0.4) 0%, rgba(3,7,18,0.6) 100%)',
     backdropFilter: 'blur(16px)',
     WebkitBackdropFilter: 'blur(16px)',
-    border: '1px solid rgba(255,255,255,0.05)',
+    border: '1px solid rgba(255,255,255,0.12)',
   },
   appHeader: {
     background: '#030712',
-    border: '1px solid rgba(255,255,255,0.06)',
+    border: '1px solid rgba(255,255,255,0.14)',
     borderRadius: '16px',
     padding: '12px 24px',
     width: '100%',
     maxWidth: '1240px',
     height: '64px',
-    boxShadow: '0 8px 32px -8px rgba(0, 0, 0, 0.5)',
+    boxShadow:
+      '0 0 0 1px rgba(148,163,184,0.12), 0 8px 32px -8px rgba(0, 0, 0, 0.5)',
   }
 };
 
@@ -125,6 +126,10 @@ const Navbar = () => {
         zIndex: 100,
         display: 'flex',
         alignItems: 'center',
+        // Keep a subtle visible outline across bright/dark page sections.
+        boxShadow:
+          (useAppHeader ? customStyles.appHeader.boxShadow : undefined) ??
+          '0 0 0 1px rgba(148,163,184,0.12), 0 8px 28px -10px rgba(0,0,0,0.55)',
       }}
     >
       <div className="flex items-center justify-between w-full h-full">

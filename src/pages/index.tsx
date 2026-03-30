@@ -212,7 +212,7 @@ const HeroSection = ({ onEnterApp }: { onEnterApp: () => void }) => (
         className="text-lg md:text-xl font-light leading-relaxed mb-10"
         style={{ color: '#94a3b8', maxWidth: '560px', animation: 'slideUpFade 0.8s cubic-bezier(0.16, 1, 0.3, 1) 200ms forwards', opacity: 0, fontFamily: "'IBM Plex Sans', sans-serif" }}
       >
-        Supply, borrow, and manage capital with zero-knowledge privacy. Xyra eliminates MEV and protects your strategies while maintaining absolute on-chain solvency.
+        Supply, borrow, and manage capital on the Aleo blockchain with zero-knowledge privacy. Xyra eliminates MEV and protects your strategies while maintaining absolute on-chain solvency.
       </p>
 
       <div className="flex flex-col sm:flex-row items-center gap-6 w-full sm:w-auto" style={{ animation: 'slideUpFade 0.8s cubic-bezier(0.16, 1, 0.3, 1) 300ms forwards', opacity: 0 }}>
@@ -379,10 +379,10 @@ const ArchitectureSection = () => {
 // ─── Features Section ─────────────────────────────────────────────────────────
 
 const featureCards = [
-  { icon: 'briefcase', title: 'Institutional Grade', desc: 'Manage corporate treasuries without broadcasting capital moves to competitors or the public.' },
+  { icon: 'briefcase', title: 'Institutional Grade', desc: 'Manage corporate treasuries on the Aleo blockchain without broadcasting capital moves to competitors or the public.' },
   { icon: 'check-circle', title: 'Provable Solvency', desc: 'Despite hidden user balances, on-chain reserve totals and protocol solvency are mathematically proven via ZK.' },
   { icon: 'layers', title: 'Composable Yield', desc: 'Supplied assets generate private yield-bearing tokens, composable with other Aleo DeFi protocols.' },
-  { icon: 'shield', title: 'Compliance Rails', desc: 'Optional zK-KYC integrations allow whitelisted pools without exposing underlying identity data.' },
+  { icon: 'shield', title: 'Compliance Rails', desc: 'Optional zK-KYC integrations on the Aleo blockchain allow whitelisted pools without exposing underlying identity data.' },
   { icon: 'activity', title: 'Dynamic Rates', desc: 'Per-reserve borrow and supply rates from utilization (Aave-style linear curve), with on-chain parameters and oracle-backed prices.' },
   { icon: 'trending-up', title: 'Future ZK Credit', desc: 'Foundation built to support uncollateralized lending via private on-chain reputation and credit scoring.' },
 ];
@@ -397,7 +397,7 @@ const FeaturesSection = () => {
         <div className="text-center mb-16">
           <h2 className="text-3xl md:text-4xl font-bold text-white mb-4">Protocol Features</h2>
           <p className="text-sm max-w-xl mx-auto" style={{ color: '#94a3b8', fontFamily: "'IBM Plex Mono', monospace" }}>
-            Designed for institutions and power users demanding financial privacy.
+            Built on the Aleo blockchain for institutions and power users demanding financial privacy.
           </p>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
