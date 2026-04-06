@@ -275,6 +275,7 @@ const DocsPage: NextPageWithLayout = () => {
             <ul className="list-disc list-inside space-y-3 text-sm text-slate-400">
               <li><span className="font-semibold text-white">Architecture:</span> <strong>multi-asset, cross-collateral, Aave-style</strong> money market—one program with separate reserves (ALEO, USDCx, USAD), per-reserve utilization and indices, and a linear base+slope borrow curve with reserve factor (see <span className="font-mono text-cyan-400">finalize_accrue</span>).</li>
               <li><span className="font-semibold text-white">Explore:</span> <strong>flash loan</strong> support (design and safety work TBD).</li>
+              <li><span className="font-semibold text-white">Sprint 2 (in progress):</span> <strong>private-record migration skeleton</strong> — <span className="font-mono text-cyan-400">PositionNote</span> mint + <span className="font-mono text-cyan-400">position_note_schema</span> mapping; UI gated by <span className="font-mono text-cyan-400">NEXT_PUBLIC_SHOW_SPRINT2_MIGRATION_UI</span>.</li>
               <li><span className="font-semibold text-white">Later:</span> liquidations, governance, richer oracles, and additional assets as the stack matures.</li>
           </ul>
         </div>

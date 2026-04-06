@@ -52,9 +52,34 @@ const Navbar = () => {
 
   const navItems = [
     { name: 'DASHBOARD', id: 'dashboard', href: '/dashboard' },
+    {
+      name: 'FLASH',
+      id: 'flash',
+      href: '/dashboard?view=flash',
+    },
     { name: 'MARKETS', id: 'markets', href: '/markets' },
-    { name: 'DOCS', id: 'docs', href: '/docs' }
-  ];
+    { name: 'DOCS', id: 'docs', href: '/docs' },
+  ] as const;
+
+  const dashboardViewParam = Array.isArray(router.query.view)
+    ? router.query.view[0]
+    : router.query.view;
+
+  const isNavItemActive = (id: string, href: string) => {
+    if (id === 'flash') {
+      return router.pathname === '/dashboard' && dashboardViewParam === 'flash';
+    }
+    if (id === 'dashboard') {
+      return (
+        router.pathname === '/dashboard' &&
+        dashboardViewParam !== 'flash' &&
+        dashboardViewParam !== 'markets' &&
+        dashboardViewParam !== 'docs'
+      );
+    }
+    const base = href.split('?')[0];
+    return router.pathname === base;
+  };
 
   const formatAddress = (addr: string) => {
     if (!addr) return '';
@@ -79,8 +104,8 @@ const Navbar = () => {
     setIsDropdownOpen(false);
   };
 
-  const NavLink = ({ item }: { item: typeof navItems[0] }) => {
-    const isActive = router.pathname === item.href;
+  const NavLink = ({ item }: { item: (typeof navItems)[number] }) => {
+    const isActive = isNavItemActive(item.id, item.href);
     return (
       <Link
         key={item.id}
@@ -290,7 +315,7 @@ const Navbar = () => {
           style={{ background: '#030712', backdropFilter: 'blur(20px)' }}
         >
           {navItems.map((item) => {
-            const isActive = router.pathname === item.href;
+            const isActive = isNavItemActive(item.id, item.href);
             return (
               <Link
                 key={item.id}

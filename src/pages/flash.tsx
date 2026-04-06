@@ -8,12 +8,11 @@ import { useRouter } from 'next/router';
 export default function FlashRedirectPage() {
   const router = useRouter();
   useEffect(() => {
-    // Flash is intentionally hidden right now (not part of the current testing flow).
-    void router.replace('/dashboard');
+    void router.replace('/dashboard?view=flash');
   }, [router]);
   return (
     <div className="flex min-h-[40vh] items-center justify-center px-4 text-base-content/70">
-      Flash loan page is disabled for now. Redirecting…
+      Opening Flash &amp; Liquidation…
     </div>
   );
 }

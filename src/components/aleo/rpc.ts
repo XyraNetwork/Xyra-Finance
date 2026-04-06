@@ -338,128 +338,559 @@ export async function transferPrivate(
  * Leo:
  *   transition main(public a: u32, b: u32) -> u32
  */
-// ----------------- Lending Pool helpers -----------------
+// ----------------- Lending Pool helpers (xyra_lending_v8: private LendingPosition) -----------------
+
+const LENDING_INDEX_SCALE_ORACLE = BigInt('1000000000000');
+/** Matches Leo `PRICE_SCALE` / `initialize` default `asset_price` when a mapping read fails (never use index scale here). */
+const LENDING_PRICE_SCALE_ORACLE = BigInt(1_000_000);
+/** Matches Leo `as u64` on public amounts and intermediates. */
+const LENDING_U64_MAX = (BigInt(1) << BigInt(64)) - BigInt(1);
+
+async function readMappingU64(programId: string, mapping: string, key: string): Promise<bigint | null> {
+  try {
+    const res = await client.request('getMappingValue', {
+      program_id: programId,
+      mapping_name: mapping,
+      key,
+    });
+    const raw = res?.value ?? res ?? null;
+    if (raw == null) return null;
+    const str = String(raw).replace(/u64$/i, '').trim();
+    if (!str) return null;
+    return BigInt(str);
+  } catch {
+    return null;
+  }
+}
+
+/** Legacy shape; `assert_withdraw_*` mappings and `set_withdraw_assert` were removed from the lending program. */
+export type WithdrawAssertFlags = {
+  programId: string;
+  wdr09Stored: boolean | null;
+  wdr10Stored: boolean | null;
+  fwdStored: boolean | null;
+  wdr09Effective: boolean;
+  wdr10Effective: boolean;
+  fwdEffective: boolean;
+};
+
+/** No on-chain mappings to read — returns inert flags for older dashboard code. */
+export async function fetchWithdrawAssertFlags(programId: string): Promise<WithdrawAssertFlags> {
+  return {
+    programId,
+    wdr09Stored: null,
+    wdr10Stored: null,
+    fwdStored: null,
+    wdr09Effective: false,
+    wdr10Effective: false,
+    fwdEffective: false,
+  };
+}
+
+/** No-op: withdraw assert toggles removed from program. */
+export async function logWithdrawAssertFlags(programId: string, label?: string): Promise<WithdrawAssertFlags> {
+  const f = await fetchWithdrawAssertFlags(programId);
+  const tag = label ?? programId;
+  console.info(`[withdraw asserts] (removed from program) ${tag}`, f);
+  return f;
+}
 
 /**
- * Helper: Get the latest UserPosition record or create a new one
- * Returns the record in the format expected by Aleo transitions (as a string)
+ * Idle liquidity tracked in the lending program (`available_liquidity` mapping).
+ * Native ALEO withdraws are capped by this counter — not by `total_deposited - total_borrowed` and
+ * not by the backend vault wallet balance (those can diverge).
  */
+export async function fetchAvailableLiquidityMicro(
+  programId: string,
+  assetKey: string,
+): Promise<bigint | null> {
+  return readMappingU64(programId, 'available_liquidity', assetKey);
+}
+
+const VAULT_HUMAN_CACHE_TTL_MS = 4000;
+let vaultHumanCache: { t: number; value: { aleo: number; usdcx: number; usad: number } | null } | null =
+  null;
+
 /**
- * Get the latest UserActivity record from wallet records, or return a zero activity for first-time users.
- * IMPORTANT: Always fetch from wallet records (requestRecords), never use activity from transaction result.
- * This ensures we always have the most up-to-date activity from the contract.
- * 
- * UserActivity contains 4 counters: total_deposits, total_withdrawals, total_borrows, total_repayments
- * Frontend calculates: net_supplied = total_deposits - total_withdrawals
- *                      net_borrowed = total_borrows - total_repayments
- * 
- * For first-time users (no record found), returns a zero activity object that the contract will accept.
- * The contract automatically handles first-time users when all counters are 0.
- * 
- * @param requestRecords - Function to fetch records from wallet
- * @param publicKey - User's public key (for validation and creating zero activity)
- * @returns The latest UserActivity record, or a zero activity object for first-time users
+ * Human balances from `GET {NEXT_PUBLIC_BACKEND_URL}/vault-balances` (same source as dashboard vault checks).
+ * Short TTL cache so parallel borrow + withdraw cap calls share one request.
  */
-async function getOrCreateActivity(
-  requestRecords: (program: string, includeSpent?: boolean) => Promise<any[]>,
-  publicKey: string
-): Promise<any> {
+export async function fetchVaultHumanBalancesFromBackend(): Promise<{
+  aleo: number;
+  usdcx: number;
+  usad: number;
+} | null> {
+  const now = Date.now();
+  if (vaultHumanCache && now - vaultHumanCache.t < VAULT_HUMAN_CACHE_TTL_MS) {
+    return vaultHumanCache.value;
+  }
+  let out: { aleo: number; usdcx: number; usad: number } | null = null;
   try {
-    console.log('getOrCreateActivity: Fetching latest records from wallet for program:', LENDING_POOL_PROGRAM_ID);
-    // requestRecords takes two parameters: (programId: string, includeSpent?: boolean)
-    const records = await requestRecords(LENDING_POOL_PROGRAM_ID, false);
-    console.log('getOrCreateActivity: Found records:', records?.length || 0);
-    
-    if (records && records.length > 0) {
-      // Find the most recent UserActivity record
-      // Records are typically returned with the newest last, so iterate in reverse
-      // IMPORTANT: Always use the LATEST record from wallet, not from transaction result
-      for (let i = records.length - 1; i >= 0; i--) {
-        const record = records[i];
-        console.log('getOrCreateActivity: Checking record', i, ':', typeof record);
-        
-        // Records from the wallet are typically already in the correct format
-        if (typeof record === 'string') {
-          // If it's already a string, check if it looks like a UserActivity record
-          if (record.includes('owner') || record.includes('total_deposits') || record.includes('total_withdrawals') || 
-              record.includes('total_borrows') || record.includes('total_repayments')) {
-            console.log('getOrCreateActivity: Found UserActivity record (string format) - using latest from wallet');
-            return record;
-          }
-        } else if (record && typeof record === 'object') {
-          // If it's an object, check if it has UserActivity fields
-          const recordData = record;
-          const hasUserActivityFields = 
-            recordData.program_id === LENDING_POOL_PROGRAM_ID || 
-            recordData.programId === LENDING_POOL_PROGRAM_ID ||
-            recordData.recordName === 'UserActivity' ||
-            recordData.type === 'UserActivity' ||
-            recordData.recordType === 'UserActivity' ||
-            (recordData.data && (
-              recordData.data.total_deposits !== undefined || 
-              recordData.data.total_withdrawals !== undefined ||
-              recordData.data.total_borrows !== undefined ||
-              recordData.data.total_repayments !== undefined
-            )) ||
-            (recordData.total_deposits !== undefined || 
-             recordData.total_withdrawals !== undefined ||
-             recordData.total_borrows !== undefined ||
-             recordData.total_repayments !== undefined);
-          
-          if (hasUserActivityFields) {
-            console.log('getOrCreateActivity: Found UserActivity record (object format) - using latest from wallet');
-            // Verify the owner matches (if we can extract it)
-            // This ensures we're using the correct user's activity
-            if (publicKey && recordData.owner && recordData.owner !== publicKey) {
-              console.warn('getOrCreateActivity: Record owner does not match publicKey, continuing search...');
-              continue;
-            }
-            return record; // Return the record object - wallet adapter handles serialization
-          }
-        }
+    const base =
+      typeof process !== 'undefined' && process.env.NEXT_PUBLIC_BACKEND_URL
+        ? String(process.env.NEXT_PUBLIC_BACKEND_URL).trim()
+        : '';
+    if (base) {
+      const resp = await fetch(`${base.replace(/\/$/, '')}/vault-balances`);
+      if (resp.ok) {
+        const j = await resp.json();
+        const aleo = Number(j?.human?.aleo ?? 0);
+        const usdcx = Number(j?.human?.usdcx ?? 0);
+        const usad = Number(j?.human?.usad ?? 0);
+        out = {
+          aleo: Number.isFinite(aleo) ? aleo : 0,
+          usdcx: Number.isFinite(usdcx) ? usdcx : 0,
+          usad: Number.isFinite(usad) ? usad : 0,
+        };
       }
     }
-    
-    // No record found - return a zero activity for first-time users
-    // The contract will accept this and automatically create the activity
-    // The wallet adapter expects records as objects with a specific structure
-    console.log('getOrCreateActivity: No existing record found, creating zero activity for first-time user');
-    
-    // Create a zero activity record object that matches the wallet adapter's expected format
-    // The wallet adapter expects records to have a structure similar to what requestRecords returns
-    // Format: { program_id, data: { owner, total_deposits, total_withdrawals, total_borrows, total_repayments } }
-    const zeroActivityObject = {
-      program_id: LENDING_POOL_PROGRAM_ID,
-      recordName: 'UserActivity',
-      data: {
-        owner: `${publicKey}.private`,
-        total_deposits: `0u64.private`,
-        total_withdrawals: `0u64.private`,
-        total_borrows: `0u64.private`,
-        total_repayments: `0u64.private`,
-      },
-    };
-    
-    console.log('getOrCreateActivity: Created zero activity record object:', zeroActivityObject);
-    return zeroActivityObject;
-  } catch (error) {
-    console.error('getOrCreateActivity: Failed to get activity record from wallet:', error);
-    // Return zero activity for first-time users even on error
-    // Format it as a proper object structure that matches wallet adapter expectations
-    const zeroActivityObject = {
-      program_id: LENDING_POOL_PROGRAM_ID,
-      recordName: 'UserActivity',
-      data: {
-        owner: `${publicKey}.private`,
-        total_deposits: `0u64.private`,
-        total_withdrawals: `0u64.private`,
-        total_borrows: `0u64.private`,
-        total_repayments: `0u64.private`,
-      },
-    };
-    console.log('getOrCreateActivity: Created zero activity record object (error fallback):', zeroActivityObject);
-    return zeroActivityObject;
+  } catch {
+    out = null;
   }
+  vaultHumanCache = { t: now, value: out };
+  return out;
+}
+
+function humanToMicroU64(h: number): bigint {
+  if (!Number.isFinite(h) || h <= 0) return BigInt(0);
+  const r = Math.round(h * 1_000_000);
+  if (r <= 0) return BigInt(0);
+  const cap = Number(LENDING_U64_MAX);
+  return BigInt(r > cap ? cap : r);
+}
+
+export type LendingPositionScaled = {
+  scaledSupNative: bigint;
+  scaledSupUsdcx: bigint;
+  scaledSupUsad: bigint;
+  scaledBorNative: bigint;
+  scaledBorUsdcx: bigint;
+  scaledBorUsad: bigint;
+};
+
+export type LendingOraclePublic = {
+  supIdxAleo: bigint;
+  supIdxUsdcx: bigint;
+  supIdxUsad: bigint;
+  borIdxAleo: bigint;
+  borIdxUsdcx: bigint;
+  borIdxUsad: bigint;
+  priceAleo: bigint;
+  priceUsdcx: bigint;
+  priceUsad: bigint;
+  ltvAleo: bigint;
+  ltvUsdcx: bigint;
+  ltvUsad: bigint;
+};
+
+function parseU64FromLeoFragment(s: string): bigint | null {
+  const m = String(s).match(/(\d[\d_]*)u64/i);
+  if (!m) return null;
+  try {
+    return BigInt(m[1].replace(/_/g, ''));
+  } catch {
+    return null;
+  }
+}
+
+export function parseLendingPositionScaledFromPlaintext(plain: string): LendingPositionScaled | null {
+  if (!plain || typeof plain !== 'string') return null;
+  const g = (name: string) => {
+    const re = new RegExp(`${name}:\\s*(\\d[\\d_]*)u64`, 'i');
+    const m = plain.match(re);
+    return m ? parseU64FromLeoFragment(`${m[1]}u64`) : null;
+  };
+  const scaledSupNative = g('scaled_sup_native');
+  const scaledSupUsdcx = g('scaled_sup_usdcx');
+  const scaledSupUsad = g('scaled_sup_usad');
+  const scaledBorNative = g('scaled_bor_native');
+  const scaledBorUsdcx = g('scaled_bor_usdcx');
+  const scaledBorUsad = g('scaled_bor_usad');
+  if (
+    scaledSupNative == null ||
+    scaledSupUsdcx == null ||
+    scaledSupUsad == null ||
+    scaledBorNative == null ||
+    scaledBorUsdcx == null ||
+    scaledBorUsad == null
+  ) {
+    return null;
+  }
+  return {
+    scaledSupNative,
+    scaledSupUsdcx,
+    scaledSupUsad,
+    scaledBorNative,
+    scaledBorUsdcx,
+    scaledBorUsad,
+  };
+}
+
+export function parseLendingPositionScaledFromRecord(record: any): LendingPositionScaled | null {
+  if (record == null) return null;
+        if (typeof record === 'string') {
+    return parseLendingPositionScaledFromPlaintext(record);
+  }
+  if (record.data && typeof record.data === 'object') {
+    const d = record.data;
+    const read = (k: string) => {
+      const v = d[k];
+      if (v == null) return null;
+      const s = String(v);
+      return parseU64FromLeoFragment(s.includes('u64') ? s : `${s}u64`);
+    };
+    const scaledSupNative = read('scaled_sup_native');
+    const scaledSupUsdcx = read('scaled_sup_usdcx');
+    const scaledSupUsad = read('scaled_sup_usad');
+    const scaledBorNative = read('scaled_bor_native');
+    const scaledBorUsdcx = read('scaled_bor_usdcx');
+    const scaledBorUsad = read('scaled_bor_usad');
+    if (
+      scaledSupNative != null &&
+      scaledSupUsdcx != null &&
+      scaledSupUsad != null &&
+      scaledBorNative != null &&
+      scaledBorUsdcx != null &&
+      scaledBorUsad != null
+    ) {
+      return {
+        scaledSupNative,
+        scaledSupUsdcx,
+        scaledSupUsad,
+        scaledBorNative,
+        scaledBorUsdcx,
+        scaledBorUsad,
+      };
+    }
+  }
+  if (record.plaintext && typeof record.plaintext === 'string') {
+    return parseLendingPositionScaledFromPlaintext(record.plaintext);
+  }
+  return null;
+}
+
+function isLendingPositionLike(record: any): boolean {
+  if (typeof record === 'string') {
+    return record.includes('scaled_sup_native') || record.includes('LendingPosition');
+  }
+  const n = (record?.recordName || record?.type || '').toString();
+  if (n.includes('LendingPosition')) return true;
+  return parseLendingPositionScaledFromRecord(record) != null;
+}
+
+async function resolveRecordPlaintext(
+  record: any,
+  decrypt?: (c: string) => Promise<string>,
+): Promise<string | null> {
+  if (typeof record === 'string') return record;
+  if (record?.plaintext && typeof record.plaintext === 'string') return record.plaintext;
+  const ct = record?.recordCiphertext || record?.ciphertext;
+  if (ct && decrypt) {
+    try {
+      const p = await decrypt(ct);
+      if (p) return p;
+    } catch {
+      // ignore
+    }
+  }
+  return null;
+}
+
+/**
+ * Index of `ref` in `records` (same array `requestRecords(programId)` uses), for `executeTransaction.recordIndices`.
+ */
+function findWalletRecordIndexInList(records: any[] | undefined, ref: any): number {
+  if (!records?.length || ref == null) return -1;
+  for (let i = 0; i < records.length; i++) {
+    if (records[i] === ref) return i;
+  }
+  const ct = ref?.recordCiphertext || ref?.record_ciphertext || ref?.ciphertext;
+  if (ct) {
+    for (let i = 0; i < records.length; i++) {
+      const r = records[i];
+      if ((r?.recordCiphertext || r?.record_ciphertext || r?.ciphertext) === ct) return i;
+    }
+  }
+  return -1;
+}
+
+/** Re-resolve `recordIndices` against a fresh `requestRecords` snapshot (ordering can shift between calls). */
+async function refreshLendingPositionRecordIndex(
+  requestRecords: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  poolProgramId: string,
+  walletRecord: any,
+  fallbackIdx: number,
+): Promise<{ records: any[]; recordIdx: number }> {
+  const records = await requestRecords(poolProgramId, false);
+  let recordIdx = findWalletRecordIndexInList(records, walletRecord);
+  if (recordIdx < 0) recordIdx = fallbackIdx;
+  return { records, recordIdx };
+}
+
+/** Block height from a wallet record (lending, credits, token, etc.). */
+function getWalletRecordBlockHeight(rec: any): number | null {
+  if (rec == null) return null;
+  const v =
+    rec.height ??
+    rec.block_height ??
+    rec.blockHeight ??
+    rec.block ??
+    (rec.data && typeof rec.data === 'object' && (rec.data as any).height) ??
+    (rec.data && typeof rec.data === 'object' && (rec.data as any).block_height);
+  if (v === undefined || v === null) return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+export type LendingPositionRecordCandidate = {
+  input: string | any;
+  scaled: LendingPositionScaled;
+  idx: number;
+  score: bigint;
+  borScore: bigint;
+  walletRecord: any;
+};
+
+/**
+ * All funded (or empty-only) `LendingPosition` candidates for selection / aggregation.
+ */
+export async function listFundedLendingPositionCandidates(
+  requestRecords: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  programId: string,
+  decrypt?: (cipherText: string) => Promise<string>,
+  recordsSnapshot?: any[],
+): Promise<LendingPositionRecordCandidate[]> {
+  const records = recordsSnapshot ?? (await requestRecords(programId, false));
+  if (!records?.length) return [];
+
+  const cands: LendingPositionRecordCandidate[] = [];
+
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r?.spent) continue;
+    if (!isLendingPositionLike(r)) continue;
+    const plain = await resolveRecordPlaintext(r, decrypt);
+    let scaled: LendingPositionScaled | null = null;
+    if (plain) scaled = parseLendingPositionScaledFromPlaintext(plain);
+    if (!scaled) scaled = parseLendingPositionScaledFromRecord(r);
+    if (!scaled) continue;
+    const input = plain ?? r;
+    const score =
+      scaled.scaledSupNative + scaled.scaledSupUsdcx + scaled.scaledSupUsad;
+    const borScore =
+      scaled.scaledBorNative + scaled.scaledBorUsdcx + scaled.scaledBorUsad;
+    cands.push({ input, scaled, idx: i, score, borScore, walletRecord: r });
+  }
+
+  if (cands.length === 0) return [];
+
+  const hasFunded = cands.some((c) => c.score > BigInt(0) || c.borScore > BigInt(0));
+  const pool = hasFunded
+    ? cands.filter((c) => c.score > BigInt(0) || c.borScore > BigInt(0))
+    : cands;
+  return pool;
+}
+
+/**
+ * Latest `LendingPosition` from the wallet for `programId`, or `null` (call `open_lending_account` first).
+ *
+ * @param recordsSnapshot — If provided, use this array instead of calling `requestRecords` again.
+ *   **Pass the same snapshot** you will use when resolving `recordIndices` for `executeTransaction`, or
+ *   wallet ordering can disagree with `recordIndex` and proofs will reject on-chain.
+ */
+export async function getLatestLendingPositionRecordInput(
+  requestRecords: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  programId: string,
+  decrypt?: (cipherText: string) => Promise<string>,
+  recordsSnapshot?: any[],
+): Promise<{
+  input: string | any;
+  scaled: LendingPositionScaled;
+  recordIndex: number;
+  /** Raw wallet record for `findWalletRecordIndexInList` (same array as snapshot / requestRecords). */
+  walletRecord: any;
+} | null> {
+  const pool = await listFundedLendingPositionCandidates(
+    requestRecords,
+    programId,
+    decrypt,
+    recordsSnapshot,
+  );
+  if (pool.length === 0) return null;
+
+  // Prefer max scaled supply. On equal supply, prefer **newer** block height when known.
+  // When height ties or is missing: prefer **lower** scaled borrow total — after a repay/borrow the canonical
+  // head is debt-free (or lower debt). Old unspent duplicates often still carry the pre-repay borrow; picking
+  // them makes withdraw/repay fail health asserts while the UI looks clean on the latest note.
+  const pickBetter = (a: LendingPositionRecordCandidate, b: LendingPositionRecordCandidate): LendingPositionRecordCandidate => {
+    if (a.score !== b.score) return a.score > b.score ? a : b;
+    const ha = getWalletRecordBlockHeight(a.walletRecord);
+    const hb = getWalletRecordBlockHeight(b.walletRecord);
+    if (ha != null && hb != null && ha !== hb) return ha > hb ? a : b;
+    if (ha != null && hb == null) return a;
+    if (hb != null && ha == null) return b;
+    if (a.borScore !== b.borScore) return a.borScore < b.borScore ? a : b;
+    return a.idx > b.idx ? a : b;
+  };
+  let best = pool[0];
+  for (let j = 1; j < pool.length; j++) {
+    best = pickBetter(best, pool[j]);
+  }
+  let input: string | any = best.input;
+  if (typeof input !== 'string' || !String(input).trim()) {
+    const p = await resolveRecordPlaintext(best.walletRecord, decrypt);
+    if (p) input = p;
+  }
+  return {
+    input,
+    scaled: best.scaled,
+    recordIndex: best.idx,
+    walletRecord: best.walletRecord,
+  };
+}
+
+export async function parseLatestLendingPositionScaled(
+  requestRecords: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  programId: string,
+  decrypt?: (cipherText: string) => Promise<string>,
+  /** Same snapshot as `lendingWithdrawUsdc` / caps so selection matches tx submission. */
+  recordsSnapshot?: any[],
+): Promise<LendingPositionScaled | null> {
+  const r = await getLatestLendingPositionRecordInput(requestRecords, programId, decrypt, recordsSnapshot);
+  return r?.scaled ?? null;
+}
+
+/** On-chain indices, prices, and LTVs (matches pool `finalize_*` public inputs). */
+export async function fetchLendingOraclePublic(programId: string): Promise<LendingOraclePublic> {
+  const zIdx = (x: bigint | null) => x ?? LENDING_INDEX_SCALE_ORACLE;
+  const zPrice = (x: bigint | null) => x ?? LENDING_PRICE_SCALE_ORACLE;
+  const [
+    supA,
+    supU,
+    supD,
+    borA,
+    borU,
+    borD,
+    pA,
+    pU,
+    pD,
+    ltvA,
+    ltvU,
+    ltvD,
+  ] = await Promise.all([
+    readMappingU64(programId, 'supply_index', '0field'),
+    readMappingU64(programId, 'supply_index', '1field'),
+    readMappingU64(programId, 'supply_index', '2field'),
+    readMappingU64(programId, 'borrow_index', '0field'),
+    readMappingU64(programId, 'borrow_index', '1field'),
+    readMappingU64(programId, 'borrow_index', '2field'),
+    readMappingU64(programId, 'asset_price', '0field'),
+    readMappingU64(programId, 'asset_price', '1field'),
+    readMappingU64(programId, 'asset_price', '2field'),
+    readMappingU64(programId, 'asset_ltv', '0field'),
+    readMappingU64(programId, 'asset_ltv', '1field'),
+    readMappingU64(programId, 'asset_ltv', '2field'),
+  ]);
+  return {
+    supIdxAleo: zIdx(supA),
+    supIdxUsdcx: zIdx(supU),
+    supIdxUsad: zIdx(supD),
+    borIdxAleo: zIdx(borA),
+    borIdxUsdcx: zIdx(borU),
+    borIdxUsad: zIdx(borD),
+    priceAleo: zPrice(pA),
+    priceUsdcx: zPrice(pU),
+    priceUsad: zPrice(pD),
+    ltvAleo: ltvA ?? BigInt(7500),
+    ltvUsdcx: ltvU ?? BigInt(8500),
+    ltvUsad: ltvD ?? BigInt(8500),
+  };
+}
+
+function oracleToBorrowWithdrawPublicInputs(o: LendingOraclePublic): string[] {
+  const u = (n: bigint) => `${n.toString()}u64`;
+  return [
+    u(o.supIdxAleo),
+    u(o.supIdxUsdcx),
+    u(o.supIdxUsad),
+    u(o.borIdxAleo),
+    u(o.borIdxUsdcx),
+    u(o.borIdxUsad),
+    u(o.priceAleo),
+    u(o.priceUsdcx),
+    u(o.priceUsad),
+    u(o.ltvAleo),
+    u(o.ltvUsdcx),
+    u(o.ltvUsad),
+  ];
+}
+
+/**
+ * Unified `withdraw`: LendingPosition input, amount, `out_asset`, then oracle.
+ * Order must match `program/build/abi.json` → `withdraw.inputs`: **amount (u64) before out_asset (field)**,
+ * then 12× u64 (`sup_idx_*`, `bor_idx_*`, `price_*`, `ltv_*`). Do **not** pass `U64Triple` / finalize-only args here.
+ * Shield `executeTransaction`: `positionInput` must be Leo plaintext `string` (wallet-serializable), **not** a raw JS record object — otherwise "Invalid transaction payload".
+ */
+function lendingWithdrawProgramInputs(
+  positionInput: unknown,
+  amountMicro: bigint,
+  outAssetField: '0field' | '1field' | '2field',
+  oracle: LendingOraclePublic,
+): unknown[] {
+  return [
+    positionInput,
+    `${amountMicro.toString()}u64`,
+    outAssetField,
+    ...oracleToBorrowWithdrawPublicInputs(oracle),
+  ];
+}
+
+/** Unified `borrow`: position, amount, `borrow_asset`, then oracle. */
+function lendingBorrowProgramInputs(
+  positionInput: unknown,
+  amountMicro: bigint,
+  borrowAssetField: '0field' | '1field' | '2field',
+  oracle: LendingOraclePublic,
+): unknown[] {
+  return [
+    positionInput,
+    `${amountMicro.toString()}u64`,
+    borrowAssetField,
+    ...oracleToBorrowWithdrawPublicInputs(oracle),
+  ];
+}
+
+function oracleToRepayPublicInputs(o: LendingOraclePublic): string[] {
+  const u = (n: bigint) => `${n.toString()}u64`;
+  return [
+    u(o.borIdxAleo),
+    u(o.borIdxUsdcx),
+    u(o.borIdxUsad),
+    u(o.priceAleo),
+    u(o.priceUsdcx),
+    u(o.priceUsad),
+  ];
+}
+
+export function formatU64TripleStruct(a: bigint, b: bigint, c: bigint): string {
+  return `{ x0: ${a}u64, x1: ${b}u64, x2: ${c}u64 }`;
+}
+
+export async function lendingOpenLendingAccount(
+  executeTransaction: ((tx: any) => Promise<any>) | undefined,
+  programId: string = LENDING_POOL_PROGRAM_ID,
+): Promise<string> {
+  if (!executeTransaction) throw new Error('executeTransaction is not available.');
+  const result = await executeTransaction({
+    program: programId,
+    function: 'open_lending_account',
+    inputs: [],
+    fee: DEFAULT_LENDING_FEE * 1_000_000,
+    privateFee: false,
+  });
+  const txId = result?.transactionId;
+  if (!txId) throw new Error('open_lending_account: no transactionId');
+  return txId;
 }
 
 /**
@@ -512,13 +943,8 @@ export async function getPrivateCreditsBalance(
 }
 
 /**
- * Deposit into the lending pool using a real `credits.aleo/credits` record.
- *
- * Contract: lending_pool_v86.aleo
- *   async transition deposit_with_credits(
- *     pay_record: credits.aleo/credits,
- *     public amount: u64
- *   ) -> (UserActivity, credits.aleo/credits, Future)
+ * Deposit into the lending pool using a real `credits.aleo::credits` record.
+ * xyra_lending_v8: `deposit_with_credits(position, pay_record, amount, sup_idx)`.
  */
 export async function lendingDeposit(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
@@ -526,6 +952,7 @@ export async function lendingDeposit(
   publicKey?: string,
   requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
   decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   console.log('========================================');
   console.log('💰 LENDING DEPOSIT (credits) CALLED');
@@ -533,7 +960,7 @@ export async function lendingDeposit(
   console.log('📥 Input Parameters:', {
     amount,
     network: CURRENT_NETWORK,
-    programId: LENDING_POOL_PROGRAM_ID,
+    programId: poolProgramId,
   });
 
   if (!executeTransaction) {
@@ -551,6 +978,24 @@ export async function lendingDeposit(
     // rounding to the nearest micro credit. Pool expects micro-ALEO as its `amount`.
     const amountMicro = Math.round(amount * 1_000_000);
     const requiredMicro = amountMicro;
+
+    const poolRecords = await requestRecords(poolProgramId, false);
+    const pos = await getLatestLendingPositionRecordInput(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      poolRecords,
+    );
+    if (!pos) {
+      throw new Error(
+        'No LendingPosition record found. Submit open_lending_account once, then deposit.',
+      );
+    }
+    let posIdx = findWalletRecordIndexInList(poolRecords, pos.walletRecord);
+    if (posIdx < 0) posIdx = pos.recordIndex;
+
+    const oracle = await fetchLendingOraclePublic(poolProgramId);
+    const supIdxStr = `${oracle.supIdxAleo.toString()}u64`;
 
     console.log('🔍 Fetching credits.aleo records for deposit...', {
       CREDITS_PROGRAM_ID,
@@ -597,12 +1042,15 @@ export async function lendingDeposit(
     };
 
     let payRecord: any | null = null;
-    for (const r of records as any[]) {
+    let payRecordIndex = -1;
+    for (let ri = 0; ri < records.length; ri++) {
+      const r = records[ri];
       if (r.spent) continue;
       const val = await processRecord(r);
       const isSpendable = !!(r.plaintext || r.nonce || r._nonce || r.data?._nonce || r.ciphertext);
       if (isSpendable && val >= requiredMicro) {
         payRecord = r;
+        payRecordIndex = ri;
         break;
       }
     }
@@ -640,24 +1088,41 @@ export async function lendingDeposit(
     }
 
     const amountInput = `${amountMicro}u64`;
-    const inputs: any[] = [recordInput, amountInput];
+
+    const { recordIdx: posIdxFresh } = await refreshLendingPositionRecordIndex(
+      requestRecords,
+      poolProgramId,
+      pos.walletRecord,
+      posIdx,
+    );
+    const creditsFresh = await requestRecords(CREDITS_PROGRAM_ID, false);
+    const payIdxFresh = findWalletRecordIndexInList(creditsFresh, payRecord);
+    const payIdxFinal = payIdxFresh >= 0 ? payIdxFresh : payRecordIndex;
+
+    const oracleAtSubmit = await fetchLendingOraclePublic(poolProgramId);
+    const supIdxStrAtSubmit = `${oracleAtSubmit.supIdxAleo.toString()}u64`;
+
+    const inputs: any[] = [pos.input, recordInput, amountInput, supIdxStrAtSubmit];
 
     console.log('🔍 Calling executeTransaction for deposit_with_credits...', {
-      program: LENDING_POOL_PROGRAM_ID,
+      program: poolProgramId,
       function: 'deposit_with_credits',
       inputsPreview: {
-        input0_len: recordInput.length,
-        input1: amountInput,
+        input0: 'LendingPosition',
+        input1_len: typeof recordInput === 'string' ? recordInput.length : 'object',
+        input2: amountInput,
+        input3: supIdxStrAtSubmit,
+        supIdxRefreshed: supIdxStrAtSubmit !== supIdxStr,
       },
     });
 
     const result = await executeTransaction({
-      program: LENDING_POOL_PROGRAM_ID,
+      program: poolProgramId,
       function: 'deposit_with_credits',
       inputs,
       fee: DEFAULT_LENDING_FEE * 1_000_000,
       privateFee: false,
-      recordIndices: [0],
+      recordIndices: payIdxFinal >= 0 ? [posIdxFresh, payIdxFinal] : [posIdxFresh, 0],
     });
 
     const tempId: string | undefined = result?.transactionId;
@@ -690,37 +1155,51 @@ export async function lendingDeposit(
 }
 
 /**
- * Borrow from the lending pool using wallet adapter (v8 - simplified API).
- * v8 API: borrow(public amount: u64) -> (UserActivity, Future)
- * - Updates public pool state (total_borrowed, utilization_index)
- * - Updates private user mappings (increments total_borrows counter)
- * - No Credits record needed - just amount
+ * Borrow ALEO from the pool (xyra_lending_v8: `borrow` + public oracle + LendingPosition).
  */
 export async function lendingBorrow(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
   amount: number,
+  publicKey?: string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   if (!executeTransaction) {
     throw new Error('executeTransaction is not available from the connected wallet.');
   }
-
+  if (!publicKey || !requestRecords) {
+    throw new Error('Wallet not connected or record access (requestRecords) unavailable.');
+  }
   if (amount <= 0) {
     throw new Error('Borrow amount must be greater than 0');
   }
 
   try {
-    const amountMicro = Math.round(amount * 1_000_000);
-    const inputs = [`${amountMicro}u64`];
-
-    // No frontend liquidity hard-block: program handles cross-collateral eligibility on-chain.
+    const records = await requestRecords(poolProgramId, false);
+    const pos = await getLatestLendingPositionRecordInput(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      records,
+    );
+    if (!pos) {
+      throw new Error('No LendingPosition record. Call open_lending_account before borrowing.');
+    }
+    let recordIdx = findWalletRecordIndexInList(records, pos.walletRecord);
+    if (recordIdx < 0) recordIdx = pos.recordIndex;
+    const oracle = await fetchLendingOraclePublic(poolProgramId);
+    const amountMicro = BigInt(Math.round(amount * 1_000_000));
+    const inputs = lendingBorrowProgramInputs(pos.input, amountMicro, '0field', oracle);
 
     console.log('🔍 Calling executeTransaction for borrow (public fee)...');
     const result = await executeTransaction({
-      program: LENDING_POOL_PROGRAM_ID,
+      program: poolProgramId,
       function: 'borrow',
       inputs,
       fee: DEFAULT_LENDING_FEE * 1_000_000,
       privateFee: false,
+      recordIndices: [recordIdx],
     });
 
     const tempId: string | undefined = result?.transactionId;
@@ -752,16 +1231,47 @@ export async function lendingBorrow(
   }
 }
 
+/** On-chain `position_note_schema` value after Sprint 2 `mint_position_migration_note`. */
+export const POSITION_NOTE_SCHEMA_ON_CHAIN_V2 = 2;
+
 /**
- * Repay to the lending pool using a real `credits.aleo/credits` record.
- *
- * Contract: lending_pool_v86.aleo
- *   async transition repay_with_credits(
- *     pay_record: credits.aleo/credits,
- *     public amount: u64
- *   ) -> (UserActivity, credits.aleo/credits, Future)
- *
- * This mirrors `lendingDeposit` but calls `repay_with_credits` instead of `deposit_with_credits`.
+ * Read lending pool mapping `position_note_schema` at `BHP256::hash_to_field(caller)`.
+ * `0` / missing = legacy-only; `2` = v2 PositionNote minted (see Sprint 2 migration).
+ */
+export async function getPositionNoteSchemaFromChain(
+  programId: string,
+  userAddress: string,
+): Promise<number | null> {
+  const userKey = await computeUserKeyFieldFromAddress(userAddress);
+  if (!userKey) return null;
+  try {
+    const res = await client.request('getMappingValue', {
+      program_id: programId,
+      mapping_name: 'position_note_schema',
+      key: userKey,
+    });
+    const raw = res?.value ?? res ?? null;
+    if (raw == null) return 0;
+    const str = String(raw).replace(/u64$/i, '').trim();
+    const n = Number(str);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Removed in xyra_lending_v8 (no `mint_position_migration_note`).
+ */
+export async function lendingMintPositionMigrationNote(
+  executeTransaction: ((tx: any) => Promise<any>) | undefined,
+): Promise<string> {
+  void executeTransaction;
+  throw new Error('mint_position_migration_note is not part of xyra_lending_v8.');
+}
+
+/**
+ * Repay with credits (xyra_lending_v8: `repay_with_credits` + public oracle).
  */
 export async function lendingRepay(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
@@ -769,6 +1279,7 @@ export async function lendingRepay(
   publicKey?: string,
   requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
   decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   if (!executeTransaction) {
     throw new Error('executeTransaction is not available from the connected wallet.');
@@ -781,6 +1292,20 @@ export async function lendingRepay(
   }
 
   try {
+    const poolRecords = await requestRecords(poolProgramId, false);
+    const pos = await getLatestLendingPositionRecordInput(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      poolRecords,
+    );
+    if (!pos) {
+      throw new Error('No LendingPosition record. Call open_lending_account before repaying.');
+    }
+    let posIdx = findWalletRecordIndexInList(poolRecords, pos.walletRecord);
+    if (posIdx < 0) posIdx = pos.recordIndex;
+    const oracle = await fetchLendingOraclePublic(poolProgramId);
+
     // Convert amount (credits) to microcredits. We allow decimals (up to 6 places),
     // rounding to the nearest micro credit. Pool expects micro-ALEO as its `amount`.
     const amountMicro = Math.round(amount * 1_000_000);
@@ -830,12 +1355,15 @@ export async function lendingRepay(
     };
 
     let payRecord: any | null = null;
-    for (const r of records as any[]) {
+    let payRecordIndex = -1;
+    for (let ri = 0; ri < records.length; ri++) {
+      const r = records[ri];
       if (r.spent) continue;
       const val = await processRecord(r);
       const isSpendable = !!(r.plaintext || r.nonce || r._nonce || r.data?._nonce || r.ciphertext);
       if (isSpendable && val >= requiredMicro) {
         payRecord = r;
+        payRecordIndex = ri;
         break;
       }
     }
@@ -873,24 +1401,26 @@ export async function lendingRepay(
     }
 
     const amountInput = `${amountMicro}u64`;
-    const inputs: any[] = [recordInput, amountInput];
+    const inputs: any[] = [pos.input, recordInput, amountInput, ...oracleToRepayPublicInputs(oracle)];
 
     console.log('🔍 Calling executeTransaction for repay_with_credits...', {
-      program: LENDING_POOL_PROGRAM_ID,
+      program: poolProgramId,
       function: 'repay_with_credits',
       inputsPreview: {
-        input0_len: typeof recordInput === 'string' ? recordInput.length : 'object',
-        input1: amountInput,
+        input0: 'LendingPosition',
+        input1_len: typeof recordInput === 'string' ? recordInput.length : 'object',
+        input2: amountInput,
       },
     });
 
     const result = await executeTransaction({
-      program: LENDING_POOL_PROGRAM_ID,
+      program: poolProgramId,
       function: 'repay_with_credits',
       inputs,
       fee: DEFAULT_LENDING_FEE * 1_000_000,
       privateFee: false,
-      recordIndices: [0],
+      recordIndices:
+        payRecordIndex >= 0 ? [posIdx, payRecordIndex] : [posIdx, 0],
     });
 
     const tempId: string | undefined = result?.transactionId;
@@ -922,6 +1452,167 @@ export async function lendingRepay(
   }
 }
 
+/**
+ * Self-liquidation: `self_liquidate_debt_credits` (v8 — no third-party liquidation without public positions).
+ */
+export async function lendingSelfLiquidateDebtCredits(
+  executeTransaction: ((tx: any) => Promise<any>) | undefined,
+  repayAmount: number,
+  seizeAsset: '0field' | '1field' | '2field',
+  publicKey?: string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = LENDING_POOL_PROGRAM_ID,
+): Promise<string> {
+  if (!executeTransaction) {
+    throw new Error('executeTransaction is not available from the connected wallet.');
+  }
+  if (!publicKey || !requestRecords) {
+    throw new Error('Wallet not connected or requestRecords unavailable for liquidation.');
+  }
+  if (repayAmount <= 0) {
+    throw new Error('Repay amount must be greater than 0.');
+  }
+
+  const poolRecords = await requestRecords(poolProgramId, false);
+  const pos = await getLatestLendingPositionRecordInput(
+    requestRecords,
+    poolProgramId,
+    decrypt,
+    poolRecords,
+  );
+  if (!pos) {
+    throw new Error('No LendingPosition record. Open a lending account first.');
+  }
+  let posIdx = findWalletRecordIndexInList(poolRecords, pos.walletRecord);
+  if (posIdx < 0) posIdx = pos.recordIndex;
+
+  const repayMicro = Math.round(repayAmount * 1_000_000);
+
+  let records = await requestRecords(CREDITS_PROGRAM_ID, false);
+  if (!records || !Array.isArray(records)) records = [];
+
+  const getMicrocredits = (record: any): number => {
+    try {
+      if (record.data && record.data.microcredits) {
+        return parseInt(String(record.data.microcredits).replace('u64', ''), 10);
+      }
+      if (record.plaintext) {
+        const match = String(record.plaintext).match(/microcredits:\s*([\d_]+)u64/);
+        if (match && match[1]) return parseInt(match[1].replace(/_/g, ''), 10);
+      }
+    } catch {
+      // ignore parse failures
+    }
+    return 0;
+  };
+
+  const processRecord = async (r: any): Promise<number> => {
+    let val = getMicrocredits(r);
+    if (val === 0 && r.recordCiphertext && !r.plaintext && decrypt) {
+      try {
+        const decrypted = await decrypt(r.recordCiphertext);
+        if (decrypted) {
+          r.plaintext = decrypted;
+          val = getMicrocredits(r);
+        }
+      } catch {
+        // ignore decrypt failures
+      }
+    }
+    return val;
+  };
+
+  let payRecord: any | null = null;
+  let payRecordIndex = -1;
+  for (let ri = 0; ri < records.length; ri++) {
+    const r = records[ri];
+    if (r.spent) continue;
+    const val = await processRecord(r);
+    const isSpendable = !!(r.plaintext || r.nonce || r._nonce || r.data?._nonce || r.ciphertext);
+    if (isSpendable && val >= repayMicro) {
+      payRecord = r;
+      payRecordIndex = ri;
+      break;
+    }
+  }
+  if (!payRecord) {
+    throw new Error(`No credits record has enough balance for ${repayAmount.toFixed(6)} ALEO liquidation repay.`);
+  }
+
+  let recordInput: string | any = payRecord.plaintext;
+  if (!recordInput) {
+    const nonce = payRecord.nonce || payRecord._nonce || payRecord.data?._nonce;
+    const micro = getMicrocredits(payRecord);
+    const owner = payRecord.owner;
+    if (nonce && micro > 0 && owner) {
+      recordInput = `{ owner: ${owner}.private, microcredits: ${micro}u64.private, _nonce: ${nonce}.public }`;
+    } else if (payRecord.ciphertext || payRecord.recordCiphertext) {
+      recordInput = payRecord.ciphertext || payRecord.recordCiphertext;
+    } else {
+      recordInput = payRecord;
+    }
+  }
+
+  const oracle = await fetchLendingOraclePublic(poolProgramId);
+  const [tA, tU, tD] = await Promise.all([
+    readMappingU64(poolProgramId, 'asset_liq_threshold', '0field'),
+    readMappingU64(poolProgramId, 'asset_liq_threshold', '1field'),
+    readMappingU64(poolProgramId, 'asset_liq_threshold', '2field'),
+  ]);
+  const bonus = await readMappingU64(poolProgramId, 'asset_liq_bonus', seizeAsset);
+
+  const inputs = [
+    pos.input,
+    recordInput,
+    `${repayMicro}u64`,
+    seizeAsset,
+    formatU64TripleStruct(oracle.supIdxAleo, oracle.supIdxUsdcx, oracle.supIdxUsad),
+    formatU64TripleStruct(oracle.borIdxAleo, oracle.borIdxUsdcx, oracle.borIdxUsad),
+    formatU64TripleStruct(oracle.priceAleo, oracle.priceUsdcx, oracle.priceUsad),
+    formatU64TripleStruct(tA ?? BigInt(0), tU ?? BigInt(0), tD ?? BigInt(0)),
+    `${(bonus ?? BigInt(0)).toString()}u64`,
+  ];
+  const result = await executeTransaction({
+    program: poolProgramId,
+    function: 'self_liquidate_debt_credits',
+    inputs,
+    fee: DEFAULT_LENDING_FEE * 1_000_000,
+    privateFee: false,
+    recordIndices:
+      payRecordIndex >= 0 ? [posIdx, payRecordIndex] : [posIdx, 0],
+  });
+  const tempId = result?.transactionId;
+  if (!tempId) throw new Error('Liquidation failed: No transactionId returned.');
+  return tempId;
+}
+
+/** @deprecated Use `lendingSelfLiquidateDebtCredits`. */
+export async function lendingLiquidateAleoDebt(
+  executeTransaction: ((tx: any) => Promise<any>) | undefined,
+  borrowerAddress: string,
+  repayAmount: number,
+  seizeAsset: '0field' | '1field' | '2field',
+  publicKey?: string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+): Promise<string> {
+  if (publicKey && borrowerAddress.trim() !== publicKey.trim()) {
+    throw new Error(
+      'Third-party liquidation is not supported on this pool version (positions are private). ' +
+        'Only self-liquidation is available.',
+    );
+  }
+  return lendingSelfLiquidateDebtCredits(
+    executeTransaction,
+    repayAmount,
+    seizeAsset,
+    publicKey,
+    requestRecords,
+    decrypt,
+  );
+}
+
 /** Same as pool `FLASH_PREMIUM_BPS` (0.05% of principal). */
 export const ALEO_FLASH_PREMIUM_BPS = 5;
 export const BPS_DENOMINATOR = 10_000;
@@ -934,8 +1625,7 @@ export function aleoFlashFeeMicro(principalMicro: number): number {
 }
 
 /**
- * Flash loan (ALEO pool): `flash_loan_with_credits` — pay principal + fee to vault in one tx;
- * backend sends principal to your wallet (same as borrow).
+ * Flash loans are not included in `xyra_lending_v9.aleo`. Reserved for a future program version.
  */
 export async function lendingFlashLoan(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
@@ -944,168 +1634,117 @@ export async function lendingFlashLoan(
   requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
   decrypt?: (cipherText: string) => Promise<string>,
 ): Promise<string> {
-  if (!executeTransaction) {
-    throw new Error('executeTransaction is not available from the connected wallet.');
-  }
-  if (!publicKey || !requestRecords) {
-    throw new Error('Wallet not connected or record access (requestRecords) unavailable for flash loan.');
-  }
-  if (amount <= 0) {
-    throw new Error('Flash loan amount must be greater than 0');
-  }
-
-  try {
-    const principalMicro = Math.round(amount * 1_000_000);
-    const feeMicro = aleoFlashFeeMicro(principalMicro);
-    const totalMicro = principalMicro + feeMicro;
-
-    console.log('🔍 Fetching credits.aleo records for flash_loan...', {
-      CREDITS_PROGRAM_ID,
-      principalMicro,
-      feeMicro,
-      totalMicro,
-    });
-
-    let records = await requestRecords(CREDITS_PROGRAM_ID, false);
-    if (!records || !Array.isArray(records)) records = [];
-
-    const getMicrocredits = (record: any): number => {
-      try {
-        if (record.data && record.data.microcredits) {
-          return parseInt(String(record.data.microcredits).replace('u64', ''), 10);
-        }
-        if (record.plaintext) {
-          const match = String(record.plaintext).match(/microcredits:\s*([\d_]+)u64/);
-          if (match && match[1]) {
-            return parseInt(match[1].replace(/_/g, ''), 10);
-          }
-        }
-      } catch {
-        // ignore
-      }
-      return 0;
-    };
-
-    const processRecord = async (r: any): Promise<number> => {
-      let val = getMicrocredits(r);
-      if (val === 0 && r.recordCiphertext && !r.plaintext && decrypt) {
-        try {
-          const decrypted = await decrypt(r.recordCiphertext);
-          if (decrypted) {
-            r.plaintext = decrypted;
-            val = getMicrocredits(r);
-          }
-        } catch (e) {
-          console.warn('⚠️ Failed to decrypt credits record for flash loan:', e);
-        }
-      }
-      return val;
-    };
-
-    let payRecord: any | null = null;
-    for (const r of records as any[]) {
-      if (r.spent) continue;
-      const val = await processRecord(r);
-      const isSpendable = !!(r.plaintext || r.nonce || r._nonce || r.data?._nonce || r.ciphertext);
-      if (isSpendable && val >= totalMicro) {
-        payRecord = r;
-        break;
-      }
-    }
-
-    if (!payRecord) {
-      throw new Error(
-        `No credits.aleo record covers principal + flash fee (${amount} + fee). Need one record with at least ${(totalMicro / 1_000_000).toFixed(6)} ALEO.`,
-      );
-    }
-
-    let recordInput: string | any = payRecord.plaintext;
-    if (!recordInput) {
-      const nonce = payRecord.nonce || payRecord._nonce || payRecord.data?._nonce;
-      const micro = getMicrocredits(payRecord);
-      const owner = payRecord.owner;
-      if (nonce && micro > 0 && owner) {
-        recordInput = `{ owner: ${owner}.private, microcredits: ${micro}u64.private, _nonce: ${nonce}.public }`;
-      } else if (payRecord.ciphertext || payRecord.recordCiphertext) {
-        recordInput = payRecord.ciphertext || payRecord.recordCiphertext;
-      } else {
-        recordInput = payRecord;
-      }
-    }
-
-    const amountInput = `${principalMicro}u64`;
-    const inputs: any[] = [recordInput, amountInput];
-
-    console.log('🔍 Calling executeTransaction for flash_loan_with_credits...', {
-      program: LENDING_POOL_PROGRAM_ID,
-      function: 'flash_loan_with_credits',
-      inputsPreview: { input1: amountInput },
-    });
-
-    const result = await executeTransaction({
-      program: LENDING_POOL_PROGRAM_ID,
-      function: 'flash_loan_with_credits',
-      inputs,
-      fee: DEFAULT_LENDING_FEE * 1_000_000,
-      privateFee: false,
-      recordIndices: [0],
-    });
-
-    const tempId: string | undefined = result?.transactionId;
-    if (!tempId) {
-      throw new Error('Flash loan failed: No temporary transactionId returned from wallet.');
-    }
-    console.log('Temporary Transaction ID (flash_loan_with_credits):', tempId);
-    return tempId;
-  } catch (error: any) {
-    console.error('❌ FLASH LOAN FAILED:', error);
-    const rawMsg = String(error?.message || error || '').toLowerCase();
-    const isCancelled =
-      rawMsg.includes('operation was cancelled by the user') ||
-      rawMsg.includes('operation was canceled by the user') ||
-      rawMsg.includes('user cancelled') ||
-      rawMsg.includes('user canceled') ||
-      rawMsg.includes('user rejected') ||
-      rawMsg.includes('rejected by user') ||
-      rawMsg.includes('transaction cancelled by user');
-    if (isCancelled) {
-      console.warn('💡 Flash loan cancelled by user (handled gracefully).');
-      return '__CANCELLED__';
-    }
-    throw new Error(`Flash loan failed: ${error?.message || 'Unknown error'}`);
-  }
+  void executeTransaction;
+  void amount;
+  void publicKey;
+  void requestRecords;
+  void decrypt;
+  throw new Error(
+    'Flash loans are not available in xyra_lending_v9. Deploy a program that includes flash_loan or use borrow/repay.',
+  );
 }
 
 /**
- * Withdraw from the lending pool using wallet adapter (v8 - simplified API).
- * v8 API: withdraw(public amount: u64) -> (UserActivity, Future)
- * - Updates public pool state (total_supplied, utilization_index)
- * - Updates private user mappings (increments total_withdrawals counter)
- * - No Credits record needed - just amount
+ * Withdraw ALEO (xyra_lending_v8: `withdraw` with `out_asset` `0field` + LendingPosition + public oracle).
  */
 export async function lendingWithdraw(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
   amount: number,
+  publicKey?: string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  amountMicroOverride?: bigint,
+  poolProgramId: string = LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   if (!executeTransaction) {
     throw new Error('executeTransaction is not available from the connected wallet.');
   }
-
+  if (!publicKey || !requestRecords) {
+    throw new Error('Wallet not connected or record access (requestRecords) unavailable.');
+  }
   if (amount <= 0) {
     throw new Error('Withdraw amount must be greater than 0');
   }
 
   try {
-    const amountMicro = Math.round(amount * 1_000_000);
-    const inputs = [`${amountMicro}u64`];
+    const records = await requestRecords(poolProgramId, false);
+    const pos = await getBestLendingPositionRecordForWithdrawOut(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      0,
+      records,
+    );
+    if (!pos) {
+      throw new Error('No LendingPosition record. Call open_lending_account before withdrawing.');
+    }
+    let recordIdx = findWalletRecordIndexInList(records, pos.walletRecord);
+    if (recordIdx < 0) recordIdx = pos.recordIndex;
+    const oracle = await fetchLendingOraclePublic(poolProgramId);
+    const amountMicro =
+      amountMicroOverride != null
+        ? amountMicroOverride
+        : BigInt(Math.floor(Math.max(0, Number(amount)) * 1_000_000));
+    if (amountMicro <= BigInt(0)) {
+      throw new Error('Withdraw amount must be greater than 0');
+    }
+    if (amountMicro > LENDING_U64_MAX) {
+      throw new Error('Withdraw amount exceeds u64.');
+    }
+    const bh = getWalletRecordBlockHeight(pos.walletRecord);
+    const posInputKind = typeof pos.input === 'string' ? 'plaintext' : 'object';
+    console.log(
+      '[ALEO withdraw] diagnostics',
+      JSON.stringify(
+        {
+          poolProgramId,
+          amountMicro: amountMicro.toString(),
+          recordIdx,
+          posInputKind,
+          recordBlockHeight: bh,
+          maxWithdrawMicroAleoPortfolio: pos.caps?.maxWithdrawMicroAleoPortfolio?.toString(),
+          maxWithdrawMicroAleo: pos.caps?.maxWithdrawMicroAleo?.toString(),
+          scaledSup: {
+            aleo: pos.scaled.scaledSupNative.toString(),
+            usdcx: pos.scaled.scaledSupUsdcx.toString(),
+            usad: pos.scaled.scaledSupUsad.toString(),
+          },
+          scaledBor: {
+            aleo: pos.scaled.scaledBorNative.toString(),
+            usdcx: pos.scaled.scaledBorUsdcx.toString(),
+            usad: pos.scaled.scaledBorUsad.toString(),
+          },
+          oracleSup: [oracle.supIdxAleo, oracle.supIdxUsdcx, oracle.supIdxUsad].map((x) => x.toString()),
+          oraclePrice: [oracle.priceAleo, oracle.priceUsdcx, oracle.priceUsad].map((x) => x.toString()),
+        },
+        null,
+        0,
+      ),
+    );
+    await logLendingWithdrawAuditIfEnabled(
+      poolProgramId,
+      'withdraw ALEO out',
+      pos.scaled,
+      oracle,
+      amountMicro,
+      '0field',
+    );
+    const { recordIdx: spendIdx } = await refreshLendingPositionRecordIndex(
+      requestRecords,
+      poolProgramId,
+      pos.walletRecord,
+      recordIdx,
+    );
+    const inputs = lendingWithdrawProgramInputs(pos.input, amountMicro, '0field', oracle);
 
     console.log('🔍 Calling executeTransaction for withdraw (public fee)...');
     const result = await executeTransaction({
-      program: LENDING_POOL_PROGRAM_ID,
+      program: poolProgramId,
       function: 'withdraw',
       inputs,
       fee: DEFAULT_LENDING_FEE * 1_000_000,
       privateFee: false,
+      recordIndices: [spendIdx],
     });
 
     const tempId: string | undefined = result?.transactionId;
@@ -1999,19 +2638,9 @@ export async function getLatestBlockHeight(): Promise<number> {
   }
 }
 
-/** Extract block height from a record if present (wallet/chain may provide height, block_height, etc.). */
+/** @deprecated use getWalletRecordBlockHeight — kept for USDC token helpers */
 function getUsdcRecordBlockHeight(rec: any): number | null {
-  if (rec == null) return null;
-  const v =
-    rec.height ??
-    rec.block_height ??
-    rec.blockHeight ??
-    rec.block ??
-    (rec.data && typeof rec.data === 'object' && (rec.data as any).height) ??
-    (rec.data && typeof rec.data === 'object' && (rec.data as any).block_height);
-  if (v === undefined || v === null) return null;
-  const n = typeof v === 'number' ? v : Number(v);
-  return Number.isFinite(n) ? n : null;
+  return getWalletRecordBlockHeight(rec);
 }
 
 /**
@@ -2357,8 +2986,7 @@ function handleUsadTxError(error: any, action: string): string {
 }
 
 /**
- * USAD deposit: xyra_lending_v2.aleo/deposit_usad(token, amount, proofs) — 3 inputs.
- * Amount in human USAD; converted to micro-USAD for the program.
+ * USAD deposit (v8: `deposit_usad` — position, token, amount, proofs, sup_idx).
  *
  * @param ownerAddress - Connected wallet `aleo1…` address. Used to build Sealance / Veiled Markets–style
  *   Merkle non-inclusion proofs when the wallet does not attach proofs to the record.
@@ -2369,11 +2997,28 @@ export async function lendingDepositUsad(
   tokenRecord: any,
   proofs?: [string, string] | string,
   ownerAddress?: string | null,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = USAD_LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   if (!executeTransaction) throw new Error('executeTransaction is not available.');
   if (amount <= 0) throw new Error('Deposit amount must be greater than 0');
   if (tokenRecord == null) throw new Error('A USAD Token record is required. Please ensure you have USAD in your wallet.');
+  if (!requestRecords) throw new Error('requestRecords is required for LendingPosition.');
   try {
+    const poolRecords = await requestRecords(poolProgramId, false);
+    const pos = await getLatestLendingPositionRecordInput(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      poolRecords,
+    );
+    if (!pos) {
+      throw new Error('No LendingPosition record. Call open_lending_account before depositing.');
+    }
+    let posIdx = findWalletRecordIndexInList(poolRecords, pos.walletRecord);
+    if (posIdx < 0) posIdx = pos.recordIndex;
+
     const tokenInput = getUsadTokenInputForTransition(tokenRecord);
     if (tokenInput === '' || (typeof tokenInput === 'string' && !String(tokenInput).trim())) {
       throw new Error('USAD Token record has no ciphertext or plaintext. Ensure the record is from test_usad_stablecoin.aleo and try again.');
@@ -2389,7 +3034,7 @@ export async function lendingDepositUsad(
       JSON.stringify(
         {
           ts: new Date().toISOString(),
-          poolProgram: USAD_LENDING_POOL_PROGRAM_ID,
+          poolProgram: poolProgramId,
           envPoolProgram: process.env.NEXT_PUBLIC_USAD_LENDING_POOL_PROGRAM_ID ?? '(unset)',
           tokenProgram: USAD_TOKEN_PROGRAM,
           function: 'deposit_usad',
@@ -2405,14 +3050,36 @@ export async function lendingDepositUsad(
       ),
     );
 
-    const inputs: (string | any)[] = [tokenInput, amountStr, proofsLiteral];
+    const { recordIdx: posIdxFresh } = await refreshLendingPositionRecordIndex(
+      requestRecords,
+      poolProgramId,
+      pos.walletRecord,
+      posIdx,
+    );
+    const tokenRecords = await requestRecords(USAD_TOKEN_PROGRAM, false);
+    const tokenIdxFresh = findWalletRecordIndexInList(tokenRecords, tokenRecord);
+
+    const oracleAtSubmit = await fetchLendingOraclePublic(poolProgramId);
+    const supIdxStrAtSubmit = `${oracleAtSubmit.supIdxUsad.toString()}u64`;
+
+    const inputs: (string | any)[] = [
+      pos.input,
+      tokenInput,
+      amountStr,
+      proofsLiteral,
+      supIdxStrAtSubmit,
+    ];
+
+    console.log('[USAD deposit] sup_idx at submit:', supIdxStrAtSubmit);
 
     const result = await executeTransaction({
-      program: USAD_LENDING_POOL_PROGRAM_ID,
+      program: poolProgramId,
       function: 'deposit_usad',
       inputs,
       fee: feeMicro,
       privateFee: false,
+      recordIndices:
+        tokenIdxFresh >= 0 ? [posIdxFresh, tokenIdxFresh] : [posIdxFresh, 0],
     });
     const tempId = result?.transactionId;
     if (!tempId) throw new Error('Deposit failed: No transactionId returned.');
@@ -2425,8 +3092,7 @@ export async function lendingDepositUsad(
 }
 
 /**
- * USAD repay: xyra_lending_v2.aleo/repay_usad(token, amount, proofs) — 3 inputs.
- * Amount in human USAD; converted to micro-USAD for the program.
+ * USAD repay (v8: position, token, amount, proofs, borrow indices, prices).
  *
  * @param ownerAddress - Connected wallet address for Sealance / Veiled-style Merkle proofs (see deposit).
  */
@@ -2436,11 +3102,29 @@ export async function lendingRepayUsad(
   tokenRecord: any,
   proofs?: [string, string] | string,
   ownerAddress?: string | null,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = USAD_LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   if (!executeTransaction) throw new Error('executeTransaction is not available.');
   if (amount <= 0) throw new Error('Repay amount must be greater than 0');
   if (tokenRecord == null) throw new Error('A USAD Token record is required for repay.');
+  if (!requestRecords) throw new Error('requestRecords is required for LendingPosition.');
   try {
+    const poolRecords = await requestRecords(poolProgramId, false);
+    const pos = await getLatestLendingPositionRecordInput(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      poolRecords,
+    );
+    if (!pos) {
+      throw new Error('No LendingPosition record. Call open_lending_account before repaying.');
+    }
+    let posIdx = findWalletRecordIndexInList(poolRecords, pos.walletRecord);
+    if (posIdx < 0) posIdx = pos.recordIndex;
+    const oracle = await fetchLendingOraclePublic(poolProgramId);
+
     const tokenInput = getUsadTokenInputForTransition(tokenRecord);
     if (tokenInput === '' || (typeof tokenInput === 'string' && !String(tokenInput).trim())) {
       throw new Error('USAD Token record has no ciphertext or plaintext. Ensure the record is from test_usad_stablecoin.aleo and try again.');
@@ -2456,7 +3140,7 @@ export async function lendingRepayUsad(
       JSON.stringify(
         {
           ts: new Date().toISOString(),
-          poolProgram: USAD_LENDING_POOL_PROGRAM_ID,
+          poolProgram: poolProgramId,
           envPoolProgram: process.env.NEXT_PUBLIC_USAD_LENDING_POOL_PROGRAM_ID ?? '(unset)',
           tokenProgram: USAD_TOKEN_PROGRAM,
           function: 'repay_usad',
@@ -2478,14 +3162,25 @@ export async function lendingRepayUsad(
       ),
     );
 
-    const inputs: (string | any)[] = [tokenInput, amountStr, proofsLiteral];
+    const inputs: (string | any)[] = [
+      pos.input,
+      tokenInput,
+      amountStr,
+      proofsLiteral,
+      ...oracleToRepayPublicInputs(oracle),
+    ];
+
+    const tokenRecords = await requestRecords(USAD_TOKEN_PROGRAM, false);
+    const tokenIdx = findWalletRecordIndexInList(tokenRecords, tokenRecord);
 
     const result = await executeTransaction({
-      program: USAD_LENDING_POOL_PROGRAM_ID,
+      program: poolProgramId,
       function: 'repay_usad',
       inputs,
       fee: feeMicro,
       privateFee: false,
+      recordIndices:
+        tokenIdx >= 0 ? [posIdx, tokenIdx] : [posIdx, 0],
     });
     const tempId = result?.transactionId;
     if (!tempId) throw new Error('Repay failed: No transactionId returned.');
@@ -2498,23 +3193,96 @@ export async function lendingRepayUsad(
 }
 
 /**
- * USAD withdraw: state-only; wallet submits withdraw transition, backend later transfers USAD.
+ * USAD withdraw (v8: LendingPosition + oracle).
  */
 export async function lendingWithdrawUsad(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
   amount: number,
+  publicKey?: string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = USAD_LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   if (!executeTransaction) throw new Error('executeTransaction is not available.');
+  if (!publicKey || !requestRecords) throw new Error('Wallet not connected or requestRecords unavailable.');
   if (amount <= 0) throw new Error('Withdraw amount must be greater than 0');
   try {
-    const amountMicro = Math.round(amount * 1_000_000);
-    const inputs = [`${amountMicro}u64`];
+    const records = await requestRecords(poolProgramId, false);
+    const pos = await getBestLendingPositionRecordForWithdrawOut(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      2,
+      records,
+    );
+    if (!pos) throw new Error('No LendingPosition record. Call open_lending_account first.');
+    let recordIdx = findWalletRecordIndexInList(records, pos.walletRecord);
+    if (recordIdx < 0) recordIdx = pos.recordIndex;
+    const oracle = await fetchLendingOraclePublic(poolProgramId);
+    const reqMicro = BigInt(Math.floor(Math.max(0, Number(amount)) * 1_000_000));
+    let amountMicro = reqMicro;
+    const caps = pos.caps;
+    if (caps?.maxWithdrawMicroUsad != null) {
+      let cap = caps.maxWithdrawMicroUsad;
+      const WD_SLACK_MICRO = BigInt(100);
+      if (cap > WD_SLACK_MICRO) cap -= WD_SLACK_MICRO;
+      if (reqMicro > cap) amountMicro = cap;
+    }
+    if (amountMicro <= BigInt(0)) throw new Error('Withdraw amount must be greater than 0');
+    if (amountMicro > LENDING_U64_MAX) throw new Error('Withdraw amount exceeds u64.');
+    const bh = getWalletRecordBlockHeight(pos.walletRecord);
+    const posInputKind = typeof pos.input === 'string' ? 'plaintext' : 'object';
+    console.log(
+      '[USAD withdraw] diagnostics',
+      JSON.stringify(
+        {
+          poolProgramId,
+          reqMicro: reqMicro.toString(),
+          amountMicro: amountMicro.toString(),
+          capApplied: reqMicro !== amountMicro,
+          recordIdx,
+          posInputKind,
+          recordBlockHeight: bh,
+          scaledSup: {
+            aleo: pos.scaled.scaledSupNative.toString(),
+            usdcx: pos.scaled.scaledSupUsdcx.toString(),
+            usad: pos.scaled.scaledSupUsad.toString(),
+          },
+          scaledBor: {
+            aleo: pos.scaled.scaledBorNative.toString(),
+            usdcx: pos.scaled.scaledBorUsdcx.toString(),
+            usad: pos.scaled.scaledBorUsad.toString(),
+          },
+          oracleSup: [oracle.supIdxAleo, oracle.supIdxUsdcx, oracle.supIdxUsad].map((x) => x.toString()),
+          oraclePrice: [oracle.priceAleo, oracle.priceUsdcx, oracle.priceUsad].map((x) => x.toString()),
+          oracleLtv: [oracle.ltvAleo, oracle.ltvUsdcx, oracle.ltvUsad].map((x) => x.toString()),
+        },
+        null,
+        0,
+      ),
+    );
+    await logLendingWithdrawAuditIfEnabled(
+      poolProgramId,
+      'withdraw USAD out',
+      pos.scaled,
+      oracle,
+      amountMicro,
+      '2field',
+    );
+    const { recordIdx: spendIdx } = await refreshLendingPositionRecordIndex(
+      requestRecords,
+      poolProgramId,
+      pos.walletRecord,
+      recordIdx,
+    );
+    const inputs = lendingWithdrawProgramInputs(pos.input, amountMicro, '2field', oracle);
     const result = await executeTransaction({
-      program: USAD_LENDING_POOL_PROGRAM_ID,
-      function: 'withdraw_usad',
+      program: poolProgramId,
+      function: 'withdraw',
       inputs,
       fee: DEFAULT_LENDING_FEE * 1_000_000,
       privateFee: false,
+      recordIndices: [spendIdx],
     });
     const tempId = result?.transactionId;
     if (!tempId) throw new Error('Withdraw failed: No transactionId returned.');
@@ -2525,23 +3293,40 @@ export async function lendingWithdrawUsad(
 }
 
 /**
- * USAD borrow: state-only; wallet submits borrow transition, backend later transfers USAD.
+ * USAD borrow (v8: LendingPosition + oracle).
  */
 export async function lendingBorrowUsad(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
   amount: number,
+  publicKey?: string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = USAD_LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   if (!executeTransaction) throw new Error('executeTransaction is not available.');
+  if (!publicKey || !requestRecords) throw new Error('Wallet not connected or requestRecords unavailable.');
   if (amount <= 0) throw new Error('Borrow amount must be greater than 0');
   try {
-    const amountMicro = Math.round(amount * 1_000_000);
-    const inputs = [`${amountMicro}u64`];
+    const records = await requestRecords(poolProgramId, false);
+    const pos = await getLatestLendingPositionRecordInput(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      records,
+    );
+    if (!pos) throw new Error('No LendingPosition record. Call open_lending_account first.');
+    let recordIdx = findWalletRecordIndexInList(records, pos.walletRecord);
+    if (recordIdx < 0) recordIdx = pos.recordIndex;
+    const oracle = await fetchLendingOraclePublic(poolProgramId);
+    const amountMicro = BigInt(Math.round(amount * 1_000_000));
+    const inputs = lendingBorrowProgramInputs(pos.input, amountMicro, '2field', oracle);
     const result = await executeTransaction({
-      program: USAD_LENDING_POOL_PROGRAM_ID,
-      function: 'borrow_usad',
+      program: poolProgramId,
+      function: 'borrow',
       inputs,
       fee: DEFAULT_LENDING_FEE * 1_000_000,
       privateFee: false,
+      recordIndices: [recordIdx],
     });
     const tempId = result?.transactionId;
     if (!tempId) throw new Error('Borrow failed: No transactionId returned.');
@@ -2552,19 +3337,36 @@ export async function lendingBorrowUsad(
 }
 
 /**
- * USDC deposit: xyra_lending_v2.aleo/deposit_usdcx — token, amount, proofs — 3 inputs.
+ * USDC deposit (v8: position, token, amount, proofs, sup_idx).
  * Amount in human USDC; converted to micro-USDC for the program.
  */
 export async function lendingDepositUsdc(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
   amount: number,
   tokenRecord: any,
-  proofs?: [string, string] | string
+  proofs?: [string, string] | string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = USDC_LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   if (!executeTransaction) throw new Error('executeTransaction is not available.');
   if (amount <= 0) throw new Error('Deposit amount must be greater than 0');
   if (tokenRecord == null) throw new Error('A USDC Token record is required. Please ensure you have USDCx in your wallet.');
+  if (!requestRecords) throw new Error('requestRecords is required for LendingPosition.');
   try {
+    const poolRecords = await requestRecords(poolProgramId, false);
+    const pos = await getLatestLendingPositionRecordInput(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      poolRecords,
+    );
+    if (!pos) {
+      throw new Error('No LendingPosition record. Call open_lending_account before depositing.');
+    }
+    let posIdx = findWalletRecordIndexInList(poolRecords, pos.walletRecord);
+    if (posIdx < 0) posIdx = pos.recordIndex;
+
     const tokenInput = getUsdcTokenInputForTransition(tokenRecord);
     if (tokenInput === '' || (typeof tokenInput === 'string' && !String(tokenInput).trim())) {
       throw new Error('USDC Token record has no ciphertext or plaintext. Ensure the record is from test_usdcx_stablecoin.aleo and try again.');
@@ -2580,7 +3382,7 @@ export async function lendingDepositUsdc(
       JSON.stringify(
         {
           ts: new Date().toISOString(),
-          poolProgram: USDC_LENDING_POOL_PROGRAM_ID,
+          poolProgram: poolProgramId,
           envPoolProgram: process.env.NEXT_PUBLIC_USDC_LENDING_POOL_PROGRAM_ID ?? '(unset)',
           tokenProgram: USDC_TOKEN_PROGRAM,
           function: 'deposit_usdcx',
@@ -2596,16 +3398,37 @@ export async function lendingDepositUsdc(
       ),
     );
 
-    const inputs: (string | any)[] = [tokenInput, amountStr, proofsLiteral];
+    const { recordIdx: posIdxFresh } = await refreshLendingPositionRecordIndex(
+      requestRecords,
+      poolProgramId,
+      pos.walletRecord,
+      posIdx,
+    );
+    const tokenRecords = await requestRecords(USDC_TOKEN_PROGRAM, false);
+    const tokenIdxFresh = findWalletRecordIndexInList(tokenRecords, tokenRecord);
+
+    const oracleAtSubmit = await fetchLendingOraclePublic(poolProgramId);
+    const supIdxStrAtSubmit = `${oracleAtSubmit.supIdxUsdcx.toString()}u64`;
+
+    const inputs: (string | any)[] = [
+      pos.input,
+      tokenInput,
+      amountStr,
+      proofsLiteral,
+      supIdxStrAtSubmit,
+    ];
 
     console.log('[USDC deposit] input2 proofs preview:', proofsLiteral.slice(0, 220));
+    console.log('[USDC deposit] sup_idx at submit:', supIdxStrAtSubmit);
 
     const result = await executeTransaction({
-      program: USDC_LENDING_POOL_PROGRAM_ID,
+      program: poolProgramId,
       function: 'deposit_usdcx',
       inputs,
       fee: feeMicro,
       privateFee: false,
+      recordIndices:
+        tokenIdxFresh >= 0 ? [posIdxFresh, tokenIdxFresh] : [posIdxFresh, 0],
     });
     const tempId = result?.transactionId;
     if (!tempId) throw new Error('Deposit failed: No transactionId returned.');
@@ -2618,19 +3441,37 @@ export async function lendingDepositUsdc(
 }
 
 /**
- * USDC repay: xyra_lending_v2.aleo/repay_usdcx — 3 inputs.
+ * USDC repay (v8: position, token, amount, proofs, oracle).
  * Amount in human USDC; converted to micro-USDC for the program.
  */
 export async function lendingRepayUsdc(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
   amount: number,
   tokenRecord: any,
-  proofs?: [string, string] | string
+  proofs?: [string, string] | string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = USDC_LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   if (!executeTransaction) throw new Error('executeTransaction is not available.');
   if (amount <= 0) throw new Error('Repay amount must be greater than 0');
   if (tokenRecord == null) throw new Error('A USDC Token record is required for repay.');
+  if (!requestRecords) throw new Error('requestRecords is required for LendingPosition.');
   try {
+    const poolRecords = await requestRecords(poolProgramId, false);
+    const pos = await getLatestLendingPositionRecordInput(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      poolRecords,
+    );
+    if (!pos) {
+      throw new Error('No LendingPosition record. Call open_lending_account before repaying.');
+    }
+    let posIdx = findWalletRecordIndexInList(poolRecords, pos.walletRecord);
+    if (posIdx < 0) posIdx = pos.recordIndex;
+    const oracle = await fetchLendingOraclePublic(poolProgramId);
+
     const tokenInput = getUsdcTokenInputForTransition(tokenRecord);
     if (tokenInput === '' || (typeof tokenInput === 'string' && !String(tokenInput).trim())) {
       throw new Error('USDC Token record has no ciphertext or plaintext. Ensure the record is from test_usdcx_stablecoin.aleo and try again.');
@@ -2646,7 +3487,7 @@ export async function lendingRepayUsdc(
       JSON.stringify(
         {
           ts: new Date().toISOString(),
-          poolProgram: USDC_LENDING_POOL_PROGRAM_ID,
+          poolProgram: poolProgramId,
           envPoolProgram: process.env.NEXT_PUBLIC_USDC_LENDING_POOL_PROGRAM_ID ?? '(unset)',
           tokenProgram: USDC_TOKEN_PROGRAM,
           function: 'repay_usdcx',
@@ -2667,16 +3508,27 @@ export async function lendingRepayUsdc(
       ),
     );
 
-    const inputs: (string | any)[] = [tokenInput, amountStr, proofsLiteral];
+    const inputs: (string | any)[] = [
+      pos.input,
+      tokenInput,
+      amountStr,
+      proofsLiteral,
+      ...oracleToRepayPublicInputs(oracle),
+    ];
 
     console.log('[USDC repay] input2 proofs preview:', proofsLiteral.slice(0, 220));
 
+    const tokenRecords = await requestRecords(USDC_TOKEN_PROGRAM, false);
+    const tokenIdx = findWalletRecordIndexInList(tokenRecords, tokenRecord);
+
     const result = await executeTransaction({
-      program: USDC_LENDING_POOL_PROGRAM_ID,
+      program: poolProgramId,
       function: 'repay_usdcx',
       inputs,
       fee: feeMicro,
       privateFee: false,
+      recordIndices:
+        tokenIdx >= 0 ? [posIdx, tokenIdx] : [posIdx, 0],
     });
     const tempId = result?.transactionId;
     if (!tempId) throw new Error('Repay failed: No transactionId returned.');
@@ -2691,18 +3543,91 @@ export async function lendingRepayUsdc(
 export async function lendingWithdrawUsdc(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
   amount: number,
+  publicKey?: string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = USDC_LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   if (!executeTransaction) throw new Error('executeTransaction is not available.');
+  if (!publicKey || !requestRecords) throw new Error('Wallet not connected or requestRecords unavailable.');
   if (amount <= 0) throw new Error('Withdraw amount must be greater than 0');
   try {
-    const amountMicro = Math.round(amount * 1_000_000);
-    const inputs = [`${amountMicro}u64`];
+    const records = await requestRecords(poolProgramId, false);
+    const pos = await getBestLendingPositionRecordForWithdrawOut(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      1,
+      records,
+    );
+    if (!pos) throw new Error('No LendingPosition record. Call open_lending_account first.');
+    let recordIdx = findWalletRecordIndexInList(records, pos.walletRecord);
+    if (recordIdx < 0) recordIdx = pos.recordIndex;
+    const oracle = await fetchLendingOraclePublic(poolProgramId);
+    const reqMicro = BigInt(Math.floor(Math.max(0, Number(amount)) * 1_000_000));
+    let amountMicro = reqMicro;
+    const caps = pos.caps;
+    if (caps?.maxWithdrawMicroUsdcx != null) {
+      let cap = caps.maxWithdrawMicroUsdcx;
+      const USDC_WD_SLACK_MICRO = BigInt(100);
+      if (cap > USDC_WD_SLACK_MICRO) cap -= USDC_WD_SLACK_MICRO;
+      if (reqMicro > cap) amountMicro = cap;
+    }
+    if (amountMicro <= BigInt(0)) throw new Error('Withdraw amount must be greater than 0');
+    if (amountMicro > LENDING_U64_MAX) throw new Error('Withdraw amount exceeds u64.');
+    const bh = getWalletRecordBlockHeight(pos.walletRecord);
+    const posInputKind = typeof pos.input === 'string' ? 'plaintext' : 'object';
+    console.log(
+      '[USDC withdraw] diagnostics',
+      JSON.stringify(
+        {
+          poolProgramId,
+          reqMicro: reqMicro.toString(),
+          amountMicro: amountMicro.toString(),
+          capApplied: reqMicro !== amountMicro,
+          recordIdx,
+          posInputKind,
+          recordBlockHeight: bh,
+          scaledSup: {
+            aleo: pos.scaled.scaledSupNative.toString(),
+            usdcx: pos.scaled.scaledSupUsdcx.toString(),
+            usad: pos.scaled.scaledSupUsad.toString(),
+          },
+          scaledBor: {
+            aleo: pos.scaled.scaledBorNative.toString(),
+            usdcx: pos.scaled.scaledBorUsdcx.toString(),
+            usad: pos.scaled.scaledBorUsad.toString(),
+          },
+          oracleSup: [oracle.supIdxAleo, oracle.supIdxUsdcx, oracle.supIdxUsad].map((x) => x.toString()),
+          oraclePrice: [oracle.priceAleo, oracle.priceUsdcx, oracle.priceUsad].map((x) => x.toString()),
+          oracleLtv: [oracle.ltvAleo, oracle.ltvUsdcx, oracle.ltvUsad].map((x) => x.toString()),
+        },
+        null,
+        0,
+      ),
+    );
+    await logLendingWithdrawAuditIfEnabled(
+      poolProgramId,
+      'withdraw USDCx out',
+      pos.scaled,
+      oracle,
+      amountMicro,
+      '1field',
+    );
+    const { recordIdx: spendIdx } = await refreshLendingPositionRecordIndex(
+      requestRecords,
+      poolProgramId,
+      pos.walletRecord,
+      recordIdx,
+    );
+    const inputs = lendingWithdrawProgramInputs(pos.input, amountMicro, '1field', oracle);
     const result = await executeTransaction({
-      program: USDC_LENDING_POOL_PROGRAM_ID,
-      function: 'withdraw_usdcx',
+      program: poolProgramId,
+      function: 'withdraw',
       inputs,
       fee: DEFAULT_LENDING_FEE * 1_000_000,
       privateFee: false,
+      recordIndices: [spendIdx],
     });
     const tempId = result?.transactionId;
     if (!tempId) throw new Error('Withdraw failed: No transactionId returned.');
@@ -2715,18 +3640,35 @@ export async function lendingWithdrawUsdc(
 export async function lendingBorrowUsdc(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
   amount: number,
+  publicKey?: string,
+  requestRecords?: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  poolProgramId: string = USDC_LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
   if (!executeTransaction) throw new Error('executeTransaction is not available.');
+  if (!publicKey || !requestRecords) throw new Error('Wallet not connected or requestRecords unavailable.');
   if (amount <= 0) throw new Error('Borrow amount must be greater than 0');
   try {
-    const amountMicro = Math.round(amount * 1_000_000);
-    const inputs = [`${amountMicro}u64`];
+    const records = await requestRecords(poolProgramId, false);
+    const pos = await getLatestLendingPositionRecordInput(
+      requestRecords,
+      poolProgramId,
+      decrypt,
+      records,
+    );
+    if (!pos) throw new Error('No LendingPosition record. Call open_lending_account first.');
+    let recordIdx = findWalletRecordIndexInList(records, pos.walletRecord);
+    if (recordIdx < 0) recordIdx = pos.recordIndex;
+    const oracle = await fetchLendingOraclePublic(poolProgramId);
+    const amountMicro = BigInt(Math.round(amount * 1_000_000));
+    const inputs = lendingBorrowProgramInputs(pos.input, amountMicro, '1field', oracle);
     const result = await executeTransaction({
-      program: USDC_LENDING_POOL_PROGRAM_ID,
-      function: 'borrow_usdcx',
+      program: poolProgramId,
+      function: 'borrow',
       inputs,
       fee: DEFAULT_LENDING_FEE * 1_000_000,
       privateFee: false,
+      recordIndices: [recordIdx],
     });
     const tempId = result?.transactionId;
     if (!tempId) throw new Error('Borrow failed: No transactionId returned.');
@@ -3511,64 +4453,66 @@ export async function computeLendingPositionMappingKey(
 }
 
 /**
- * Effective supply balance = (user_scaled_supply * supply_index) / INDEX_SCALE.
- * Effective borrow debt = (user_scaled_borrow * borrow_index) / INDEX_SCALE.
+ * Effective supply / borrow for one asset leg from private `LendingPosition` scaled amounts × on-chain indices.
  *
- * @param assetIdField Per-asset key: `0field` (ALEO), `1field` (USDCx), `2field` (USAD) for unified v3.
- * Returns null if position key cannot be computed (caller should fall back to records).
+ * @param assetIdField `0field` (ALEO), `1field` (USDCx), `2field` (USAD).
+ * @param scaled Parsed `LendingPosition` counters; if null, returns null (no public mapping fallback in v8).
  */
 export async function getAleoPoolUserEffectivePosition(
   programId: string,
-  userAddress: string,
+  _userAddress: string,
   assetIdField: string = '0field',
+  scaled: LendingPositionScaled | null,
 ): Promise<{ effectiveSupplyBalance: number; effectiveBorrowDebt: number } | null> {
-  const posKey = await computeLendingPositionMappingKey(userAddress, assetIdField);
-  if (!posKey) return null;
+  if (!scaled) return null;
   try {
-    const requestWithErrorHandling = async (mappingName: string, key: string) => {
-      try {
-        const res = await client.request('getMappingValue', {
-          program_id: programId,
-          mapping_name: mappingName,
-          key,
-        });
-        const raw = res?.value ?? res ?? null;
-        if (raw == null) return null;
-        const str = String(raw).replace(/u64$/i, '');
-        return str ? BigInt(str) : null;
-      } catch {
-        return null;
-      }
-    };
-
     const assetKey = normalizeFieldLiteral(assetIdField);
+    let ss: bigint;
+    let sb: bigint;
+    if (assetKey === '0field') {
+      ss = scaled.scaledSupNative;
+      sb = scaled.scaledBorNative;
+    } else if (assetKey === '1field') {
+      ss = scaled.scaledSupUsdcx;
+      sb = scaled.scaledBorUsdcx;
+    } else {
+      ss = scaled.scaledSupUsad;
+      sb = scaled.scaledBorUsad;
+    }
+
     const keyU8 = '0u8';
-    const [scaledSupply, scaledBorrow, supplyIndexAsset, borrowIndexAsset] = await Promise.all([
-      requestWithErrorHandling('user_scaled_supply', posKey),
-      requestWithErrorHandling('user_scaled_borrow', posKey),
-      requestWithErrorHandling('supply_index', assetKey),
-      requestWithErrorHandling('borrow_index', assetKey),
+    const [supplyIndexAsset, borrowIndexAsset] = await Promise.all([
+      getMappingU64Big(programId, 'supply_index', assetKey),
+      getMappingU64Big(programId, 'borrow_index', assetKey),
     ]);
 
     const INDEX_SCALE_ALEO = BigInt('1000000000000');
 
-    // Unified v3: indices are per asset_id. Legacy single-asset pools: fall back to 0field / 0u8.
     let li = supplyIndexAsset;
     if (li == null) {
       li =
-        (await requestWithErrorHandling('supply_index', '0field')) ??
-        (await requestWithErrorHandling('liquidity_index', keyU8));
+        (await getMappingU64Big(programId, 'supply_index', '0field')) ??
+        (await (async () => {
+          try {
+            const res = await client.request('getMappingValue', {
+              program_id: programId,
+              mapping_name: 'liquidity_index',
+              key: keyU8,
+            });
+            const raw = res?.value ?? res ?? null;
+            if (raw == null) return null;
+            return BigInt(String(raw).replace(/u64$/i, '').trim());
+          } catch {
+            return null;
+          }
+        })());
     }
     let bi = borrowIndexAsset;
     if (bi == null) {
-      bi =
-        (await requestWithErrorHandling('borrow_index', '0field')) ??
-        (await requestWithErrorHandling('borrow_index', keyU8));
+      bi = (await getMappingU64Big(programId, 'borrow_index', '0field')) ?? INDEX_SCALE_ALEO;
     }
     li = li ?? INDEX_SCALE_ALEO;
     bi = bi ?? INDEX_SCALE_ALEO;
-    const ss = scaledSupply ?? BigInt(0);
-    const sb = scaledBorrow ?? BigInt(0);
     const effectiveSupplyBalance = Number((ss * li) / INDEX_SCALE_ALEO);
     const effectiveBorrowDebt = Number((sb * bi) / INDEX_SCALE_ALEO);
     return { effectiveSupplyBalance, effectiveBorrowDebt };
@@ -3581,6 +4525,37 @@ export async function getAleoPoolUserEffectivePosition(
 const LENDING_INDEX_SCALE = BigInt('1000000000000');
 const LENDING_PRICE_SCALE = BigInt('1000000');
 const LENDING_LTV_SCALE = BigInt('10000');
+/** Matches `WITHDRAW_XA_REMAINDER_MAX` in lending `withdraw` (USD remainder after 3-leg burn; v6 uses 3). */
+const LENDING_WITHDRAW_REMAINDER_MAX_USD = BigInt(3);
+
+/**
+ * Floor 6-decimal token micro-units to a display precision (e.g. 2 → steps of 0.01 token = 10_000 micro).
+ * Use for withdraw MAX / inputs so UI matches borrow/repay-style 2 dp and stays at or below chain-safe amounts.
+ */
+const TOKEN_MICRO_POW10: readonly bigint[] = [
+  BigInt(1),
+  BigInt(10),
+  BigInt(100),
+  BigInt(1_000),
+  BigInt(10_000),
+  BigInt(100_000),
+  BigInt(1_000_000),
+];
+
+export function floorTokenMicroToDisplayDecimals(micro: bigint, displayDecimals: number): bigint {
+  if (micro <= BigInt(0)) return BigInt(0);
+  const d = Math.min(6, Math.max(0, Math.floor(displayDecimals)));
+  const drop = 6 - d;
+  if (drop <= 0) return micro;
+  const step = TOKEN_MICRO_POW10[drop] ?? BigInt(1);
+  return (micro / step) * step;
+}
+
+function toU64Leo(x: bigint): bigint {
+  if (x <= BigInt(0)) return BigInt(0);
+  return x > LENDING_U64_MAX ? LENDING_U64_MAX : x;
+}
+
 /** u128::MAX — same bound as Leo for `(real_sup * price) * ltv` before single division. */
 const LENDING_U128_MAX = BigInt('340282366920938463463374607431768211455');
 
@@ -3591,21 +4566,274 @@ function weightedCollateralUsdMicro(realSup: bigint, price: bigint, ltv: bigint)
   return rpTimesLOk ? (rp * ltv) / den : ((rp / LENDING_PRICE_SCALE) * ltv) / LENDING_LTV_SCALE;
 }
 
+/** Set `NEXT_PUBLIC_XYRA_WITHDRAW_DEBUG=true` in `.env` and restart dev — logs `[xyra withdraw audit]` before each withdraw tx. */
+const XYRA_WITHDRAW_AUDIT_DEBUG =
+  typeof process !== 'undefined' &&
+  (process.env.NEXT_PUBLIC_XYRA_WITHDRAW_DEBUG === 'true' ||
+    process.env.NEXT_PUBLIC_XYRA_WITHDRAW_DEBUG === '1');
+
+export type LendingWithdrawTransitionAudit = {
+  ok: boolean;
+  /** First Leo `assert` that would fail in `withdraw` (transition), or null if all pass. */
+  failReason: string | null;
+  checks: {
+    amountPositive: boolean;
+    withdrawUsdPositive: boolean;
+    withdrawLteTotalSupplyUsd: boolean;
+    scaledOutPositive: boolean;
+    remAfterUsadLteMax: boolean;
+    healthAfterWithdraw: boolean;
+  };
+  numerics: Record<string, string>;
+};
+
+/**
+ * When `supIdx > INDEX`, `floor(burn * INDEX / supIdx)` can be 0 for small positive `burn` (cross-asset ladder dust).
+ * Bump burn to the minimum raw that yields ≥1 scaled unit: `ceil(supIdx / INDEX)`, capped by `realSup` — must match `main.leo` `withdraw`.
+ */
+function bumpBurnForScaledWithdrawLeg(burn: bigint, realSup: bigint, supIdx: bigint): bigint {
+  if (burn <= BigInt(0)) return burn;
+  const scaledProbe = toU64Leo((burn * LENDING_INDEX_SCALE) / supIdx);
+  if (scaledProbe > BigInt(0)) return toU64Leo(burn);
+  const ceilMin = (supIdx + LENDING_INDEX_SCALE - BigInt(1)) / LENDING_INDEX_SCALE;
+  let bumped = burn > ceilMin ? burn : ceilMin;
+  if (bumped > realSup) bumped = realSup;
+  return toU64Leo(bumped);
+}
+
+/** Mirrors `xyra_lending_v*.aleo` `withdraw` transition (floor burn ladder, index-dust bump, `rem <= 3`, LTV health). */
+export function simulateLendingWithdrawTransitionAudit(
+  scaled: LendingPositionScaled,
+  oracle: LendingOraclePublic,
+  amountMicro: bigint,
+  outAssetField: '0field' | '1field' | '2field',
+): LendingWithdrawTransitionAudit {
+  const mulDiv = (a: bigint, b: bigint, den: bigint) => (a * b) / den;
+
+  const supA = oracle.supIdxAleo;
+  const supU = oracle.supIdxUsdcx;
+  const supD = oracle.supIdxUsad;
+  const borA = oracle.borIdxAleo;
+  const borU = oracle.borIdxUsdcx;
+  const borD = oracle.borIdxUsad;
+  const pA = oracle.priceAleo;
+  const pU = oracle.priceUsdcx;
+  const pD = oracle.priceUsad;
+  const lA = oracle.ltvAleo;
+  const lU = oracle.ltvUsdcx;
+  const lD = oracle.ltvUsad;
+
+  const priceOut = outAssetField === '0field' ? pA : outAssetField === '1field' ? pU : pD;
+
+  const realSupA = toU64Leo(mulDiv(scaled.scaledSupNative, supA, LENDING_INDEX_SCALE));
+  const realSupU = toU64Leo(mulDiv(scaled.scaledSupUsdcx, supU, LENDING_INDEX_SCALE));
+  const realSupD = toU64Leo(mulDiv(scaled.scaledSupUsad, supD, LENDING_INDEX_SCALE));
+
+  const supUsdA = toU64Leo(mulDiv(realSupA, pA, LENDING_PRICE_SCALE));
+  const supUsdU = toU64Leo(mulDiv(realSupU, pU, LENDING_PRICE_SCALE));
+  const supUsdD = toU64Leo(mulDiv(realSupD, pD, LENDING_PRICE_SCALE));
+
+  const totalSupplyUsd = supUsdA + supUsdU + supUsdD;
+  const withdrawUsd = toU64Leo(mulDiv(amountMicro, priceOut, LENDING_PRICE_SCALE));
+
+  const amountPositive = amountMicro > BigInt(0);
+  const withdrawUsdPositive = withdrawUsd > BigInt(0);
+  const withdrawLteTotalSupplyUsd = withdrawUsd <= totalSupplyUsd;
+
+  const targetAleoUsd = withdrawUsd > supUsdA ? supUsdA : withdrawUsd;
+  const burnAleoRaw = toU64Leo(mulDiv(targetAleoUsd, LENDING_PRICE_SCALE, pA));
+  const burnAleoPre = burnAleoRaw > realSupA ? realSupA : burnAleoRaw;
+  const burnAleo = bumpBurnForScaledWithdrawLeg(burnAleoPre, realSupA, supA);
+  const burnAleoUsd = toU64Leo(mulDiv(burnAleo, pA, LENDING_PRICE_SCALE));
+  const remAfterAleo = withdrawUsd > burnAleoUsd ? withdrawUsd - burnAleoUsd : BigInt(0);
+
+  const targetUsdcUsd = remAfterAleo > supUsdU ? supUsdU : remAfterAleo;
+  const burnUsdcRaw = toU64Leo(mulDiv(targetUsdcUsd, LENDING_PRICE_SCALE, pU));
+  const burnUsdcPre = burnUsdcRaw > realSupU ? realSupU : burnUsdcRaw;
+  const burnUsdc = bumpBurnForScaledWithdrawLeg(burnUsdcPre, realSupU, supU);
+  const burnUsdcUsd = toU64Leo(mulDiv(burnUsdc, pU, LENDING_PRICE_SCALE));
+  const remAfterUsdc = remAfterAleo > burnUsdcUsd ? remAfterAleo - burnUsdcUsd : BigInt(0);
+
+  const targetUsadUsd = remAfterUsdc > supUsdD ? supUsdD : remAfterUsdc;
+  const burnUsadRaw = toU64Leo(mulDiv(targetUsadUsd, LENDING_PRICE_SCALE, pD));
+  const burnUsadPre = burnUsadRaw > realSupD ? realSupD : burnUsadRaw;
+  const burnUsad = bumpBurnForScaledWithdrawLeg(burnUsadPre, realSupD, supD);
+  const burnUsadUsd = toU64Leo(mulDiv(burnUsad, pD, LENDING_PRICE_SCALE));
+  const remAfterUsad = remAfterUsdc > burnUsadUsd ? remAfterUsdc - burnUsadUsd : BigInt(0);
+
+  const remAfterUsadLteMax = remAfterUsad <= LENDING_WITHDRAW_REMAINDER_MAX_USD;
+
+  const realAfterA = realSupA > burnAleo ? realSupA - burnAleo : BigInt(0);
+  const realAfterU = realSupU > burnUsdc ? realSupU - burnUsdc : BigInt(0);
+  const realAfterD = realSupD > burnUsad ? realSupD - burnUsad : BigInt(0);
+
+  const wA = weightedCollateralUsdMicro(realAfterA, pA, lA);
+  const wU = weightedCollateralUsdMicro(realAfterU, pU, lU);
+  const wD = weightedCollateralUsdMicro(realAfterD, pD, lD);
+  const totalCollAfter = wA + wU + wD;
+
+  const realBorA = toU64Leo(mulDiv(scaled.scaledBorNative, borA, LENDING_INDEX_SCALE));
+  const realBorU = toU64Leo(mulDiv(scaled.scaledBorUsdcx, borU, LENDING_INDEX_SCALE));
+  const realBorD = toU64Leo(mulDiv(scaled.scaledBorUsad, borD, LENDING_INDEX_SCALE));
+
+  const debtA = toU64Leo(mulDiv(realBorA, pA, LENDING_PRICE_SCALE));
+  const debtU = toU64Leo(mulDiv(realBorU, pU, LENDING_PRICE_SCALE));
+  const debtD = toU64Leo(mulDiv(realBorD, pD, LENDING_PRICE_SCALE));
+  const totalDebt = debtA + debtU + debtD;
+
+  const healthAfterWithdraw = totalDebt === BigInt(0) || totalDebt <= totalCollAfter;
+
+  const scaledOutAleo = toU64Leo(mulDiv(burnAleo, LENDING_INDEX_SCALE, supA));
+  const scaledOutUsdc = toU64Leo(mulDiv(burnUsdc, LENDING_INDEX_SCALE, supU));
+  const scaledOutUsad = toU64Leo(mulDiv(burnUsad, LENDING_INDEX_SCALE, supD));
+  const scaledOutPositive =
+    (burnAleo === BigInt(0) || scaledOutAleo > BigInt(0)) &&
+    (burnUsdc === BigInt(0) || scaledOutUsdc > BigInt(0)) &&
+    (burnUsad === BigInt(0) || scaledOutUsad > BigInt(0));
+
+  let failReason: string | null = null;
+  if (!amountPositive) failReason = 'amount <= 0';
+  else if (!withdrawUsdPositive) failReason = 'withdraw_usd == 0 (amount * price / PRICE_SCALE truncated)';
+  else if (!withdrawLteTotalSupplyUsd) failReason = 'withdraw_usd > total_supply_usd';
+  else if (!scaledOutPositive) {
+    failReason =
+      'burn > 0 but scaled_out == 0 after index-dust bump (supply too small vs index; increase withdraw or close dust leg)';
+  } else if (!remAfterUsadLteMax) {
+    failReason = `rem_after_usad (${remAfterUsad}) > ${LENDING_WITHDRAW_REMAINDER_MAX_USD} (cross-asset rounding)`;
+  } else if (!healthAfterWithdraw) {
+    failReason = 'total_debt_usd > weighted_collateral_after (health / LTV)';
+  }
+
+  const ok =
+    amountPositive &&
+    withdrawUsdPositive &&
+    withdrawLteTotalSupplyUsd &&
+    scaledOutPositive &&
+    remAfterUsadLteMax &&
+    healthAfterWithdraw;
+
+  return {
+    ok,
+    failReason,
+    checks: {
+      amountPositive,
+      withdrawUsdPositive,
+      withdrawLteTotalSupplyUsd,
+      scaledOutPositive,
+      remAfterUsadLteMax,
+      healthAfterWithdraw,
+    },
+    numerics: {
+      amountMicro: amountMicro.toString(),
+      outAssetField,
+      priceOut: priceOut.toString(),
+      withdrawUsd: withdrawUsd.toString(),
+      totalSupplyUsd: totalSupplyUsd.toString(),
+      remAfterUsad: remAfterUsad.toString(),
+      burnAleo: burnAleo.toString(),
+      burnUsdcx: burnUsdc.toString(),
+      burnUsad: burnUsad.toString(),
+      totalDebtUsd: totalDebt.toString(),
+      weightedCollateralAfterUsd: totalCollAfter.toString(),
+      realSupAleo: realSupA.toString(),
+      realSupUsdcx: realSupU.toString(),
+      realSupUsad: realSupD.toString(),
+    },
+  };
+}
+
+export type LendingWithdrawFinalizePreview = {
+  /** Raw `available_liquidity[out]` before finalize (null = mapping empty). */
+  availableLiquidityPayout: string | null;
+  /** After Leo saturating subtract: `prev > amount ? prev - amount : 0`. */
+  payoutAfterSaturatingSub: string;
+  /** `true` when pool counter is below payout amount (finalize still applies; operational insolvency). */
+  liquidityDeficit: boolean;
+};
+
+/** Reads on-chain `available_liquidity` for the payout asset (diagnostic; finalize uses saturating subtract, vault pays out). */
+export async function previewLendingWithdrawFinalizeLiquidity(
+  programId: string,
+  outAssetField: '0field' | '1field' | '2field',
+  amountMicro: bigint,
+): Promise<LendingWithdrawFinalizePreview> {
+  const prev = await readMappingU64(programId, 'available_liquidity', outAssetField);
+  if (prev == null) {
+    return {
+      availableLiquidityPayout: null,
+      payoutAfterSaturatingSub: '0',
+      liquidityDeficit: amountMicro > BigInt(0),
+    };
+  }
+  const next = prev > amountMicro ? prev - amountMicro : BigInt(0);
+  return {
+    availableLiquidityPayout: prev.toString(),
+    payoutAfterSaturatingSub: next.toString(),
+    liquidityDeficit: prev < amountMicro,
+  };
+}
+
+/** Fresh oracle + transition simulation + payout liquidity (call right before `executeTransaction`). */
+export async function auditLendingWithdrawPreSubmit(
+  programId: string,
+  scaled: LendingPositionScaled,
+  amountMicro: bigint,
+  outField: '0field' | '1field' | '2field',
+): Promise<{
+  sim: LendingWithdrawTransitionAudit;
+  liquidity: LendingWithdrawFinalizePreview;
+  oracle: LendingOraclePublic;
+}> {
+  const oracle = await fetchLendingOraclePublic(programId);
+  const sim = simulateLendingWithdrawTransitionAudit(scaled, oracle, amountMicro, outField);
+  const liquidity = await previewLendingWithdrawFinalizeLiquidity(programId, outField, amountMicro);
+  return { sim, liquidity, oracle };
+}
+
+async function logLendingWithdrawAuditIfEnabled(
+  poolProgramId: string,
+  label: string,
+  scaled: LendingPositionScaled,
+  oracle: LendingOraclePublic,
+  amountMicro: bigint,
+  outField: '0field' | '1field' | '2field',
+): Promise<void> {
+  if (!XYRA_WITHDRAW_AUDIT_DEBUG) return;
+  const sim = simulateLendingWithdrawTransitionAudit(scaled, oracle, amountMicro, outField);
+  const liquidity = await previewLendingWithdrawFinalizeLiquidity(poolProgramId, outField, amountMicro);
+  console.log(
+    '[xyra withdraw audit]',
+    JSON.stringify(
+      {
+        label,
+        poolProgramId,
+        transitionOk: sim.ok,
+        failReason: sim.failReason,
+        checks: sim.checks,
+        numerics: sim.numerics,
+        finalizeLiquidity: liquidity,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
 async function getMappingU64Big(programId: string, mappingName: string, key: string): Promise<bigint | null> {
-  try {
-    const res = await client.request('getMappingValue', {
-      program_id: programId,
-      mapping_name: mappingName,
-      key,
-    });
-    const raw = res?.value ?? res ?? null;
-    if (raw == null) return null;
+      try {
+        const res = await client.request('getMappingValue', {
+          program_id: programId,
+          mapping_name: mappingName,
+          key,
+        });
+        const raw = res?.value ?? res ?? null;
+        if (raw == null) return null;
     const str = String(raw).replace(/u64$/i, '').trim();
     if (!str) return null;
     return BigInt(str);
-  } catch {
-    return null;
-  }
+      } catch {
+        return null;
+      }
 }
 
 /** Raw JSON-RPC result for debugging (some nodes nest `value`, others return the literal on `result`). */
@@ -3768,7 +4996,8 @@ export async function probeLendingPositionMappings(
 
   let caps: Awaited<ReturnType<typeof getCrossCollateralBorrowCapsFromChain>> = null;
   try {
-    caps = await getCrossCollateralBorrowCapsFromChain(programId, trimmed);
+    caps = await getCrossCollateralBorrowCapsFromChain(programId, null);
+    notes.push('v8: per-user caps need wallet LendingPosition — caps above are null without scaled record.');
   } catch (e: unknown) {
     notes.push(`getCrossCollateralBorrowCapsFromChain threw: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -3825,6 +5054,140 @@ export async function probeLendingPositionMappings(
   };
 }
 
+export type LiquidationPreview = {
+  ok: boolean;
+  reason?: string;
+  liquidatable: boolean;
+  totalDebtUsd: number;
+  thresholdCollateralUsd: number;
+  aleoDebt: number;
+  maxCloseAleo: number;
+  repayAleo: number;
+  seizeAsset: '0field' | '1field' | '2field';
+  /** Borrower real supply in the selected seize asset (micro-units as float). */
+  collateralSeizeAsset: number;
+  seizeAmount: number;
+  seizeUsd: number;
+  liqBonusBps: number;
+};
+
+/** Self-liquidation preview (v8: uses private `LendingPosition` — no third-party borrower lookup). */
+export async function getLiquidationPreviewAleo(
+  programId: string,
+  repayAleo: number,
+  seizeAsset: '0field' | '1field' | '2field',
+  scaled: LendingPositionScaled | null,
+): Promise<LiquidationPreview> {
+  const zero: LiquidationPreview = {
+    ok: false,
+    reason: 'Preview unavailable.',
+    liquidatable: false,
+    totalDebtUsd: 0,
+    thresholdCollateralUsd: 0,
+    aleoDebt: 0,
+    maxCloseAleo: 0,
+    repayAleo: 0,
+    seizeAsset,
+    collateralSeizeAsset: 0,
+    seizeAmount: 0,
+    seizeUsd: 0,
+    liqBonusBps: 0,
+  };
+
+  if (!scaled) {
+    return { ...zero, reason: 'No LendingPosition in wallet — open an account or refresh records.' };
+  }
+  if (!Number.isFinite(repayAleo) || repayAleo <= 0) {
+    return { ...zero, reason: 'Enter repay amount > 0.' };
+  }
+
+  try {
+    const readU64 = async (mappingName: string, key: string): Promise<number> => {
+      try {
+        const res = await client.request('getMappingValue', {
+          program_id: programId,
+          mapping_name: mappingName,
+          key,
+        });
+        return parseMappingU64Response(res) ?? 0;
+      } catch {
+        return 0;
+      }
+    };
+
+    const sA = Number(scaled.scaledSupNative);
+    const sU = Number(scaled.scaledSupUsdcx);
+    const sD = Number(scaled.scaledSupUsad);
+    const bA = Number(scaled.scaledBorNative);
+    const bU = Number(scaled.scaledBorUsdcx);
+    const bD = Number(scaled.scaledBorUsad);
+
+    const [iSA, iSU, iSD, iBA, iBU, iBD, pA, pU, pD, tA, tU, tD, bonus] = await Promise.all([
+      readU64('supply_index', '0field'),
+      readU64('supply_index', '1field'),
+      readU64('supply_index', '2field'),
+      readU64('borrow_index', '0field'),
+      readU64('borrow_index', '1field'),
+      readU64('borrow_index', '2field'),
+      readU64('asset_price', '0field'),
+      readU64('asset_price', '1field'),
+      readU64('asset_price', '2field'),
+      readU64('asset_liq_threshold', '0field'),
+      readU64('asset_liq_threshold', '1field'),
+      readU64('asset_liq_threshold', '2field'),
+      readU64('asset_liq_bonus', seizeAsset),
+    ]);
+
+    const INDEX_SCALE = 1_000_000_000_000;
+    const PRICE_SCALE = 1_000_000;
+    const BPS = 10_000;
+    const CLOSE_FACTOR_BPS = 5_000;
+
+    const realSupA = (sA * iSA) / INDEX_SCALE;
+    const realSupU = (sU * iSU) / INDEX_SCALE;
+    const realSupD = (sD * iSD) / INDEX_SCALE;
+    const realBorA = (bA * iBA) / INDEX_SCALE;
+    const realBorU = (bU * iBU) / INDEX_SCALE;
+    const realBorD = (bD * iBD) / INDEX_SCALE;
+
+    const weighted = (real: number, price: number, thr: number) => (real * price * thr) / (PRICE_SCALE * BPS);
+    const debt = (real: number, price: number) => (real * price) / PRICE_SCALE;
+
+    const thresholdCollateralUsd =
+      weighted(realSupA, pA, tA) + weighted(realSupU, pU, tU) + weighted(realSupD, pD, tD);
+    const totalDebtUsd = debt(realBorA, pA) + debt(realBorU, pU) + debt(realBorD, pD);
+    const liquidatable = totalDebtUsd > thresholdCollateralUsd;
+
+    const aleoDebt = realBorA;
+    const maxCloseAleo = Math.max(0, Math.min(aleoDebt, (aleoDebt * CLOSE_FACTOR_BPS) / BPS));
+    const repayAleoClamped = Math.max(0, Math.min(repayAleo, maxCloseAleo));
+    const repayMicro = Math.round(repayAleoClamped * 1_000_000);
+    const repayUsd = (repayMicro * pA) / PRICE_SCALE;
+    const seizeUsd = (repayUsd * (BPS + bonus)) / BPS;
+    const seizePrice = seizeAsset === '0field' ? pA : seizeAsset === '1field' ? pU : pD;
+    const seizeAmount = seizePrice > 0 ? seizeUsd / seizePrice : 0;
+    const collateralSeizeAsset =
+      seizeAsset === '0field' ? realSupA : seizeAsset === '1field' ? realSupU : realSupD;
+
+    return {
+      ok: true,
+      liquidatable,
+      totalDebtUsd,
+      thresholdCollateralUsd,
+      aleoDebt,
+      maxCloseAleo,
+      repayAleo: repayAleoClamped,
+      seizeAsset,
+      collateralSeizeAsset,
+      seizeAmount,
+      seizeUsd,
+      liqBonusBps: bonus,
+    };
+  } catch (e: any) {
+    return { ...zero, reason: e?.message || 'Failed to compute preview.' };
+  }
+}
+
 /**
  * Replicates `finalize_borrow` collateral/debt USD totals and max borrow per asset (micro units)
  * so the UI cannot exceed `assert(total_debt + new_borrow_usd <= total_collateral)`.
@@ -3837,7 +5200,7 @@ export type CrossCollateralChainCaps = {
   maxBorrowMicroAleo: bigint;
   maxBorrowMicroUsdcx: bigint;
   maxBorrowMicroUsad: bigint;
-  /** Effective token amounts (micro units) from `user_scaled_*` × indices — use for UI rows when set. */
+  /** Effective token amounts (micro units) from scaled position × indices — use for UI rows when set. */
   realSupplyMicroAleo: bigint;
   realSupplyMicroUsdcx: bigint;
   realSupplyMicroUsad: bigint;
@@ -3848,25 +5211,20 @@ export type CrossCollateralChainCaps = {
 
 export async function getCrossCollateralBorrowCapsFromChain(
   programId: string,
-  userAddress: string,
+  scaled: LendingPositionScaled | null,
 ): Promise<CrossCollateralChainCaps | null> {
-  await loadProvableWasm();
-  const [pkAleo, pkUsdcx, pkUsad] = await Promise.all([
-    computeLendingPositionMappingKey(userAddress, '0field'),
-    computeLendingPositionMappingKey(userAddress, '1field'),
-    computeLendingPositionMappingKey(userAddress, '2field'),
-  ]);
-  if (!pkAleo || !pkUsdcx || !pkUsad) return null;
+  if (!scaled) return null;
 
   const z = (x: bigint | null) => x ?? BigInt(0);
 
+  const ssA = scaled.scaledSupNative;
+  const ssU = scaled.scaledSupUsdcx;
+  const ssD = scaled.scaledSupUsad;
+  const sbA = scaled.scaledBorNative;
+  const sbU = scaled.scaledBorUsdcx;
+  const sbD = scaled.scaledBorUsad;
+
   const [
-    ssA,
-    ssU,
-    ssD,
-    sbA,
-    sbU,
-    sbD,
     supA,
     supU,
     supD,
@@ -3880,12 +5238,6 @@ export async function getCrossCollateralBorrowCapsFromChain(
     ltvU,
     ltvD,
   ] = await Promise.all([
-    getMappingU64Big(programId, 'user_scaled_supply', pkAleo),
-    getMappingU64Big(programId, 'user_scaled_supply', pkUsdcx),
-    getMappingU64Big(programId, 'user_scaled_supply', pkUsad),
-    getMappingU64Big(programId, 'user_scaled_borrow', pkAleo),
-    getMappingU64Big(programId, 'user_scaled_borrow', pkUsdcx),
-    getMappingU64Big(programId, 'user_scaled_borrow', pkUsad),
     getMappingU64Big(programId, 'supply_index', '0field'),
     getMappingU64Big(programId, 'supply_index', '1field'),
     getMappingU64Big(programId, 'supply_index', '2field'),
@@ -3932,8 +5284,11 @@ export async function getCrossCollateralBorrowCapsFromChain(
   const debtU = (realBorU * priceU) / LENDING_PRICE_SCALE;
   const debtD = (realBorD * priceD) / LENDING_PRICE_SCALE;
   const totalDebtUsd = debtA + debtU + debtD;
+  const anyScaledBorrow = sbA + sbU + sbD > BigInt(0);
+  const debtUsdForHealth =
+    totalDebtUsd > BigInt(0) ? totalDebtUsd : anyScaledBorrow ? BigInt(1) : BigInt(0);
 
-  let headroomUsd = totalCollateralUsd - totalDebtUsd;
+  let headroomUsd = totalCollateralUsd - debtUsdForHealth;
   if (headroomUsd < BigInt(0)) headroomUsd = BigInt(0);
 
   const maxMicroForPrice = (head: bigint, price: bigint): bigint => {
@@ -3941,13 +5296,27 @@ export async function getCrossCollateralBorrowCapsFromChain(
     return (head * LENDING_PRICE_SCALE + LENDING_PRICE_SCALE - BigInt(1)) / price;
   };
 
+  let maxBorrowMicroAleo = maxMicroForPrice(headroomUsd, priceA);
+  let maxBorrowMicroUsdcx = maxMicroForPrice(headroomUsd, priceU);
+  let maxBorrowMicroUsad = maxMicroForPrice(headroomUsd, priceD);
+
+  const vaultHum = await fetchVaultHumanBalancesFromBackend();
+  if (vaultHum) {
+    const vA = humanToMicroU64(vaultHum.aleo);
+    const vU = humanToMicroU64(vaultHum.usdcx);
+    const vD = humanToMicroU64(vaultHum.usad);
+    maxBorrowMicroAleo = maxBorrowMicroAleo < vA ? maxBorrowMicroAleo : vA;
+    maxBorrowMicroUsdcx = maxBorrowMicroUsdcx < vU ? maxBorrowMicroUsdcx : vU;
+    maxBorrowMicroUsad = maxBorrowMicroUsad < vD ? maxBorrowMicroUsad : vD;
+  }
+
   return {
     totalCollateralUsd,
     totalDebtUsd,
     headroomUsd,
-    maxBorrowMicroAleo: maxMicroForPrice(headroomUsd, priceA),
-    maxBorrowMicroUsdcx: maxMicroForPrice(headroomUsd, priceU),
-    maxBorrowMicroUsad: maxMicroForPrice(headroomUsd, priceD),
+    maxBorrowMicroAleo,
+    maxBorrowMicroUsdcx,
+    maxBorrowMicroUsad,
     realSupplyMicroAleo: realSupA,
     realSupplyMicroUsdcx: realSupU,
     realSupplyMicroUsad: realSupD,
@@ -3961,136 +5330,124 @@ export type CrossCollateralWithdrawCaps = {
   maxWithdrawMicroAleo: bigint;
   maxWithdrawMicroUsdcx: bigint;
   maxWithdrawMicroUsad: bigint;
+  /**
+   * ALEO withdraw from position/health only (binary search), before treasury / mapping payout clamp.
+   */
+  maxWithdrawMicroAleoPortfolio: bigint;
+  /** `available_liquidity` mapping for native ALEO (`0field`); null if RPC read failed (diagnostics only when vault fetch works). */
+  availableLiquidityMicroAleo: bigint | null;
 };
 
 /**
- * Replicates `finalize_withdraw` health + collateral burn logic from `xyra_lending_v4.aleo`.
- * Returns the maximum output-asset amount (micro units) the user can withdraw while the
- * program's assertions pass, allowing "withdraw with any asset".
+ * Replicates unified `withdraw` (`0field` ALEO / `1field` USDCx / `2field` USAD) on-chain:
+ * same oracle as `fetchLendingOraclePublic` (the tx path), and u64 truncation on intermediates
+ * (`real_sup_*`, `sup_*_usd_before`, `withdraw_usd`, burn legs, debt USD, weighted collateral after).
+ *
+ * **Portfolio USD cap (cross-asset):** `canWithdraw` requires `withdraw_usd <= supUsdA + supUsdU + supUsdD` for this note.
+ * The ladder walks ALEO → USDCx → USAD; the user does **not** need supply in the payout asset—only enough **total**
+ * raw-supply USD across the three (plus health / rem<=3 / index-dust bump matching `main.leo`).
+ *
+ * **Payout caps (frontend):** `min(portfolio binary search, treasury)` per asset when `/vault-balances` loads.
+ * Withdraw: transition burn ladder matches Leo (floor + index-dust bump + rem<=3); finalize decrements **`available_liquidity[payout]` only**
+ * (saturating). Cross-asset does **not** require on-chain idle stables if treasury funds the payout.
+ *
+ * **Why UI max can be below displayed supply (normal):** (1) **Debt** — health after withdraw. (2) **One note per tx**.
+ * (3) **Vault** — `min(..., vaultHum.*)` caps payout to operational liquidity.
  */
 export async function getCrossCollateralWithdrawCapsFromChain(
   programId: string,
-  userAddress: string,
+  scaled: LendingPositionScaled | null,
 ): Promise<CrossCollateralWithdrawCaps | null> {
-  await loadProvableWasm();
-  const [pkAleo, pkUsdcx, pkUsad] = await Promise.all([
-    computeLendingPositionMappingKey(userAddress, '0field'),
-    computeLendingPositionMappingKey(userAddress, '1field'),
-    computeLendingPositionMappingKey(userAddress, '2field'),
-  ]);
-  if (!pkAleo || !pkUsdcx || !pkUsad) return null;
+  if (!scaled) return null;
 
   const z = (x: bigint | null) => x ?? BigInt(0);
 
-  const [
-    ssA,
-    ssU,
-    ssD,
-    sbA,
-    sbU,
-    sbD,
-    supA,
-    supU,
-    supD,
-    borA,
-    borU,
-    borD,
-    pA,
-    pU,
-    pD,
-    ltvA,
-    ltvU,
-    ltvD,
-  ] = await Promise.all([
-    getMappingU64Big(programId, 'user_scaled_supply', pkAleo),
-    getMappingU64Big(programId, 'user_scaled_supply', pkUsdcx),
-    getMappingU64Big(programId, 'user_scaled_supply', pkUsad),
-    getMappingU64Big(programId, 'user_scaled_borrow', pkAleo),
-    getMappingU64Big(programId, 'user_scaled_borrow', pkUsdcx),
-    getMappingU64Big(programId, 'user_scaled_borrow', pkUsad),
-    getMappingU64Big(programId, 'supply_index', '0field'),
-    getMappingU64Big(programId, 'supply_index', '1field'),
-    getMappingU64Big(programId, 'supply_index', '2field'),
-    getMappingU64Big(programId, 'borrow_index', '0field'),
-    getMappingU64Big(programId, 'borrow_index', '1field'),
-    getMappingU64Big(programId, 'borrow_index', '2field'),
-    getMappingU64Big(programId, 'asset_price', '0field'),
-    getMappingU64Big(programId, 'asset_price', '1field'),
-    getMappingU64Big(programId, 'asset_price', '2field'),
-    getMappingU64Big(programId, 'asset_ltv', '0field'),
-    getMappingU64Big(programId, 'asset_ltv', '1field'),
-    getMappingU64Big(programId, 'asset_ltv', '2field'),
-  ]);
+  const ssA = scaled.scaledSupNative;
+  const ssU = scaled.scaledSupUsdcx;
+  const ssD = scaled.scaledSupUsad;
+  const sbA = scaled.scaledBorNative;
+  const sbU = scaled.scaledBorUsdcx;
+  const sbD = scaled.scaledBorUsad;
 
-  const supIdxA = supA ?? LENDING_INDEX_SCALE;
-  const supIdxU = supU ?? LENDING_INDEX_SCALE;
-  const supIdxD = supD ?? LENDING_INDEX_SCALE;
-  const borIdxA = borA ?? LENDING_INDEX_SCALE;
-  const borIdxU = borU ?? LENDING_INDEX_SCALE;
-  const borIdxD = borD ?? LENDING_INDEX_SCALE;
-
-  const priceA = pA ?? LENDING_PRICE_SCALE;
-  const priceU = pU ?? LENDING_PRICE_SCALE;
-  const priceD = pD ?? LENDING_PRICE_SCALE;
-
-  const ltvAB = ltvA ?? BigInt(7500);
-  const ltvUB = ltvU ?? BigInt(8500);
-  const ltvDB = ltvD ?? BigInt(8500);
+  const o = await fetchLendingOraclePublic(programId);
+  const supIdxA = o.supIdxAleo;
+  const supIdxU = o.supIdxUsdcx;
+  const supIdxD = o.supIdxUsad;
+  const borIdxA = o.borIdxAleo;
+  const borIdxU = o.borIdxUsdcx;
+  const borIdxD = o.borIdxUsad;
+  const priceA = o.priceAleo;
+  const priceU = o.priceUsdcx;
+  const priceD = o.priceUsad;
+  const ltvAB = o.ltvAleo;
+  const ltvUB = o.ltvUsdcx;
+  const ltvDB = o.ltvUsad;
 
   const realSup = [
-    (z(ssA) * supIdxA) / LENDING_INDEX_SCALE,
-    (z(ssU) * supIdxU) / LENDING_INDEX_SCALE,
-    (z(ssD) * supIdxD) / LENDING_INDEX_SCALE,
+    toU64Leo((z(ssA) * supIdxA) / LENDING_INDEX_SCALE),
+    toU64Leo((z(ssU) * supIdxU) / LENDING_INDEX_SCALE),
+    toU64Leo((z(ssD) * supIdxD) / LENDING_INDEX_SCALE),
   ];
   const realBor = [
-    (z(sbA) * borIdxA) / LENDING_INDEX_SCALE,
-    (z(sbU) * borIdxU) / LENDING_INDEX_SCALE,
-    (z(sbD) * borIdxD) / LENDING_INDEX_SCALE,
+    toU64Leo((z(sbA) * borIdxA) / LENDING_INDEX_SCALE),
+    toU64Leo((z(sbU) * borIdxU) / LENDING_INDEX_SCALE),
+    toU64Leo((z(sbD) * borIdxD) / LENDING_INDEX_SCALE),
   ];
 
   const prices = [priceA, priceU, priceD];
   const ltvs = [ltvAB, ltvUB, ltvDB];
 
-  const debtUsd = [
-    (realBor[0] * prices[0]) / LENDING_PRICE_SCALE,
-    (realBor[1] * prices[1]) / LENDING_PRICE_SCALE,
-    (realBor[2] * prices[2]) / LENDING_PRICE_SCALE,
-  ];
-  const totalDebtUsd = debtUsd[0] + debtUsd[1] + debtUsd[2];
+  const debtUsd0 = toU64Leo((realBor[0] * prices[0]) / LENDING_PRICE_SCALE);
+  const debtUsd1 = toU64Leo((realBor[1] * prices[1]) / LENDING_PRICE_SCALE);
+  const debtUsd2 = toU64Leo((realBor[2] * prices[2]) / LENDING_PRICE_SCALE);
+  const totalDebtUsd = debtUsd0 + debtUsd1 + debtUsd2;
+  /** Leo still enforces health if scaled borrow > 0 but u64 USD debt sums truncate to 0. */
+  const anyScaledBorrow = sbA + sbU + sbD > BigInt(0);
+  const debtUsdForHealth =
+    totalDebtUsd > BigInt(0) ? totalDebtUsd : anyScaledBorrow ? BigInt(1) : BigInt(0);
 
   const supUsdBefore = [
-    (realSup[0] * prices[0]) / LENDING_PRICE_SCALE,
-    (realSup[1] * prices[1]) / LENDING_PRICE_SCALE,
-    (realSup[2] * prices[2]) / LENDING_PRICE_SCALE,
+    toU64Leo((realSup[0] * prices[0]) / LENDING_PRICE_SCALE),
+    toU64Leo((realSup[1] * prices[1]) / LENDING_PRICE_SCALE),
+    toU64Leo((realSup[2] * prices[2]) / LENDING_PRICE_SCALE),
   ];
   const totalSupplyUsdBefore = supUsdBefore[0] + supUsdBefore[1] + supUsdBefore[2];
+  const supIdxByLeg: [bigint, bigint, bigint] = [supIdxA, supIdxU, supIdxD];
 
-  const MAX_U64 = (BigInt(1) << BigInt(64)) - BigInt(1);
+  const MAX_U64 = LENDING_U64_MAX;
 
   const canWithdraw = (amountOutMicro: bigint, outIdx: 0 | 1 | 2): boolean => {
     if (amountOutMicro <= BigInt(0)) return false;
     const priceOut = prices[outIdx];
     if (priceOut <= BigInt(0)) return false;
 
-    // withdraw_usd = floor(amount * price_out / PRICE_SCALE)
-    const withdrawUsd = (amountOutMicro * priceOut) / LENDING_PRICE_SCALE;
+    const withdrawUsd = toU64Leo((amountOutMicro * priceOut) / LENDING_PRICE_SCALE);
     if (withdrawUsd <= BigInt(0)) return false;
+    /// Same as Leo WDR-08: cap by **sum** of position raw-supply USD (cross-asset), not payout-asset supply alone.
     if (withdrawUsd > totalSupplyUsdBefore) return false;
 
-    // Burn collateral in deterministic order: ALEO -> USDCx -> USAD
     let rem = withdrawUsd;
     const burnAmt: bigint[] = [BigInt(0), BigInt(0), BigInt(0)];
     for (const idx of [0, 1, 2] as const) {
       const targetUsd = rem > supUsdBefore[idx] ? supUsdBefore[idx] : rem;
-      const burnAmtRaw = (targetUsd * LENDING_PRICE_SCALE) / prices[idx];
-      const burnAmtIdx = burnAmtRaw > realSup[idx] ? realSup[idx] : burnAmtRaw;
-      const burnUsd = (burnAmtIdx * prices[idx]) / LENDING_PRICE_SCALE;
+      const p = prices[idx];
+      /// **Must match `main.leo` `withdraw`:** floor `target_usd * PRICE_SCALE / price`, not ceil — ceil made
+      /// caps optimistic so txs passed the UI but reverted on `rem_after_usad <= WITHDRAW_XA_REMAINDER_MAX` (e.g. USDC-only → ALEO out).
+      const burnAmtRaw = toU64Leo((targetUsd * LENDING_PRICE_SCALE) / p);
+      const burnPre = burnAmtRaw > realSup[idx] ? realSup[idx] : burnAmtRaw;
+      const burnAmtIdx = bumpBurnForScaledWithdrawLeg(burnPre, realSup[idx], supIdxByLeg[idx]);
+      const burnUsd = toU64Leo((burnAmtIdx * prices[idx]) / LENDING_PRICE_SCALE);
       rem = rem > burnUsd ? rem - burnUsd : BigInt(0);
       burnAmt[idx] = burnAmtIdx;
     }
 
-    // Tiny rounding dust tolerance in USD-micro units.
-    if (rem > BigInt(3)) return false;
+    const scaledOutPositive =
+      (burnAmt[0] === BigInt(0) || toU64Leo((burnAmt[0] * LENDING_INDEX_SCALE) / supIdxA) > BigInt(0)) &&
+      (burnAmt[1] === BigInt(0) || toU64Leo((burnAmt[1] * LENDING_INDEX_SCALE) / supIdxU) > BigInt(0)) &&
+      (burnAmt[2] === BigInt(0) || toU64Leo((burnAmt[2] * LENDING_INDEX_SCALE) / supIdxD) > BigInt(0));
+    if (!scaledOutPositive) return false;
+
+    if (rem > LENDING_WITHDRAW_REMAINDER_MAX_USD) return false;
 
     const realSupAfter = [
       realSup[0] > burnAmt[0] ? realSup[0] - burnAmt[0] : BigInt(0),
@@ -4099,22 +5456,20 @@ export async function getCrossCollateralWithdrawCapsFromChain(
     ];
 
     const weightedAfter = [
-      weightedCollateralUsdMicro(realSupAfter[0], prices[0], ltvs[0]),
-      weightedCollateralUsdMicro(realSupAfter[1], prices[1], ltvs[1]),
-      weightedCollateralUsdMicro(realSupAfter[2], prices[2], ltvs[2]),
+      toU64Leo(weightedCollateralUsdMicro(realSupAfter[0], prices[0], ltvs[0])),
+      toU64Leo(weightedCollateralUsdMicro(realSupAfter[1], prices[1], ltvs[1])),
+      toU64Leo(weightedCollateralUsdMicro(realSupAfter[2], prices[2], ltvs[2])),
     ];
     const totalCollateralAfter = weightedAfter[0] + weightedAfter[1] + weightedAfter[2];
 
-    return totalDebtUsd === BigInt(0) || totalDebtUsd <= totalCollateralAfter;
+    return debtUsdForHealth === BigInt(0) || debtUsdForHealth <= totalCollateralAfter;
   };
 
   const maxAmtForOut = (outIdx: 0 | 1 | 2): bigint => {
     const priceOut = prices[outIdx];
     if (priceOut <= BigInt(0)) return BigInt(0);
 
-    // Upper bound ignores health constraint:
-    // amount = floor(total_supply_usd_before * PRICE_SCALE / price_out)
-    let high = (totalSupplyUsdBefore * LENDING_PRICE_SCALE) / priceOut;
+    let high = toU64Leo((totalSupplyUsdBefore * LENDING_PRICE_SCALE) / priceOut);
     if (high > MAX_U64) high = MAX_U64;
 
     let low = BigInt(0);
@@ -4126,14 +5481,201 @@ export async function getCrossCollateralWithdrawCapsFromChain(
     return low;
   };
 
-  const maxMicroAleo = maxAmtForOut(0);
+  const maxMicroAleoPortfolio = maxAmtForOut(0);
   const maxMicroUsdcx = maxAmtForOut(1);
   const maxMicroUsad = maxAmtForOut(2);
 
+  const [availAleo, vaultHum] = await Promise.all([
+    readMappingU64(programId, 'available_liquidity', '0field'),
+    fetchVaultHumanBalancesFromBackend(),
+  ]);
+  const minU64 = (a: bigint, b: bigint): bigint => (a < b ? a : b);
+
+  /**
+   * Native ALEO finalize credits `available_liquidity[ALEO]` from burns + prior idle slot; do not clamp UI MAX by mapping alone.
+   */
+  let maxWithdrawMicroAleo = maxMicroAleoPortfolio;
+  let maxWithdrawMicroUsdcx = maxMicroUsdcx;
+  let maxWithdrawMicroUsad = maxMicroUsad;
+  if (vaultHum) {
+    const vA = humanToMicroU64(vaultHum.aleo);
+    const vU = humanToMicroU64(vaultHum.usdcx);
+    const vD = humanToMicroU64(vaultHum.usad);
+    maxWithdrawMicroAleo = minU64(maxWithdrawMicroAleo, vA);
+    maxWithdrawMicroUsdcx = minU64(maxWithdrawMicroUsdcx, vU);
+    maxWithdrawMicroUsad = minU64(maxWithdrawMicroUsad, vD);
+  }
+
   return {
-    maxWithdrawMicroAleo: maxMicroAleo,
-    maxWithdrawMicroUsdcx: maxMicroUsdcx,
-    maxWithdrawMicroUsad: maxMicroUsad,
+    maxWithdrawMicroAleo,
+    maxWithdrawMicroUsdcx,
+    maxWithdrawMicroUsad,
+    maxWithdrawMicroAleoPortfolio: maxMicroAleoPortfolio,
+    availableLiquidityMicroAleo: availAleo,
+  };
+}
+
+/**
+ * Withdraw UI caps: **one tx = one `LendingPosition` note**. For each payout asset we take the same note
+ * `getBestLendingPositionRecordForWithdrawOut` would choose (min borrow tier, then max cap). Merging `max()`
+ * across *different* notes inflated MAX vs the note actually spent (USAD reject while USDCx looked fine).
+ */
+export async function getAggregatedCrossCollateralWithdrawCapsFromWallet(
+  programId: string,
+  requestRecords: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  recordsSnapshot?: any[],
+): Promise<CrossCollateralWithdrawCaps | null> {
+  const snap =
+    recordsSnapshot != null ? recordsSnapshot : await requestRecords(programId, false);
+  const [r0, r1, r2] = await Promise.all([
+    getBestLendingPositionRecordForWithdrawOut(requestRecords, programId, decrypt, 0, snap),
+    getBestLendingPositionRecordForWithdrawOut(requestRecords, programId, decrypt, 1, snap),
+    getBestLendingPositionRecordForWithdrawOut(requestRecords, programId, decrypt, 2, snap),
+  ]);
+  if (!r0 && !r1 && !r2) return null;
+
+  let availAleo: bigint | null = null;
+  try {
+    availAleo = await readMappingU64(programId, 'available_liquidity', '0field');
+  } catch {
+    availAleo = r0?.caps.availableLiquidityMicroAleo ?? r1?.caps.availableLiquidityMicroAleo ?? null;
+  }
+
+  const z = (x: bigint | undefined) => x ?? BigInt(0);
+  return {
+    maxWithdrawMicroAleo: z(r0?.caps.maxWithdrawMicroAleo),
+    maxWithdrawMicroUsdcx: z(r1?.caps.maxWithdrawMicroUsdcx),
+    maxWithdrawMicroUsad: z(r2?.caps.maxWithdrawMicroUsad),
+    maxWithdrawMicroAleoPortfolio: z(r0?.caps.maxWithdrawMicroAleoPortfolio),
+    availableLiquidityMicroAleo: availAleo,
+  };
+}
+
+function mergeBorrowCapsMax(a: CrossCollateralChainCaps, b: CrossCollateralChainCaps): void {
+  if (b.headroomUsd > a.headroomUsd) a.headroomUsd = b.headroomUsd;
+  if (b.maxBorrowMicroAleo > a.maxBorrowMicroAleo) a.maxBorrowMicroAleo = b.maxBorrowMicroAleo;
+  if (b.maxBorrowMicroUsdcx > a.maxBorrowMicroUsdcx) a.maxBorrowMicroUsdcx = b.maxBorrowMicroUsdcx;
+  if (b.maxBorrowMicroUsad > a.maxBorrowMicroUsad) a.maxBorrowMicroUsad = b.maxBorrowMicroUsad;
+  if (b.totalCollateralUsd > a.totalCollateralUsd) a.totalCollateralUsd = b.totalCollateralUsd;
+  if (b.totalDebtUsd > a.totalDebtUsd) a.totalDebtUsd = b.totalDebtUsd;
+  if (b.realSupplyMicroAleo > a.realSupplyMicroAleo) a.realSupplyMicroAleo = b.realSupplyMicroAleo;
+  if (b.realSupplyMicroUsdcx > a.realSupplyMicroUsdcx) a.realSupplyMicroUsdcx = b.realSupplyMicroUsdcx;
+  if (b.realSupplyMicroUsad > a.realSupplyMicroUsad) a.realSupplyMicroUsad = b.realSupplyMicroUsad;
+  if (b.realBorrowMicroAleo > a.realBorrowMicroAleo) a.realBorrowMicroAleo = b.realBorrowMicroAleo;
+  if (b.realBorrowMicroUsdcx > a.realBorrowMicroUsdcx) a.realBorrowMicroUsdcx = b.realBorrowMicroUsdcx;
+  if (b.realBorrowMicroUsad > a.realBorrowMicroUsad) a.realBorrowMicroUsad = b.realBorrowMicroUsad;
+}
+
+export async function getAggregatedCrossCollateralBorrowCapsFromWallet(
+  programId: string,
+  requestRecords: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  decrypt?: (cipherText: string) => Promise<string>,
+  recordsSnapshot?: any[],
+): Promise<CrossCollateralChainCaps | null> {
+  const pool = await listFundedLendingPositionCandidates(
+    requestRecords,
+    programId,
+    decrypt,
+    recordsSnapshot,
+  );
+  if (pool.length === 0) return null;
+  const capsArr = await Promise.all(
+    pool.map((c) => getCrossCollateralBorrowCapsFromChain(programId, c.scaled)),
+  );
+  const first = capsArr.find((x) => x != null);
+  if (!first) return null;
+  const merged: CrossCollateralChainCaps = { ...first };
+  for (const c of capsArr) {
+    if (c) mergeBorrowCapsMax(merged, c);
+  }
+  return merged;
+}
+
+function withdrawCapMetric(caps: CrossCollateralWithdrawCaps, outIdx: 0 | 1 | 2): bigint {
+  return outIdx === 0
+    ? caps.maxWithdrawMicroAleo
+    : outIdx === 1
+      ? caps.maxWithdrawMicroUsdcx
+      : caps.maxWithdrawMicroUsad;
+}
+
+/**
+ * Choose the `LendingPosition` note that maximizes on-chain-feasible withdraw for `outIdx` (0=ALEO, 1=USDCx, 2=USAD).
+ */
+export async function getBestLendingPositionRecordForWithdrawOut(
+  requestRecords: (program: string, includeSpent?: boolean) => Promise<any[]>,
+  programId: string,
+  decrypt: ((cipherText: string) => Promise<string>) | undefined,
+  outIdx: 0 | 1 | 2,
+  recordsSnapshot?: any[],
+): Promise<{
+  input: string | any;
+  scaled: LendingPositionScaled;
+  recordIndex: number;
+  walletRecord: any;
+  caps: CrossCollateralWithdrawCaps;
+} | null> {
+  const pool = await listFundedLendingPositionCandidates(
+    requestRecords,
+    programId,
+    decrypt,
+    recordsSnapshot,
+  );
+  if (pool.length === 0) return null;
+
+  const capsArr = await Promise.all(
+    pool.map((c) => getCrossCollateralWithdrawCapsFromChain(programId, c.scaled)),
+  );
+
+  /** Prefer notes with minimum scaled-borrow total first. Stale unspent duplicates often keep pre-repay debt while a newer note is debt-free; max-cap-only tie-break can still go wrong if caps match due to RPC/oracle edge cases. */
+  let minBorAmongFeasible: bigint | null = null;
+  for (let i = 0; i < pool.length; i++) {
+    if (!capsArr[i]) continue;
+    const b = pool[i].borScore;
+    if (minBorAmongFeasible == null || b < minBorAmongFeasible) minBorAmongFeasible = b;
+  }
+
+  let bestI = -1;
+  let bestMetric = BigInt(-1);
+  for (let i = 0; i < pool.length; i++) {
+    const caps = capsArr[i];
+    if (!caps) continue;
+    if (minBorAmongFeasible != null && pool[i].borScore !== minBorAmongFeasible) continue;
+    const m = withdrawCapMetric(caps, outIdx);
+    if (m > bestMetric) {
+      bestMetric = m;
+      bestI = i;
+    } else if (m === bestMetric && m >= BigInt(0) && bestI >= 0) {
+      const ha = getWalletRecordBlockHeight(pool[i].walletRecord);
+      const hb = getWalletRecordBlockHeight(pool[bestI].walletRecord);
+      if (ha != null && hb != null && ha > hb) bestI = i;
+      else if (ha != null && hb == null) bestI = i;
+      else if (ha != null && hb != null && ha === hb) {
+        if (pool[i].borScore < pool[bestI].borScore) bestI = i;
+        else if (pool[i].borScore === pool[bestI].borScore && i > bestI) bestI = i;
+      } else if (ha == null && hb == null) {
+        if (pool[i].borScore < pool[bestI].borScore) bestI = i;
+        else if (pool[i].borScore === pool[bestI].borScore && i > bestI) bestI = i;
+      }
+    }
+  }
+  if (bestI < 0) return null;
+  const capsBest = capsArr[bestI];
+  if (!capsBest) return null;
+
+  const best = pool[bestI];
+  let input: string | any = best.input;
+  if (typeof input !== 'string' || !String(input).trim()) {
+    const p = await resolveRecordPlaintext(best.walletRecord, decrypt);
+    if (p) input = p;
+  }
+  return {
+    input,
+    scaled: best.scaled,
+    recordIndex: best.idx,
+    walletRecord: best.walletRecord,
+    caps: capsBest,
   };
 }
 
@@ -4179,7 +5721,7 @@ export async function getAddressHashFromContract(
 
 /**
  * Get user activity from contract (helper function for v8).
- * Calls: lending_pool_v8.aleo/get_user_activity() -> (UserActivity, Future)
+ * On-chain: UserActivity + Final (Leo 4 xyra_lending_v7)
  */
 export async function getUserActivityFromContract(
   requestTransaction: ((transaction: any) => Promise<string>) | undefined,
@@ -4524,7 +6066,7 @@ export async function lendingRepay(
  * Following basic_bank.aleo pattern - contract reads user data from mappings automatically.
  * - Updates public pool state (total_supplied, utilization_index)
  * - Updates private user mappings (increments total_withdrawals counter)
- * Returns: (UserActivity, Future) - both updated in one transaction
+ * Returns: (UserActivity, Final) — Leo 4 on-chain bundle
  * No need to pass old_activity - contract reads from mappings using hashed address
  */
 

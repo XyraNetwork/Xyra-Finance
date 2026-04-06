@@ -9,6 +9,7 @@ import {
   resolvePoolApyDisplay,
   getAssetPriceForProgram,
   getLatestBlockHeight,
+  fetchAvailableLiquidityMicro,
   LENDING_POOL_PROGRAM_ID,
   USDC_LENDING_POOL_PROGRAM_ID,
   USAD_LENDING_POOL_PROGRAM_ID,
@@ -186,6 +187,13 @@ export function MarketsView() {
   const [usadSupplyAPY, setUsadSupplyAPY] = useState<number>(0);
   const [usadBorrowAPY, setUsadBorrowAPY] = useState<number>(0);
 
+  /** Human units from `available_liquidity` mapping (what withdraw/borrow finalize use per asset). */
+  const [onChainAvailHuman, setOnChainAvailHuman] = useState<{ aleo: number; usdc: number; usad: number }>({
+    aleo: 0,
+    usdc: 0,
+    usad: 0,
+  });
+
   const [vaultLoading, setVaultLoading] = useState<boolean>(true);
   const [vaultAleoBalance, setVaultAleoBalance] = useState<number>(0);
   const [vaultUsdcxBalance, setVaultUsdcxBalance] = useState<number>(0);
@@ -203,12 +211,15 @@ export function MarketsView() {
     setLoading(true);
     (async () => {
       try {
-        const [aleoState, usdcState, usadState] = await Promise.all([
-          getLendingPoolState(),
-          getUsdcLendingPoolState(),
-          // USAD pool state
-          getUsadLendingPoolState(),
-        ]);
+        const [aleoState, usdcState, usadState, aleoAvailMicro, usdcAvailMicro, usadAvailMicro] =
+          await Promise.all([
+            getLendingPoolState(),
+            getUsdcLendingPoolState(),
+            getUsadLendingPoolState(),
+            fetchAvailableLiquidityMicro(LENDING_POOL_PROGRAM_ID, '0field'),
+            fetchAvailableLiquidityMicro(USDC_LENDING_POOL_PROGRAM_ID, '1field'),
+            fetchAvailableLiquidityMicro(USAD_LENDING_POOL_PROGRAM_ID, '2field'),
+          ]);
         if (cancelled) return;
 
         const tsAleo = Number(aleoState.totalSupplied ?? 0) || 0;
@@ -217,6 +228,15 @@ export function MarketsView() {
         const tbUsdc = Number(usdcState.totalBorrowed ?? 0) || 0;
         const tsUsad = Number(usadState.totalSupplied ?? 0) || 0;
         const tbUsad = Number(usadState.totalBorrowed ?? 0) || 0;
+
+        const aleoFallbackAvail = Math.max(0, tsAleo - tbAleo) / SCALE;
+        const usdcFallbackAvail = Math.max(0, tsUsdc - tbUsdc) / SCALE;
+        const usadFallbackAvail = Math.max(0, tsUsad - tbUsad) / SCALE;
+        setOnChainAvailHuman({
+          aleo: aleoAvailMicro != null ? Number(aleoAvailMicro) / SCALE : aleoFallbackAvail,
+          usdc: usdcAvailMicro != null ? Number(usdcAvailMicro) / SCALE : usdcFallbackAvail,
+          usad: usadAvailMicro != null ? Number(usadAvailMicro) / SCALE : usadFallbackAvail,
+        });
 
         const [chainAleo, chainUsdc, chainUsad] = await Promise.all([
           getPoolApyFractionsFromChain(LENDING_POOL_PROGRAM_ID, '0field'),
@@ -337,8 +357,9 @@ export function MarketsView() {
     };
   }, []);
 
-  const aleoAvailable = Math.max(0, aleoTotalSupplied - aleoTotalBorrowed);
-  const usdcAvailable = Math.max(0, usdcTotalSupplied - usdcTotalBorrowed);
+  const aleoAvailable = onChainAvailHuman.aleo;
+  const usdcAvailable = onChainAvailHuman.usdc;
+  const usadAvailable = onChainAvailHuman.usad;
   const fmtVault = (bal: number, priceUsd: number | null) => {
     if (vaultLoading || vaultPricesLoading) return '—';
     const usd = priceUsd == null ? null : bal * priceUsd;
@@ -408,7 +429,7 @@ export function MarketsView() {
       suppliedUnit: 'USAD',
       borrowed: usadTotalBorrowed.toFixed(2),
       borrowedUnit: 'USAD',
-      available: Math.max(0, usadTotalSupplied - usadTotalBorrowed).toFixed(2),
+      available: usadAvailable.toFixed(2),
       availableUnit: 'USAD',
       vault: fmtVault(vaultUsadBalance, priceUsdUsad),
       supplyApy: `${usadSupplyAPY.toFixed(2)}%`,
@@ -476,8 +497,14 @@ export function MarketsView() {
                   <th className="px-8 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest">Asset</th>
                   <th className="px-6 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest text-right">Total Supplied</th>
                   <th className="px-6 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest text-right">Total Borrowed</th>
-                  <th className="px-6 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest text-right">Available</th>
-                  <th className="px-6 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest text-right">Vault Balance <InfoTooltip tip="Backend vault wallet public balance for this asset. Not pool liquidity." /></th>
+                  <th className="px-6 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest text-right">
+                    Available{' '}
+                    <InfoTooltip tip="On-chain `available_liquidity` (program accounting). The app’s withdraw/borrow MAX also clamps to treasury `/vault-balances` when NEXT_PUBLIC_BACKEND_URL is set — cross-asset payouts follow that operational liquidity." />
+                  </th>
+                  <th className="px-6 py-6 text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest text-right">
+                    Vault Balance{' '}
+                    <InfoTooltip tip="Backend treasury wallet balance (public mapping read). Used to settle payouts after txs finalize. Can be higher than “Available” while the program’s internal liquidity counter is lower — native ALEO withdraws are limited by Available, not this cell." />
+                  </th>
                   <th className="px-6 py-6 text-[10px] font-mono font-bold text-cyan-400 uppercase tracking-widest text-right">Supply APY</th>
                   <th className="px-8 py-6 text-[10px] font-mono font-bold text-indigo-400 uppercase tracking-widest text-right">Borrow APY</th>
                 </tr>

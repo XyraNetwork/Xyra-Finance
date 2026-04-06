@@ -17,6 +17,7 @@
     "start": "next start",
     "lint": "next lint",
     "test:lending-math": "cd program/lending_math_tests && leo test --offline",
+    "test:withdraw-rounding": "node scripts/test-withdraw-rounding.mjs",
     "prepare": "husky install"
   },
   "dependencies": {

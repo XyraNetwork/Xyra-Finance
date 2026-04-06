@@ -10,6 +10,10 @@
  *
  *   await window.__xyraBorrowDebug.probeMyMappings('aleo1...')
  *
+ * Withdraw (mirror Leo `withdraw` transition + `available_liquidity` payout line):
+ *
+ *   await window.__xyraBorrowDebug.diagnoseWithdraw(programId, scaledFromLogs, 1_500_000n, 'aleo')
+ *
  * `@/…` imports do not work in the raw console — use `window.__xyraBorrowDebug` only.
  *
  * **HMR:** Helpers use a fresh `import('@/components/aleo/rpc')` each call so wasm/RPC does not
@@ -17,6 +21,7 @@
  */
 
 import { BOUNTY_PROGRAM_ID } from '@/types';
+import type { LendingPositionScaled } from '@/components/aleo/rpc';
 
 /** Fresh module graph after HMR — avoids "disposed module" + @provablehq/wasm warnings. */
 async function loadRpc() {
@@ -36,12 +41,13 @@ export type XyraBorrowDebug = {
   ) => ReturnType<Awaited<ReturnType<typeof loadRpc>>['computeLendingPositionMappingKey']>;
   getCrossCollateralBorrowCapsFromChain: (
     programId: string,
-    address: string,
+    scaled: LendingPositionScaled | null,
   ) => ReturnType<Awaited<ReturnType<typeof loadRpc>>['getCrossCollateralBorrowCapsFromChain']>;
   getAleoPoolUserEffectivePosition: (
     programId: string,
     address: string,
     assetIdField?: string,
+    scaled?: LendingPositionScaled | null,
   ) => ReturnType<Awaited<ReturnType<typeof loadRpc>>['getAleoPoolUserEffectivePosition']>;
   getMappingValueDebug: (
     programId: string,
@@ -64,6 +70,13 @@ export type XyraBorrowDebug = {
   probeMyMappings: (walletAddress: string) => ReturnType<
     Awaited<ReturnType<typeof loadRpc>>['probeLendingPositionMappings']
   >;
+  /** `scaled` = same shape as dashboard `[* withdraw] diagnostics` scaledSup/scaledBor (bigint fields). */
+  diagnoseWithdraw: (
+    programId: string,
+    scaled: LendingPositionScaled,
+    amountMicro: bigint,
+    out: 'aleo' | 'usdcx' | 'usad',
+  ) => ReturnType<Awaited<ReturnType<typeof loadRpc>>['auditLendingWithdrawPreSubmit']>;
 };
 
 declare global {
@@ -83,15 +96,17 @@ export function installDevBorrowDebug(): void {
     borrowAmountMicro: bigint,
   ) => {
     const m = await loadRpc();
-    const caps = await m.getCrossCollateralBorrowCapsFromChain(programId, walletAddress);
+    const caps = await m.getCrossCollateralBorrowCapsFromChain(programId, null);
     const field =
       borrowAsset === 'aleo' ? '0field' : borrowAsset === 'usdcx' ? '1field' : '2field';
-    const pos = await m.getAleoPoolUserEffectivePosition(programId, walletAddress, field);
+    const pos = await m.getAleoPoolUserEffectivePosition(programId, walletAddress, field, null);
 
     /* eslint-disable no-console */
     console.groupCollapsed('[xyra] borrow diagnose', programId, walletAddress);
     if (!caps) {
-      console.warn('getCrossCollateralBorrowCapsFromChain returned null (keys or RPC issue).');
+      console.warn(
+        'getCrossCollateralBorrowCapsFromChain returned null — v8 needs `LendingPositionScaled` from wallet records (no public user mappings).',
+      );
     } else {
       console.table({
         totalCollateralUsd_micro: caps.totalCollateralUsd.toString(),
@@ -129,6 +144,35 @@ export function installDevBorrowDebug(): void {
     /* eslint-enable no-console */
   };
 
+  const diagnoseWithdraw = async (
+    programId: string,
+    scaled: LendingPositionScaled,
+    amountMicro: bigint,
+    out: 'aleo' | 'usdcx' | 'usad',
+  ) => {
+    const m = await loadRpc();
+    const field = out === 'aleo' ? '0field' : out === 'usdcx' ? '1field' : '2field';
+    const r = await m.auditLendingWithdrawPreSubmit(programId, scaled, amountMicro, field);
+    const o = r.oracle;
+    /* eslint-disable no-console */
+    console.groupCollapsed('[xyra] withdraw diagnose', programId, out, amountMicro.toString());
+    console.log('transition', r.sim);
+    console.log('finalizeLiquidity', r.liquidity);
+    console.log('oracleWitness', {
+      sup: [o.supIdxAleo, o.supIdxUsdcx, o.supIdxUsad].map((x) => x.toString()),
+      bor: [o.borIdxAleo, o.borIdxUsdcx, o.borIdxUsad].map((x) => x.toString()),
+      price: [o.priceAleo, o.priceUsdcx, o.priceUsad].map((x) => x.toString()),
+      ltv: [o.ltvAleo, o.ltvUsdcx, o.ltvUsad].map((x) => x.toString()),
+    });
+    if (!r.sim.ok) console.warn('Transition would fail:', r.sim.failReason);
+    if (r.liquidity.liquidityDeficit) {
+      console.warn('available_liquidity < payout amount (pool counter deficit; finalize saturates)');
+    }
+    console.groupEnd();
+    /* eslint-enable no-console */
+    return r;
+  };
+
   window.__xyraBorrowDebug = {
     programId,
     LENDING_POOL_PROGRAM_ID: programId,
@@ -136,10 +180,10 @@ export function installDevBorrowDebug(): void {
       (await loadRpc()).computeUserKeyFieldFromAddress(address),
     computeLendingPositionMappingKey: async (address, assetIdField) =>
       (await loadRpc()).computeLendingPositionMappingKey(address, assetIdField),
-    getCrossCollateralBorrowCapsFromChain: async (pid, address) =>
-      (await loadRpc()).getCrossCollateralBorrowCapsFromChain(pid, address),
-    getAleoPoolUserEffectivePosition: async (pid, address, assetIdField) =>
-      (await loadRpc()).getAleoPoolUserEffectivePosition(pid, address, assetIdField),
+    getCrossCollateralBorrowCapsFromChain: async (pid, scaled) =>
+      (await loadRpc()).getCrossCollateralBorrowCapsFromChain(pid, scaled),
+    getAleoPoolUserEffectivePosition: async (pid, address, assetIdField, scaled) =>
+      (await loadRpc()).getAleoPoolUserEffectivePosition(pid, address, assetIdField, scaled ?? null),
     getMappingValueDebug: async (pid, mappingName, key) =>
       (await loadRpc()).getMappingValueDebug(pid, mappingName, key),
     probeLendingPositionMappings: async (pid, address) =>
@@ -147,6 +191,7 @@ export function installDevBorrowDebug(): void {
     probeUserKeyVariantsForAleoSupply: async (pid, address) =>
       (await loadRpc()).probeUserKeyVariantsForAleoSupply(pid, address),
     diagnoseBorrow,
+    diagnoseWithdraw,
     probeMyMappings: async (walletAddress: string) => {
       const m = await loadRpc();
       return m.probeLendingPositionMappings(m.LENDING_POOL_PROGRAM_ID, walletAddress);
@@ -155,6 +200,6 @@ export function installDevBorrowDebug(): void {
 
   // eslint-disable-next-line no-console
   console.info(
-    '[xyra] Mapping / borrow debug: `await window.__xyraBorrowDebug.probeMyMappings("aleo1…")` — `@/` imports do not work in DevTools.',
+    '[xyra] Debug: borrow `probeMyMappings`, withdraw `diagnoseWithdraw(pid, scaled, micro, "aleo")` — `@/` imports do not work in DevTools.',
   );
 }

@@ -1,0 +1,15 @@
+{
+  "program": "lending_math_tests.aleo",
+  "structs": [],
+  "records": [],
+  "mappings": [],
+  "storage_variables": [],
+  "functions": [
+    {
+      "name": "noop",
+      "is_final": false,
+      "inputs": [],
+      "outputs": []
+    }
+  ]
+}
