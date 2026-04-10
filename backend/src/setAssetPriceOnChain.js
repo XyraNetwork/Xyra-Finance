@@ -5,21 +5,18 @@ import {
   AleoKeyProvider,
   NetworkRecordProvider,
   AleoNetworkClient,
-  initializeWasm,
 } from '@provablehq/sdk';
 import { logTestnetStatus } from './checkTestnet.js';
 
 /** Matches `PRICE_SCALE` in program `main.leo` (1e6 micro-USD per $1). */
 const PRICE_SCALE = 1_000_000;
 
-/** Default `ADMIN_ADDRESS` from `program/src/main.leo` (xyra_lending_v6). Override via LENDING_POOL_ADMIN_ADDRESS if you redeploy with a different admin. */
-const DEFAULT_PROGRAM_ADMIN_ADDRESS =
-  'aleo1rhgdu77hgyqd3xjj8ucu3jj9r2krwz6mnzyd80gncr5fxcwlh5rsvzp9px';
-
-const wasmReady = initializeWasm();
-
-function expectedAdminAddress() {
-  return (process.env.LENDING_POOL_ADMIN_ADDRESS || DEFAULT_PROGRAM_ADMIN_ADDRESS).trim();
+/**
+ * When set, signer must match (same rule as `processAccrueScheduler.js`).
+ * When unset, we only require a resolvable admin/vault key — so v30+ deploys are not forced to match an old baked-in address.
+ */
+function lendingPoolAdminAddressForSignerCheck() {
+  return (process.env.LENDING_POOL_ADMIN_ADDRESS || '').trim();
 }
 
 function lendingPoolProgramId() {
@@ -32,7 +29,7 @@ export function resolveAdminPrivateKey() {
 
   const vaultPk = (process.env.VAULT_PRIVATE_KEY || '').trim();
   const vaultAddr = (process.env.VAULT_ADDRESS || '').trim();
-  const adminAddr = expectedAdminAddress();
+  const adminAddr = lendingPoolAdminAddressForSignerCheck();
   if (vaultPk && vaultAddr && adminAddr && vaultAddr === adminAddr) {
     return vaultPk;
   }
@@ -53,7 +50,6 @@ export function hasAdminKeyForPriceUpdate() {
  * @param {string} [opts.assetIdField] - Default `0field` (ASSET_ALEO).
  */
 export async function runSetAssetPriceAleo({ usdSpot, assetIdField = '0field' }) {
-  await wasmReady;
   await logTestnetStatus();
 
   const adminPk = resolveAdminPrivateKey();
@@ -81,10 +77,10 @@ export async function runSetAssetPriceAleo({ usdSpot, assetIdField = '0field' })
 
   const account = new Account({ privateKey: adminPk });
   const signer = account.address().to_string();
-  const expected = expectedAdminAddress();
-  if (signer !== expected) {
+  const expectedAdmin = lendingPoolAdminAddressForSignerCheck();
+  if (expectedAdmin && signer !== expectedAdmin) {
     throw new Error(
-      `Signer ${signer} must match program ADMIN ${expected}. Wrong POOL_ADMIN_PRIVATE_KEY / vault key.`,
+      `Signer ${signer} must match LENDING_POOL_ADMIN_ADDRESS ${expectedAdmin}. Wrong POOL_ADMIN_PRIVATE_KEY / vault key.`,
     );
   }
 

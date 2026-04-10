@@ -9,7 +9,7 @@ struct U64Triple {
     x2: u64,
 }
 
-program xyra_lending_v28.aleo {
+program xyra_lending_v32.aleo {
     const INDEX_SCALE: u64       = 1_000_000_000_000u64;
     const SCALE: u64             = 10_000u64;
     const BLOCKS_PER_YEAR: u64   = 2_102_400u64;
@@ -51,6 +51,17 @@ program xyra_lending_v28.aleo {
     mapping asset_liq_bonus:      field => u64;
     mapping asset_price:          field => u64;
 
+    /// Flash-loan controls and per-user session state.
+    mapping flash_enabled:          field => bool;
+    mapping flash_premium_bps:      field => u64;
+    mapping flash_max_amount:       field => u64;
+    mapping flash_strategy_allowed: field => bool;
+    mapping flash_active:           field => bool;
+    mapping flash_asset:            field => field;
+    mapping flash_principal:        field => u64;
+    mapping flash_min_profit:       field => u64;
+    mapping flash_strategy_id:      field => field;
+
 
 
     /// Canonical per-user position: scaled supply/borrow per asset (indices in pool mappings).
@@ -90,14 +101,13 @@ program xyra_lending_v28.aleo {
     fn deposit_with_credits(
         position: LendingPosition,
         pay_record: credits.aleo::credits,
-        public amount: u64,
+        private amount: u64,
         public sup_idx: u64,
     ) -> (LendingPosition, credits.aleo::credits, Final) {
         assert(amount > 0u64);
         let caller: address = self.caller;
         assert(caller == pay_record.owner);
         assert(position.owner == caller);
-        let user_key: field = BHP256::hash_to_field(caller);
         let scaled_in: u64 = (((amount as u128) * (INDEX_SCALE as u128) / (sup_idx as u128)) as u64);
         assert((position.scaled_sup_native as u128) + (scaled_in as u128) <= 18446744073709551615u128);
         let new_position: LendingPosition = LendingPosition {
@@ -111,13 +121,13 @@ program xyra_lending_v28.aleo {
         };
         let (change, f_transfer): (credits.aleo::credits, Final) =
             credits.aleo::transfer_private_to_public(pay_record, POOL_VAULT_ADDRESS, amount);
-        return (new_position, change, final { finalize_deposit_pos(f_transfer, ASSET_ALEO, amount, user_key, sup_idx); });
+        return (new_position, change, final { finalize_deposit_pos(f_transfer, ASSET_ALEO, amount, sup_idx); });
     }
 
     fn deposit_usdcx(
         position: LendingPosition,
         pay_record: test_usdcx_stablecoin.aleo::Token,
-        public amount: u64,
+        private amount: u64,
         private proofs: [test_usdcx_stablecoin.aleo::MerkleProof; 2],
         public sup_idx: u64,
     ) -> (LendingPosition, test_usdcx_stablecoin.aleo::ComplianceRecord, test_usdcx_stablecoin.aleo::Token, Final) {
@@ -125,7 +135,6 @@ program xyra_lending_v28.aleo {
         let caller: address = self.caller;
         assert(caller == pay_record.owner);
         assert(position.owner == caller);
-        let user_key: field = BHP256::hash_to_field(caller);
         let scaled_in: u64 = (((amount as u128) * (INDEX_SCALE as u128) / (sup_idx as u128)) as u64);
         assert((position.scaled_sup_usdcx as u128) + (scaled_in as u128) <= 18446744073709551615u128);
         let new_position: LendingPosition = LendingPosition {
@@ -143,13 +152,13 @@ program xyra_lending_v28.aleo {
             test_usdcx_stablecoin.aleo::Token,
             Final
         ) = test_usdcx_stablecoin.aleo::transfer_private_to_public(POOL_VAULT_ADDRESS, amount_u128, pay_record, proofs);
-        return (new_position, compliance_record, change_token, final { finalize_deposit_pos(f_transfer, ASSET_USDCX, amount, user_key, sup_idx); });
+        return (new_position, compliance_record, change_token, final { finalize_deposit_pos(f_transfer, ASSET_USDCX, amount, sup_idx); });
     }
 
     fn deposit_usad(
         position: LendingPosition,
         pay_record: test_usad_stablecoin.aleo::Token,
-        public amount: u64,
+        private amount: u64,
         private proofs: [test_usad_stablecoin.aleo::MerkleProof; 2],
         public sup_idx: u64,
     ) -> (LendingPosition, test_usad_stablecoin.aleo::ComplianceRecord, test_usad_stablecoin.aleo::Token, Final) {
@@ -157,7 +166,6 @@ program xyra_lending_v28.aleo {
         let caller: address = self.caller;
         assert(caller == pay_record.owner);
         assert(position.owner == caller);
-        let user_key: field = BHP256::hash_to_field(caller);
         let scaled_in: u64 = (((amount as u128) * (INDEX_SCALE as u128) / (sup_idx as u128)) as u64);
         assert((position.scaled_sup_usad as u128) + (scaled_in as u128) <= 18446744073709551615u128);
         let new_position: LendingPosition = LendingPosition {
@@ -175,7 +183,7 @@ program xyra_lending_v28.aleo {
             test_usad_stablecoin.aleo::Token,
             Final
         ) = test_usad_stablecoin.aleo::transfer_private_to_public(POOL_VAULT_ADDRESS, amount_u128, pay_record, proofs);
-        return (new_position, compliance_record, change_token, final { finalize_deposit_pos(f_transfer, ASSET_USAD, amount, user_key, sup_idx); });
+        return (new_position, compliance_record, change_token, final { finalize_deposit_pos(f_transfer, ASSET_USAD, amount, sup_idx); });
     }
 
     /// Cross-asset withdraw: burn collateral ladder (ALEO → USDCx → USAD) and pay out `out_asset` (`0field` / `1field` / `2field`).
@@ -204,26 +212,26 @@ program xyra_lending_v28.aleo {
     /// - **WDR-09** / **WDR-10** run in **`finalize_withdraw_pos`** (admin can skip via `set_withdraw_assert`); **FWD-*** there too
     /// If transition passes in JS `simulateLendingWithdrawTransitionAudit` but a tx fails, suspect **finalize** or wallet/prover mismatch.
     ///
-    /// **Tx payload vs explorer:** the wallet/prover supplies only **transition** inputs: `LendingPosition` + **public**
-    /// `amount` (**u64**), `out_asset` (**field**), then **twelve plain u64** (`sup_idx_*`, `bor_idx_*`, `price_*`, `ltv_*`).
-    /// Explorers often also show **`finalize_withdraw_pos` publics** (U64Triple structs, `rem_after_usad`, u128 totals) —
-    /// those are **not** typed like `withdraw`’s inputs; do not pass structs to `withdraw`. See `build/abi.json` → `withdraw`.
+    /// **Tx payload vs explorer:** `LendingPosition` is a **private record**; **`amount`, `out_asset`, and all oracle/LTV witnesses
+    /// (`sup_idx_*`, `bor_idx_*`, `price_*`, `ltv_*`) are private transition inputs** — not public plaintext in the transaction bundle.
+    /// Finalize still asserts those witnesses against chain mappings (`finalize_withdraw_pos`). Global mapping deltas remain public state.
+    /// See `build/abi.json` → `withdraw`.
     fn withdraw(
         position: LendingPosition,
-        public amount: u64,
-        public out_asset: field,
-        public sup_idx_aleo: u64,
-        public sup_idx_usdcx: u64,
-        public sup_idx_usad: u64,
-        public bor_idx_aleo: u64,
-        public bor_idx_usdcx: u64,
-        public bor_idx_usad: u64,
-        public price_aleo: u64,
-        public price_usdcx: u64,
-        public price_usad: u64,
-        public ltv_aleo: u64,
-        public ltv_usdcx: u64,
-        public ltv_usad: u64,
+        private amount: u64,
+        private out_asset: field,
+        private sup_idx_aleo: u64,
+        private sup_idx_usdcx: u64,
+        private sup_idx_usad: u64,
+        private bor_idx_aleo: u64,
+        private bor_idx_usdcx: u64,
+        private bor_idx_usad: u64,
+        private price_aleo: u64,
+        private price_usdcx: u64,
+        private price_usad: u64,
+        private ltv_aleo: u64,
+        private ltv_usdcx: u64,
+        private ltv_usad: u64,
     ) -> (LendingPosition, Final) {
         // WDR-01
         assert(amount > 0u64);
@@ -372,8 +380,8 @@ program xyra_lending_v28.aleo {
     /// Per-user debt lives on `LendingPosition` (private); finalize only bumps global `total_borrowed` (no `available_liquidity` change).
     fn borrow(
         position: LendingPosition,
-        public amount: u64,
-        public borrow_asset: field,
+        private amount: u64,
+        private borrow_asset: field,
         public sup_idx_aleo: u64,
         public sup_idx_usdcx: u64,
         public sup_idx_usad: u64,
@@ -473,7 +481,7 @@ program xyra_lending_v28.aleo {
     fn repay_with_credits(
         position: LendingPosition,
         pay_record: credits.aleo::credits,
-        public amount: u64,
+        private amount: u64,
         public bor_idx_aleo: u64,
         public bor_idx_usdcx: u64,
         public bor_idx_usad: u64,
@@ -548,7 +556,7 @@ program xyra_lending_v28.aleo {
     fn repay_usdcx(
         position: LendingPosition,
         pay_record: test_usdcx_stablecoin.aleo::Token,
-        public amount: u64,
+        private amount: u64,
         private proofs: [test_usdcx_stablecoin.aleo::MerkleProof; 2],
         public bor_idx_aleo: u64,
         public bor_idx_usdcx: u64,
@@ -628,7 +636,7 @@ program xyra_lending_v28.aleo {
     fn repay_usad(
         position: LendingPosition,
         pay_record: test_usad_stablecoin.aleo::Token,
-        public amount: u64,
+        private amount: u64,
         private proofs: [test_usad_stablecoin.aleo::MerkleProof; 2],
         public bor_idx_aleo: u64,
         public bor_idx_usdcx: u64,
@@ -712,13 +720,13 @@ program xyra_lending_v28.aleo {
     fn self_liquidate_and_payout(
         position: LendingPosition,
         pay_record: credits.aleo::credits,
-        public repay_amount: u64,
-        public seize_asset: field,
+        private repay_amount: u64,
+        private seize_asset: field,
         public sup_idx: U64Triple,
         public bor_idx: U64Triple,
         public price: U64Triple,
         public liq_thr: U64Triple,
-        public liq_bonus_bps: u64,
+        private liq_bonus_bps: u64,
     ) -> (LendingPosition, credits.aleo::credits, Final) {
         assert(repay_amount > 0u64);
         let caller: address = self.caller;
@@ -842,6 +850,11 @@ program xyra_lending_v28.aleo {
         public reserve_factor: u64
     ) -> Final {
         assert(self.caller == ADMIN_ADDRESS);
+        assert(asset_id == ASSET_ALEO || asset_id == ASSET_USDCX || asset_id == ASSET_USAD);
+        assert(ltv <= BPS_DENOMINATOR);
+        assert(liq_threshold <= BPS_DENOMINATOR);
+        assert(liq_bonus <= BPS_DENOMINATOR);
+        assert(reserve_factor <= SCALE);
         return final { finalize_set_params(asset_id, ltv, liq_threshold, liq_bonus, base_rate, slope_rate, reserve_factor); };
     }
 
@@ -849,6 +862,136 @@ program xyra_lending_v28.aleo {
         assert(amount > 0u64);
         assert(self.caller == ADMIN_ADDRESS);
         return final { finalize_withdraw_fees(asset_id, amount); };
+    }
+
+    /// **Admin only** — single transaction to refresh **all configurable per-asset parameters** (oracle + risk + interest model).
+    /// Updates: `asset_price`, `asset_ltv`, `asset_liq_threshold`, `asset_liq_bonus`, `asset_base_rate`, `asset_slope_rate`, `asset_reserve_factor`.
+    /// Pool **state** (`total_deposited`, indices, liquidity, fees) is **not** edited here; use user flows, `accrue_interest`, `withdraw_fees`.
+    /// For price-only or params-only updates you can still use `set_asset_price` / `set_asset_params`.
+    fn admin_update_asset(
+        public asset_id: field,
+        public price: u64,
+        public ltv: u64,
+        public liq_threshold: u64,
+        public liq_bonus: u64,
+        public base_rate: u64,
+        public slope_rate: u64,
+        public reserve_factor: u64,
+    ) -> Final {
+        assert(self.caller == ADMIN_ADDRESS);
+        assert(asset_id == ASSET_ALEO || asset_id == ASSET_USDCX || asset_id == ASSET_USAD);
+        assert(price > 0u64);
+        assert(ltv <= BPS_DENOMINATOR);
+        assert(liq_threshold <= BPS_DENOMINATOR);
+        assert(liq_bonus <= BPS_DENOMINATOR);
+        assert(reserve_factor <= SCALE);
+        return final {
+            finalize_admin_update_asset(
+                asset_id,
+                price,
+                ltv,
+                liq_threshold,
+                liq_bonus,
+                base_rate,
+                slope_rate,
+                reserve_factor,
+            );
+        };
+    }
+
+    /// Admin-only flash config per asset.
+    fn set_flash_params(
+        public asset_id: field,
+        public enabled: bool,
+        public premium_bps: u64,
+        public max_amount: u64,
+    ) -> Final {
+        assert(self.caller == ADMIN_ADDRESS);
+        assert(asset_id == ASSET_ALEO || asset_id == ASSET_USDCX || asset_id == ASSET_USAD);
+        assert(premium_bps <= BPS_DENOMINATOR);
+        return final { finalize_set_flash_params(asset_id, enabled, premium_bps, max_amount); };
+    }
+
+    /// Admin-only strategy whitelist flag (`strategy_id` is app-defined, e.g. hash of adapter id).
+    fn set_flash_strategy_allowed(public strategy_id: field, public allowed: bool) -> Final {
+        assert(self.caller == ADMIN_ADDRESS);
+        return final { finalize_set_flash_strat(strategy_id, allowed); };
+    }
+
+    /// Open a flash session for caller. Reserves `available_liquidity[asset_id]` until asset-matched settle:
+    /// `flash_settle_with_credits` (ALEO), `flash_settle_with_usdcx`, or `flash_settle_with_usad`.
+    fn flash_open(
+        private asset_id: field,
+        private principal: u64,
+        private min_profit: u64,
+        private strategy_id: field,
+    ) -> Final {
+        assert(asset_id == ASSET_ALEO || asset_id == ASSET_USDCX || asset_id == ASSET_USAD);
+        assert(principal > 0u64);
+        let user_key: field = BHP256::hash_to_field(self.caller);
+        return final { finalize_flash_open(user_key, asset_id, principal, min_profit, strategy_id); };
+    }
+
+    /// Settle an opened flash session with ALEO credits repayment.
+    /// Profit gate: tx succeeds only if `repay_amount >= principal + fee` and `(repay_amount - principal - fee) >= min_profit`.
+    fn flash_settle_with_credits(
+        pay_record: credits.aleo::credits,
+        private repay_amount: u64,
+        private strategy_id: field,
+    ) -> (credits.aleo::credits, Final) {
+        assert(repay_amount > 0u64);
+        let caller: address = self.caller;
+        assert(caller == pay_record.owner);
+        let user_key: field = BHP256::hash_to_field(caller);
+        let (change, f_transfer): (credits.aleo::credits, Final) =
+            credits.aleo::transfer_private_to_public(pay_record, POOL_VAULT_ADDRESS, repay_amount);
+        return (change, final {
+            finalize_flash_settle(f_transfer, user_key, repay_amount, strategy_id);
+        });
+    }
+
+    /// Settle flash with USDCx (same `finalize_flash_settle` profit gate as credits path).
+    fn flash_settle_with_usdcx(
+        pay_record: test_usdcx_stablecoin.aleo::Token,
+        private repay_amount: u64,
+        private strategy_id: field,
+        private proofs: [test_usdcx_stablecoin.aleo::MerkleProof; 2],
+    ) -> (test_usdcx_stablecoin.aleo::ComplianceRecord, test_usdcx_stablecoin.aleo::Token, Final) {
+        assert(repay_amount > 0u64);
+        let caller: address = self.caller;
+        assert(caller == pay_record.owner);
+        let user_key: field = BHP256::hash_to_field(caller);
+        let amount_u128: u128 = repay_amount as u128;
+        let (compliance_record, change_token, f_transfer): (
+            test_usdcx_stablecoin.aleo::ComplianceRecord,
+            test_usdcx_stablecoin.aleo::Token,
+            Final
+        ) = test_usdcx_stablecoin.aleo::transfer_private_to_public(POOL_VAULT_ADDRESS, amount_u128, pay_record, proofs);
+        return (compliance_record, change_token, final {
+            finalize_flash_settle(f_transfer, user_key, repay_amount, strategy_id);
+        });
+    }
+
+    /// Settle flash with USAD (same `finalize_flash_settle` profit gate as credits path).
+    fn flash_settle_with_usad(
+        pay_record: test_usad_stablecoin.aleo::Token,
+        private repay_amount: u64,
+        private strategy_id: field,
+        private proofs: [test_usad_stablecoin.aleo::MerkleProof; 2],
+    ) -> (test_usad_stablecoin.aleo::ComplianceRecord, test_usad_stablecoin.aleo::Token, Final) {
+        assert(repay_amount > 0u64);
+        let caller: address = self.caller;
+        assert(caller == pay_record.owner);
+        let user_key: field = BHP256::hash_to_field(caller);
+        let amount_u128: u128 = repay_amount as u128;
+        let (compliance_record, change_token, f_transfer): (
+            test_usad_stablecoin.aleo::ComplianceRecord,
+            test_usad_stablecoin.aleo::Token,
+            Final
+        ) = test_usad_stablecoin.aleo::transfer_private_to_public(POOL_VAULT_ADDRESS, amount_u128, pay_record, proofs);
+        return (compliance_record, change_token, final {
+            finalize_flash_settle(f_transfer, user_key, repay_amount, strategy_id);
+        });
     }
 
    
@@ -883,9 +1026,8 @@ assert(!already);
 /// **does** pin supply index — if `accrue_interest` runs between UI read and inclusion, deposit reverts while repay can still pass.
 final fn finalize_deposit_pos(
     public f_transfer: Final,
-    public asset_id: field,
-    public amount: u64,
-    public user_key: field,
+    asset_id: field,
+    amount: u64,
     public sup_idx: u64,
 ) {
     f_transfer.run();
@@ -902,8 +1044,8 @@ final fn finalize_deposit_pos(
 
 /// Pool-only: `total_borrowed[asset_id] += amount`. Same as v6 `finalize_borrow` mapping writes; no `available_liquidity` change.
 final fn finalize_borrow_pos(
-    public asset_id: field,
-    public amount: u64,
+     asset_id: field,
+     amount: u64,
     public sup_idx_aleo: u64,
     public sup_idx_usdcx: u64,
     public sup_idx_usad: u64,
@@ -937,9 +1079,9 @@ final fn finalize_borrow_pos(
 /// After transfer: reduce `total_borrowed` per leg by transition-computed `repay_*_asset` (v6 `finalize_repay_any` waterfall);
 /// `available_liquidity[asset_in] += amount`.
 final fn finalize_repay_pos(
-    public f_transfer: Final,
-    public asset_in: field,
-    public amount: u64,
+    f_transfer: Final,
+    asset_in: field,
+    amount: u64,
     public repay_aleo_asset: u64,
     public repay_usdcx_asset: u64,
     public repay_usad_asset: u64,
@@ -1008,17 +1150,19 @@ final fn finalize_self_liq_payout(
 /// **Debug:** failing here means a **witness ≠ chain mapping** at finalize (stale `sup_idx`/`bor_idx`/price/LTV after accrue or admin update), not “pool liquidity”.
 /// Codes: **FWD-SUP-0/1/2** supply_index · **FWD-BOR-0/1/2** borrow_index · **FWD-PRC-0/1/2** asset_price · **FWD-LTV-0/1/2** asset_ltv  
 /// Skip FWD-* only via `set_withdraw_assert(2u8, 0u64)` — **unsafe** for production.
+/// **Privacy:** `asset_id`, `amount`, `burn_amts`, oracle triples, and health intermediates are **private** finalize operands (not public ledger metadata).
+/// They are still bound to the transition proof; only mapping updates are written to chain state.
 final fn finalize_withdraw_pos(
-    public asset_id: field,
-    public amount: u64,
-    public burn_amts: U64Triple,
-    public sup_idx: U64Triple,
-    public bor_idx: U64Triple,
-    public price: U64Triple,
-    public ltv: U64Triple,
-    public rem_after_usad: u64,
-    public total_debt_u128: u128,
-    public total_collateral_after_u128: u128,
+    asset_id: field,
+    amount: u64,
+    burn_amts: U64Triple,
+    sup_idx: U64Triple,
+    bor_idx: U64Triple,
+    price: U64Triple,
+    ltv: U64Triple,
+    rem_after_usad: u64,
+    total_debt_u128: u128,
+    total_collateral_after_u128: u128,
 ) {
     
         // FWD-SUP-ALEO
@@ -1106,14 +1250,25 @@ final fn finalize_accrue(
     let base_rate: u64 = Mapping::get_or_use(asset_base_rate, asset_id, 200u64);
     let slope_rate: u64 = Mapping::get_or_use(asset_slope_rate, asset_id, 400u64);
     let reserve_factor: u64 = Mapping::get_or_use(asset_reserve_factor, asset_id, 1000u64);
+    assert(reserve_factor <= SCALE);
     let raw_delta: u64 = current_block > last_block ? current_block - last_block : 0u64;
     let delta: u64 = raw_delta > MAX_ACCRUAL_DELTA ? MAX_ACCRUAL_DELTA : raw_delta;
     let do_accrue: bool = delta > 0u64 && deposited > 0u64;
-    let safe_deposited: u64 = deposited == 0u64 ? 1u64 : deposited;
-    let raw_util: u64 = (borrowed * SCALE) / safe_deposited;
-    let util: u64 = deposited == 0u64 ? 0u64 : raw_util;
-    let borrow_rate: u64 = (base_rate + (slope_rate * util) / SCALE) * INDEX_SCALE / (BLOCKS_PER_YEAR * SCALE);
-    let supply_rate: u64 = (borrow_rate * util * (SCALE - reserve_factor)) / (SCALE * SCALE);
+    // Compute utilization in u128 and cap to SCALE (100%) to avoid overflow / extreme rate spikes.
+    let util_u128: u128 = deposited == 0u64
+        ? 0u128
+        : (((borrowed as u128) * (SCALE as u128)) / (deposited as u128));
+    let util_capped_u128: u128 = util_u128 > (SCALE as u128) ? (SCALE as u128) : util_u128;
+    let util: u64 = util_capped_u128 as u64;
+    let borrow_rate_u128: u128 =
+        (((base_rate as u128) + (((slope_rate as u128) * (util as u128)) / (SCALE as u128)))
+            * (INDEX_SCALE as u128))
+            / ((BLOCKS_PER_YEAR as u128) * (SCALE as u128));
+    let borrow_rate: u64 = borrow_rate_u128 as u64;
+    let supply_rate_u128: u128 =
+        ((borrow_rate as u128) * (util as u128) * ((SCALE - reserve_factor) as u128))
+            / ((SCALE as u128) * (SCALE as u128));
+    let supply_rate: u64 = supply_rate_u128 as u64;
     let new_sup_idx: u64 = do_accrue ? sup_idx + (sup_idx * supply_rate * delta) / INDEX_SCALE : sup_idx;
     let new_bor_idx: u64 = do_accrue ? bor_idx + (bor_idx * borrow_rate * delta) / INDEX_SCALE : bor_idx;
     let fee_rate: u64 = (borrowed * borrow_rate) / INDEX_SCALE;
@@ -1157,6 +1312,106 @@ final fn finalize_set_params(
     Mapping::set(asset_slope_rate, asset_id, slope_rate);
     Mapping::set(asset_reserve_factor, asset_id, reserve_factor);
 
+}
+
+/// Batched admin write: **7 mapping sets** (within finalize limits). Keeps price + risk + rate model in sync per asset.
+final fn finalize_admin_update_asset(
+    public asset_id: field,
+    public price: u64,
+    public ltv: u64,
+    public liq_threshold: u64,
+    public liq_bonus: u64,
+    public base_rate: u64,
+    public slope_rate: u64,
+    public reserve_factor: u64,
+) {
+    Mapping::set(asset_price, asset_id, price);
+    Mapping::set(asset_ltv, asset_id, ltv);
+    Mapping::set(asset_liq_threshold, asset_id, liq_threshold);
+    Mapping::set(asset_liq_bonus, asset_id, liq_bonus);
+    Mapping::set(asset_base_rate, asset_id, base_rate);
+    Mapping::set(asset_slope_rate, asset_id, slope_rate);
+    Mapping::set(asset_reserve_factor, asset_id, reserve_factor);
+}
+
+final fn finalize_set_flash_params(
+    public asset_id: field,
+    public enabled: bool,
+    public premium_bps: u64,
+    public max_amount: u64,
+) {
+    Mapping::set(flash_enabled, asset_id, enabled);
+    Mapping::set(flash_premium_bps, asset_id, premium_bps);
+    Mapping::set(flash_max_amount, asset_id, max_amount);
+}
+
+final fn finalize_set_flash_strat(
+    public strategy_id: field,
+    public allowed: bool,
+) {
+    Mapping::set(flash_strategy_allowed, strategy_id, allowed);
+}
+
+final fn finalize_flash_open(
+     user_key: field,
+     asset_id: field,
+     principal: u64,
+     min_profit: u64,
+     strategy_id: field,
+) {
+    assert(Mapping::get_or_use(flash_enabled, asset_id, false));
+    assert(Mapping::get_or_use(flash_strategy_allowed, strategy_id, false));
+    let max_amount: u64 = Mapping::get_or_use(flash_max_amount, asset_id, 0u64);
+    assert(max_amount == 0u64 || principal <= max_amount);
+    assert(!Mapping::get_or_use(flash_active, user_key, false));
+    let avail: u64 = Mapping::get_or_use(available_liquidity, asset_id, 0u64);
+    assert(principal <= avail);
+
+    Mapping::set(available_liquidity, asset_id, avail - principal);
+    Mapping::set(flash_active, user_key, true);
+    Mapping::set(flash_asset, user_key, asset_id);
+    Mapping::set(flash_principal, user_key, principal);
+    Mapping::set(flash_min_profit, user_key, min_profit);
+    Mapping::set(flash_strategy_id, user_key, strategy_id);
+}
+
+final fn finalize_flash_settle(
+    public f_transfer: Final,
+    public user_key: field,
+    public repay_amount: u64,
+    public strategy_id: field,
+) {
+    f_transfer.run();
+    assert(Mapping::get_or_use(flash_active, user_key, false));
+    let asset_id: field = Mapping::get_or_use(flash_asset, user_key, 0field);
+    assert(asset_id == ASSET_ALEO || asset_id == ASSET_USDCX || asset_id == ASSET_USAD);
+    let expected_strategy: field = Mapping::get_or_use(flash_strategy_id, user_key, 0field);
+    assert(expected_strategy == strategy_id);
+    let principal: u64 = Mapping::get_or_use(flash_principal, user_key, 0u64);
+    let premium_bps: u64 = Mapping::get_or_use(flash_premium_bps, asset_id, 5u64);
+    let fee_u128: u128 =
+        ((principal as u128) * (premium_bps as u128) + ((BPS_DENOMINATOR - 1u64) as u128))
+        / (BPS_DENOMINATOR as u128);
+    assert(fee_u128 <= 18446744073709551615u128);
+    let fee: u64 = fee_u128 as u64;
+    assert((principal as u128) + (fee as u128) <= 18446744073709551615u128);
+    assert(repay_amount >= principal + fee);
+    let realized_profit: u64 = repay_amount - (principal + fee);
+    let min_profit: u64 = Mapping::get_or_use(flash_min_profit, user_key, 0u64);
+    assert(realized_profit >= min_profit);
+
+    let avail: u64 = Mapping::get_or_use(available_liquidity, asset_id, 0u64);
+    assert((avail as u128) + (repay_amount as u128) <= 18446744073709551615u128);
+    Mapping::set(available_liquidity, asset_id, avail + repay_amount);
+
+    let fees: u64 = Mapping::get_or_use(protocol_fees, asset_id, 0u64);
+    assert((fees as u128) + (fee as u128) <= 18446744073709551615u128);
+    Mapping::set(protocol_fees, asset_id, fees + fee);
+
+    Mapping::set(flash_active, user_key, false);
+    Mapping::set(flash_principal, user_key, 0u64);
+    Mapping::set(flash_min_profit, user_key, 0u64);
+    Mapping::set(flash_strategy_id, user_key, 0field);
 }
 
 final fn finalize_withdraw_fees(

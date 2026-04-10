@@ -38,7 +38,12 @@ import {
   lendingAccrueInterest,
   lendingAccrueInterestUsdc,
   lendingAccrueInterestUsad,
-  lendingFlashLoan,
+  lendingFlashOpen,
+  lendingFlashSettleWithCredits,
+  lendingFlashSettleWithUsdcx,
+  lendingFlashSettleWithUsad,
+  fetchAvailableLiquidityMicro,
+  type FlashLendingAssetId,
   lendingMintPositionMigrationNote,
   getPositionNoteSchemaFromChain,
   POSITION_NOTE_SCHEMA_ON_CHAIN_V2,
@@ -83,15 +88,47 @@ import {
 // Frontend app environment: 'dev' or 'prod' (default to dev for non-production NODE_ENV)
 const APP_ENV = process.env.NEXT_PUBLIC_APP_ENV;
 const isDevAppEnv = APP_ENV ? APP_ENV === 'dev' : process.env.NODE_ENV !== 'production';
-const ADMIN_WALLET_ADDRESS =
-  process.env.NEXT_PUBLIC_LENDING_ADMIN_ADDRESS ||
-  'aleo1rhgdu77hgyqd3xjj8ucu3jj9r2krwz6mnzyd80gncr5fxcwlh5rsvzp9px';
-
 /** Sprint 2: Flash tab panel for `mint_position_migration_note` + migration readout. */
 const SHOW_SPRINT2_MIGRATION_UI = process.env.NEXT_PUBLIC_SHOW_SPRINT2_MIGRATION_UI === 'true';
 
 /** Withdraw MAX in UI: floor to this many decimal places (same style as borrow/repay inputs). */
 const WITHDRAW_MAX_DISPLAY_DECIMALS = 2;
+
+const FLASH_SESSION_TERMINAL_STATUSES = new Set(['settled', 'expired', 'failed', 'cancelled']);
+
+function isFlashSessionStatusActive(status: string): boolean {
+  return !FLASH_SESSION_TERMINAL_STATUSES.has(String(status || '').toLowerCase());
+}
+
+function flashSessionStatusChipProps(status: string): {
+  label: string;
+  variant: 'neutral' | 'good' | 'warn' | 'danger' | 'info';
+} {
+  const s = String(status || '').toLowerCase();
+  switch (s) {
+    case 'opened':
+      return { label: 'Opened', variant: 'info' };
+    case 'funding_pending':
+      return { label: 'Funding pending', variant: 'warn' };
+    case 'funded':
+      return { label: 'Funded', variant: 'info' };
+    case 'settle_pending':
+      return { label: 'Settle pending', variant: 'warn' };
+    case 'settled':
+      return { label: 'Settled', variant: 'good' };
+    case 'expired':
+      return { label: 'Expired', variant: 'neutral' };
+    case 'failed':
+      return { label: 'Failed', variant: 'danger' };
+    default: {
+      const raw = String(status || '').trim();
+      const label = raw
+        ? raw.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+        : 'Unknown';
+      return { label, variant: 'neutral' };
+    }
+  }
+}
 
 /** Rich console output when a pool tx is rejected / failed / dropped (helps debug repay). */
 function logPoolTxRejected(
@@ -468,12 +505,62 @@ const DashboardPage: NextPageWithLayout = () => {
   // Track if we've already triggered a one-time records permission request for this connection
   const [walletPermissionsInitialized, setWalletPermissionsInitialized] = useState<boolean>(false);
 
-  // Flash loan (ALEO pool only) — separate tab
+  // Flash loan (unified pool: per-asset `available_liquidity`) — separate tab
+  const [flashAsset, setFlashAsset] = useState<FlashLendingAssetId>('0field');
+  const [flashSettleAsset, setFlashSettleAsset] = useState<FlashLendingAssetId>('0field');
+  const [flashAvailLiquidityMicro, setFlashAvailLiquidityMicro] = useState<bigint | null>(null);
   const [flashAmountInput, setFlashAmountInput] = useState('');
+  const [flashMinProfitInput, setFlashMinProfitInput] = useState('0');
+  const [flashRepayInput, setFlashRepayInput] = useState('');
+  const [flashStrategyIdInput, setFlashStrategyIdInput] = useState('1field');
+  const [flashOpenAttempted, setFlashOpenAttempted] = useState(false);
   const [flashLoading, setFlashLoading] = useState(false);
   const [flashStatusMessage, setFlashStatusMessage] = useState('');
   const [flashTxId, setFlashTxId] = useState<string | null>(null);
   const [flashVaultTxId, setFlashVaultTxId] = useState<string | null>(null);
+  const [flashSessionId, setFlashSessionId] = useState<string | null>(null);
+  const [flashTxModalOpen, setFlashTxModalOpen] = useState(false);
+  const [flashTxModalKind, setFlashTxModalKind] = useState<'open' | 'settle'>('open');
+  type FlashSessionRow = {
+    id: string;
+    status: string;
+    asset_id: string;
+    principal_micro: number;
+    min_profit_micro: number;
+    strategy_id_field: string;
+    flash_open_tx_id: string | null;
+    vault_fund_tx_id: string | null;
+    flash_settle_tx_id: string | null;
+    expected_repay_micro?: number | null;
+    actual_repay_micro?: number | null;
+    profit_micro?: number | null;
+    created_at: string;
+  };
+  const [flashSessions, setFlashSessions] = useState<FlashSessionRow[]>([]);
+  const [flashSessionsLoading, setFlashSessionsLoading] = useState(false);
+  const [flashSessionsError, setFlashSessionsError] = useState<string | null>(null);
+  const [flashHistoryFilter, setFlashHistoryFilter] = useState<'all' | 'active'>('all');
+
+  const displayedFlashSessions = useMemo(() => {
+    if (flashHistoryFilter !== 'active') return flashSessions;
+    return flashSessions.filter((s) => isFlashSessionStatusActive(s.status));
+  }, [flashSessions, flashHistoryFilter]);
+
+  const prefillSettleFromSession = useCallback((s: FlashSessionRow) => {
+    const aid = String(s.asset_id || '');
+    if (aid === '0field' || aid === '1field' || aid === '2field') {
+      setFlashSettleAsset(aid as FlashLendingAssetId);
+    }
+    if (s.strategy_id_field) setFlashStrategyIdInput(String(s.strategy_id_field));
+    const expectedMicro =
+      Number(s.expected_repay_micro ?? 0) > 0
+        ? Number(s.expected_repay_micro)
+        : Math.round(Number(s.principal_micro || 0)) +
+          aleoFlashFeeMicro(Math.round(Number(s.principal_micro || 0))) +
+          Math.round(Number(s.min_profit_micro || 0));
+    if (expectedMicro > 0) setFlashRepayInput((expectedMicro / 1_000_000).toFixed(6));
+    if (s.id) setFlashSessionId(s.id);
+  }, []);
   const [liqRepayAmountInput, setLiqRepayAmountInput] = useState('');
   const [liqSeizeAsset, setLiqSeizeAsset] = useState<'0field' | '1field' | '2field'>('1field');
   const [liqLoading, setLiqLoading] = useState(false);
@@ -508,13 +595,6 @@ const DashboardPage: NextPageWithLayout = () => {
   const [openAccountStatusMsg, setOpenAccountStatusMsg] = useState('');
   /** True once submit finishes (success, timeout, chain reject, or catch). Allows closing the modal. */
   const [openAccountFlowDone, setOpenAccountFlowDone] = useState(false);
-  // Admin controls (shown only for configured admin wallet)
-  const [adminAsset, setAdminAsset] = useState<'0field' | '1field' | '2field'>('0field');
-  const [adminPriceInput, setAdminPriceInput] = useState('');
-  const [adminSubmitting, setAdminSubmitting] = useState(false);
-  const [adminStatus, setAdminStatus] = useState('');
-  const [adminTxId, setAdminTxId] = useState<string | null>(null);
-
   // Transaction history from Supabase (by wallet address)
   type TxHistoryRow = {
     id: string;
@@ -888,86 +968,6 @@ const DashboardPage: NextPageWithLayout = () => {
     return msg || 'Unknown error';
   };
 
-  const isAdminWallet = !!publicKey && publicKey === ADMIN_WALLET_ADDRESS;
-
-  const handleAdminSetAssetPrice = async () => {
-    if (!isAdminWallet) {
-      setAdminStatus('Only the configured admin wallet can call this function.');
-      return;
-    }
-    if (!executeTransaction) {
-      setAdminStatus('Wallet not ready.');
-      return;
-    }
-    const human = Number(adminPriceInput);
-    if (!Number.isFinite(human) || human <= 0) {
-      setAdminStatus('Enter a valid positive price.');
-      return;
-    }
-    const priceScaled = BigInt(Math.round(human * 1_000_000));
-    if (priceScaled <= 0n) {
-      setAdminStatus('Scaled price must be > 0.');
-      return;
-    }
-    setAdminSubmitting(true);
-    setAdminStatus('Submitting set_asset_price…');
-    setAdminTxId(null);
-    try {
-      const tx = await executeTransaction({
-        program: LENDING_POOL_PROGRAM_ID,
-        function: 'set_asset_price',
-        inputs: [adminAsset, `${priceScaled.toString()}u64`],
-        fee: 0.2 * 1_000_000,
-        privateFee: false,
-      });
-      const txId = tx?.transactionId as string | undefined;
-      if (!txId) throw new Error('No transactionId returned.');
-      setAdminTxId(txId);
-      setAdminStatus(`Submitted (${txId.slice(0, 12)}…). Waiting for finalization…`);
-
-      let finalized = false;
-      const maxAttempts = 45;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        if (!transactionStatus) continue;
-        try {
-          const statusResult = await transactionStatus(txId);
-          const statusText =
-            typeof statusResult === 'string'
-              ? statusResult
-              : (statusResult as { status?: string })?.status ?? '';
-          const lower = statusText.toLowerCase();
-          if (lower === 'finalized' || lower === 'accepted') {
-            finalized = true;
-            break;
-          }
-          if (lower === 'rejected' || lower === 'failed' || lower === 'dropped') {
-            setAdminStatus(`Transaction ${lower}.`);
-            return;
-          }
-          setAdminStatus(`Transaction ${statusText || 'pending'}… (${attempt}/${maxAttempts})`);
-        } catch {
-          // keep polling
-        }
-      }
-      if (!finalized) {
-        setAdminStatus('Transaction not finalized in time. Check explorer.');
-        return;
-      }
-      setAdminStatus('Price updated on-chain. Refreshing pool state…');
-      await Promise.all([
-        refreshPoolState(true),
-        refreshUsdcPoolState(true),
-        refreshUsadPoolState(true),
-      ]).catch(() => { });
-      setAdminStatus('Price updated and pool state refreshed.');
-    } catch (e: unknown) {
-      setAdminStatus(getErrorMessage(e));
-    } finally {
-      setAdminSubmitting(false);
-    }
-  };
-
   const fetchVaultBalancesHuman = async (): Promise<{ aleo: number; usdcx: number; usad: number } | null> => {
     try {
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
@@ -1149,6 +1149,33 @@ const DashboardPage: NextPageWithLayout = () => {
     }
   }, [address]);
 
+  const fetchFlashSessions = useCallback(async () => {
+    if (!address?.trim()) return;
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
+    if (!backendUrl) {
+      setFlashSessionsError('NEXT_PUBLIC_BACKEND_URL is not configured.');
+      setFlashSessions([]);
+      return;
+    }
+    setFlashSessionsLoading(true);
+    setFlashSessionsError(null);
+    try {
+      const resp = await fetch(`${backendUrl}/flash/sessions?wallet=${encodeURIComponent(address.trim())}&limit=100`);
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || data?.ok === false) {
+        setFlashSessionsError(data?.error || 'Failed to load flash sessions.');
+        setFlashSessions([]);
+        return;
+      }
+      setFlashSessions(Array.isArray(data?.sessions) ? data.sessions : []);
+    } catch (e: any) {
+      setFlashSessionsError(e?.message || 'Network error while loading flash sessions.');
+      setFlashSessions([]);
+    } finally {
+      setFlashSessionsLoading(false);
+    }
+  }, [address]);
+
   const saveTransactionToSupabase = async (
     walletAddress: string,
     txId: string,
@@ -1157,7 +1184,6 @@ const DashboardPage: NextPageWithLayout = () => {
       | 'withdraw'
       | 'borrow'
       | 'repay'
-      | 'flash_loan'
       | 'liquidation'
       | 'open_position'
       | 'self_liquidate_payout',
@@ -1593,17 +1619,62 @@ const DashboardPage: NextPageWithLayout = () => {
   useEffect(() => {
     if (address?.trim()) {
       fetchTransactionHistory();
+      fetchFlashSessions();
     } else {
       setTxHistory([]);
+      setFlashSessions([]);
     }
-  }, [address, fetchTransactionHistory]);
+  }, [address, fetchTransactionHistory, fetchFlashSessions]);
 
   // Auto-refresh transaction history every 1 min (e.g. to show vault_tx_id when backend completes)
   useEffect(() => {
     if (!address?.trim()) return;
-    const interval = setInterval(() => fetchTransactionHistory(), 60_000);
+    const interval = setInterval(() => {
+      fetchTransactionHistory();
+      fetchFlashSessions();
+    }, 60_000);
     return () => clearInterval(interval);
-  }, [address, fetchTransactionHistory]);
+  }, [address, fetchTransactionHistory, fetchFlashSessions]);
+
+  useEffect(() => {
+    if (!flashSessionId) return;
+    const row = flashSessions.find((s) => s.id === flashSessionId);
+    if (row?.vault_fund_tx_id) setFlashVaultTxId(row.vault_fund_tx_id);
+  }, [flashSessionId, flashSessions]);
+
+  useEffect(() => {
+    if (view !== 'flash' || !flashSessions.length) return;
+    const latest = [...flashSessions].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+    )[0];
+    if (!latest) return;
+    const latestStatus = String(latest.status || '').toLowerCase();
+    if (FLASH_SESSION_TERMINAL_STATUSES.has(latestStatus)) {
+      // No latest active session to settle -> keep settle fields empty/default.
+      setFlashSessionId(null);
+      setFlashRepayInput('');
+      setFlashSettleAsset('0field');
+      setFlashStrategyIdInput('1field');
+      return;
+    }
+    prefillSettleFromSession(latest);
+  }, [view, flashSessions, prefillSettleFromSession]);
+
+  useEffect(() => {
+    if (view !== 'flash') return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const v = await fetchAvailableLiquidityMicro(LENDING_POOL_PROGRAM_ID, flashAsset);
+        if (!cancelled) setFlashAvailLiquidityMicro(v);
+      } catch {
+        if (!cancelled) setFlashAvailLiquidityMicro(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [view, flashAsset]);
 
   const inlineTxClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // After inline panel tx finalizes: clear inputs + overview (brief delay so explorer link can show)
@@ -2024,8 +2095,57 @@ const DashboardPage: NextPageWithLayout = () => {
     }
   };
 
-  /** ALEO pool: flash_loan_with_credits — uncollateralized; capped by pool liquidity only. */
+  async function waitForPoolTxFinalization(
+    tx: string,
+    action: 'flash_open' | 'flash_settle',
+  ): Promise<string> {
+    let finalTxId = tx;
+    let finalized = false;
+    const maxAttempts = 45;
+    const delayMs = 2000;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (transactionStatus) {
+        try {
+          const statusResult = await transactionStatus(tx);
+          const statusText =
+            typeof statusResult === 'string'
+              ? statusResult
+              : (statusResult as { status?: string })?.status ?? '';
+          const statusLower = (statusText || '').toLowerCase();
+          if (statusLower === 'finalized' || statusLower === 'accepted') {
+            finalized = true;
+            const resolvedId =
+              (typeof statusResult === 'object' &&
+                (statusResult as { transactionId?: string }).transactionId) ||
+              tx;
+            finalTxId = resolvedId;
+            setFlashTxId(isExplorerHash(resolvedId) ? resolvedId : null);
+            break;
+          }
+          if (statusLower === 'rejected' || statusLower === 'failed' || statusLower === 'dropped') {
+            logPoolTxRejected('ALEO pool', statusLower, tx, {
+              action,
+              program: LENDING_POOL_PROGRAM_ID,
+            });
+            throw new Error(`Transaction ${statusLower}.`);
+          }
+          setFlashStatusMessage(`Transaction ${statusText || 'pending'}… (${attempt}/${maxAttempts})`);
+        } catch (e) {
+          if (e instanceof Error && e.message.startsWith('Transaction ')) throw e;
+          console.warn('Flash tx status poll:', e);
+        }
+      }
+    }
+    if (!finalized) {
+      throw new Error('Transaction not finalized in time. Check the explorer.');
+    }
+    return finalTxId;
+  }
+
+  /** Unified pool flash: open session (`flash_open`) for selected asset. */
   const handleFlashLoan = async () => {
+    setFlashOpenAttempted(true);
     if (!connected || !publicKey || !executeTransaction || !requestRecords) {
       setFlashStatusMessage('Please connect your wallet.');
       return;
@@ -2039,105 +2159,288 @@ const DashboardPage: NextPageWithLayout = () => {
       setFlashStatusMessage('Enter a valid principal amount.');
       return;
     }
-    const poolSuppliedMicro = Number(totalSupplied) || 0;
-    const poolBorrowedMicro = Number(totalBorrowed) || 0;
-    /** On-chain liquidity (micro); must not skip check when both totals are 0 — that means 0 available. */
-    const availableLiquidityMicro = Math.max(0, poolSuppliedMicro - poolBorrowedMicro);
     const principalMicro = Math.round(principal * 1_000_000);
-    if (principalMicro > availableLiquidityMicro) {
+    let onChainAvail: bigint | null = null;
+    try {
+      onChainAvail = await fetchAvailableLiquidityMicro(LENDING_POOL_PROGRAM_ID, flashAsset);
+      setFlashAvailLiquidityMicro(onChainAvail);
+    } catch {
+      onChainAvail = null;
+    }
+    if (onChainAvail != null && BigInt(principalMicro) > onChainAvail) {
       setFlashStatusMessage(
-        `Principal exceeds pool liquidity (${(availableLiquidityMicro / 1_000_000).toFixed(6)} ALEO available).`,
+        `Principal exceeds on-chain available liquidity for this asset (${(Number(onChainAvail) / 1_000_000).toFixed(6)}).`,
       );
+      return;
+    }
+    const minProfit = Number(flashMinProfitInput || '0');
+    if (!Number.isFinite(minProfit) || minProfit < 0) {
+      setFlashStatusMessage('Enter valid min profit (>= 0).');
+      return;
+    }
+    const strategyId = (flashStrategyIdInput || '').trim();
+    if (!/^\d+field$/.test(strategyId)) {
+      setFlashStatusMessage("Strategy id must be Leo field like '1field'.");
       return;
     }
     const feeMicro = aleoFlashFeeMicro(principalMicro);
-    const totalMicro = principalMicro + feeMicro;
-    let balance = privateAleoBalance;
-    if (balance === null && requestRecords) {
-      balance = await getPrivateCreditsBalance(requestRecords, decrypt);
-      setPrivateAleoBalance(balance);
+    const totalMicro = principalMicro + feeMicro + Math.round(minProfit * 1_000_000);
+    if (flashAsset === '0field') {
+      let balance = privateAleoBalance;
+      if (balance === null && requestRecords) {
+        balance = await getPrivateCreditsBalance(requestRecords, decrypt);
+        setPrivateAleoBalance(balance);
+      }
+      if (totalMicro / 1_000_000 > (balance ?? 0) + 1e-9) {
+        setFlashStatusMessage(
+          `Need one private credits record covering principal + fee + min profit (${(totalMicro / 1_000_000).toFixed(6)} ALEO).`,
+        );
+        return;
+      }
+    } else if (flashAsset === '1field') {
+      const rec = await getSuitableUsdcTokenRecord(requestRecords, totalMicro, publicKey, decrypt);
+      if (!rec) {
+        setFlashStatusMessage(
+          `Need one USDCx Token record covering principal + fee + min profit (${(totalMicro / 1_000_000).toFixed(6)} USDC).`,
+        );
+        return;
+      }
+    } else {
+      const rec = await getSuitableUsadTokenRecord(requestRecords, totalMicro, publicKey, decrypt);
+      if (!rec) {
+        setFlashStatusMessage(
+          `Need one USAD Token record covering principal + fee + min profit (${(totalMicro / 1_000_000).toFixed(6)} USAD).`,
+        );
+        return;
+      }
     }
-    if (totalMicro / 1_000_000 > (balance ?? 0) + 1e-9) {
-      setFlashStatusMessage(
-        `Need one private credits record covering principal + fee (${(totalMicro / 1_000_000).toFixed(6)} ALEO).`,
-      );
-      return;
-    }
-
     try {
+      setFlashTxModalKind('open');
+      setFlashTxModalOpen(true);
       setFlashLoading(true);
-      setFlashStatusMessage('Submitting flash loan…');
+      setFlashStatusMessage('Submitting flash open…');
       setFlashVaultTxId(null);
       setFlashTxId(null);
-      const tx = await lendingFlashLoan(executeTransaction, principal, publicKey, requestRecords, decrypt);
+      const tx = await lendingFlashOpen(
+        executeTransaction,
+        principal,
+        minProfit,
+        strategyId,
+        publicKey,
+        requestRecords,
+        decrypt,
+        LENDING_POOL_PROGRAM_ID,
+        flashAsset,
+      );
       if (tx === '__CANCELLED__') {
         setFlashStatusMessage('Transaction cancelled by user.');
         setFlashLoading(false);
         return;
       }
-      let finalTxId = tx;
-      let finalized = false;
-      let txFailed = false;
-      const maxAttempts = 45;
-      const delayMs = 2000;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-        if (transactionStatus) {
-          try {
-            const statusResult = await transactionStatus(tx);
-            const statusText =
-              typeof statusResult === 'string'
-                ? statusResult
-                : (statusResult as { status?: string })?.status ?? '';
-            const statusLower = (statusText || '').toLowerCase();
-            if (statusLower === 'finalized' || statusLower === 'accepted') {
-              finalized = true;
-              const resolvedId =
-                (typeof statusResult === 'object' && (statusResult as { transactionId?: string }).transactionId) ||
-                tx;
-              finalTxId = resolvedId;
-              setFlashTxId(isExplorerHash(resolvedId) ? resolvedId : null);
-              break;
-            }
-            if (statusLower === 'rejected' || statusLower === 'failed' || statusLower === 'dropped') {
-              txFailed = true;
-              logPoolTxRejected('ALEO pool', statusLower, tx, {
-                action: 'flash_loan',
-                program: LENDING_POOL_PROGRAM_ID,
-              });
-              setFlashStatusMessage(`Transaction ${statusLower}.`);
-              setFlashLoading(false);
-              return;
-            }
-            setFlashStatusMessage(`Transaction ${statusText || 'pending'}… (${attempt}/${maxAttempts})`);
-          } catch (e) {
-            console.warn('Flash loan status poll:', e);
-          }
+      const finalTxId = await waitForPoolTxFinalization(tx, 'flash_open');
+      const idempotencyKey = `flash-${publicKey}-${Date.now()}`;
+      const recResp = await fetch('/api/flash-record-open', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_address: publicKey,
+          strategy_wallet: publicKey,
+          asset_id: flashAsset,
+          principal_micro: principalMicro,
+          min_profit_micro: Math.round(minProfit * 1_000_000),
+          strategy_id: strategyId,
+          flash_open_tx_id: finalTxId,
+          idempotency_key: idempotencyKey,
+        }),
+      });
+      const recJson = await recResp.json().catch(() => ({}));
+      if (!recResp.ok) {
+        throw new Error(recJson?.error || 'Flash open finalized, but failed to record session');
+      }
+      const session = recJson?.session;
+      if (session?.id) setFlashSessionId(session.id);
+      setFlashOpenAttempted(false);
+      setFlashTxId(finalTxId);
+      setFlashRepayInput(((totalMicro) / 1_000_000).toFixed(6));
+      setFlashStatusMessage('Flash session opened. Backend watcher will fund from vault shortly.');
+      fetchTransactionHistory();
+      fetchFlashSessions();
+      try {
+        await refreshPoolState(true);
+      } catch {
+        setFlashStatusMessage((s) => s + ' (Refresh pool manually.)');
+      }
+    } catch (e: unknown) {
+      setFlashStatusMessage(getErrorMessage(e));
+    } finally {
+      setFlashLoading(false);
+    }
+  };
+
+  const handleFlashSettle = async () => {
+    if (!connected || !publicKey || !executeTransaction || !requestRecords) {
+      setFlashStatusMessage('Please connect your wallet.');
+      return;
+    }
+    const repay = Number(flashRepayInput);
+    if (!Number.isFinite(repay) || repay <= 0) {
+      setFlashStatusMessage('Enter valid repay amount (> 0).');
+      return;
+    }
+    const strategyId = (flashStrategyIdInput || '').trim();
+    if (!/^\d+field$/.test(strategyId)) {
+      setFlashStatusMessage("Strategy id must be Leo field like '1field'.");
+      return;
+    }
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
+    let sessionsSnapshot = flashSessions;
+    if (backendUrl && publicKey?.trim()) {
+      try {
+        const resp = await fetch(
+          `${backendUrl.replace(/\/$/, '')}/flash/sessions?wallet=${encodeURIComponent(publicKey.trim())}&limit=100`,
+        );
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok && Array.isArray(data?.sessions)) sessionsSnapshot = data.sessions;
+      } catch {
+        /* keep flashSessions */
+      }
+    }
+    const explicitSession = flashSessionId?.trim();
+    const rowForAsset = explicitSession
+      ? sessionsSnapshot.find((s) => s.id === explicitSession)
+      : [...sessionsSnapshot]
+          .filter((s) => ['funded', 'settle_pending'].includes(String(s.status || '').toLowerCase()))
+          .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+    const aid = rowForAsset?.asset_id;
+    const settleAsset: FlashLendingAssetId =
+      aid === '0field' || aid === '1field' || aid === '2field' ? aid : flashSettleAsset;
+    const repayMicro = Math.round(repay * 1_000_000);
+    const principalMicro = Number(rowForAsset?.principal_micro ?? 0);
+    if (Number.isFinite(principalMicro) && principalMicro > 0) {
+      const principalMicroRounded = Math.round(principalMicro);
+      const feeMicro = aleoFlashFeeMicro(principalMicroRounded);
+      const minRequiredMicro = principalMicroRounded + feeMicro;
+      if (repayMicro < minRequiredMicro) {
+        const settleUnit = settleAsset === '0field' ? 'ALEO' : settleAsset === '1field' ? 'USDCx' : 'USAD';
+        setFlashStatusMessage(
+          `Repay amount is too low. Minimum needed is ${(minRequiredMicro / 1_000_000).toFixed(6)} ${settleUnit} (principal + fee).`,
+        );
+        return;
+      }
+    }
+    try {
+      setFlashTxModalKind('settle');
+      setFlashTxModalOpen(true);
+      setFlashLoading(true);
+      setFlashStatusMessage('Submitting flash settle…');
+      setFlashTxId(null);
+      let tx: string;
+      if (settleAsset === '0field') {
+        tx = await lendingFlashSettleWithCredits(
+          executeTransaction,
+          repay,
+          strategyId,
+          publicKey,
+          requestRecords,
+          decrypt,
+        );
+      } else if (settleAsset === '1field') {
+        tx = await lendingFlashSettleWithUsdcx(
+          executeTransaction,
+          repay,
+          strategyId,
+          publicKey,
+          requestRecords,
+          decrypt,
+        );
+      } else {
+        tx = await lendingFlashSettleWithUsad(
+          executeTransaction,
+          repay,
+          strategyId,
+          publicKey,
+          requestRecords,
+          decrypt,
+        );
+      }
+      if (tx === '__CANCELLED__') {
+        setFlashStatusMessage('Transaction cancelled by user.');
+        setFlashLoading(false);
+        return;
+      }
+      const finalTxId = await waitForPoolTxFinalization(tx, 'flash_settle');
+      setFlashTxId(finalTxId);
+      let sessionsForResolve = sessionsSnapshot;
+      if (backendUrl && publicKey?.trim()) {
+        try {
+          const resp = await fetch(
+            `${backendUrl.replace(/\/$/, '')}/flash/sessions?wallet=${encodeURIComponent(publicKey.trim())}&limit=100`,
+          );
+          const data = await resp.json().catch(() => ({}));
+          if (resp.ok && Array.isArray(data?.sessions)) sessionsForResolve = data.sessions;
+        } catch {
+          /* use snapshot */
         }
       }
-      if (txFailed) {
-        setFlashLoading(false);
-        return;
+      const sessionIdForSettle = (() => {
+        const explicit = flashSessionId?.trim();
+        if (explicit) return explicit;
+        const candidates = sessionsForResolve.filter((s) =>
+          ['funded', 'settle_pending'].includes(String(s.status || '').toLowerCase()),
+        );
+        if (!candidates.length) return null;
+        return [...candidates].sort(
+          (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+        )[0]?.id ?? null;
+      })();
+      const readFlashBackendError = async (r: Response) => {
+        try {
+          const j = await r.json();
+          return typeof j?.error === 'string' ? j.error : r.statusText || 'Request failed';
+        } catch {
+          return r.statusText || 'Request failed';
+        }
+      };
+      const backendFlashWarnings: string[] = [];
+      if (backendUrl && sessionIdForSettle) {
+        try {
+          const r1 = await fetch(`${backendUrl}/flash/mark-settle-pending`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionIdForSettle, flash_settle_tx_id: finalTxId }),
+          });
+          if (!r1.ok) backendFlashWarnings.push(`mark-settle-pending: ${await readFlashBackendError(r1)}`);
+        } catch (e) {
+          backendFlashWarnings.push(`mark-settle-pending: ${getErrorMessage(e)}`);
+        }
+        try {
+          const r2 = await fetch(`${backendUrl}/flash/complete-session`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              session_id: sessionIdForSettle,
+              flash_settle_tx_id: finalTxId,
+              actual_repay_micro: Math.round(repay * 1_000_000),
+            }),
+          });
+          if (!r2.ok) backendFlashWarnings.push(`complete-session: ${await readFlashBackendError(r2)}`);
+        } catch (e) {
+          backendFlashWarnings.push(`complete-session: ${getErrorMessage(e)}`);
+        }
+      } else if (!backendUrl) {
+        backendFlashWarnings.push('NEXT_PUBLIC_BACKEND_URL not set — flash_sessions not updated.');
+      } else if (!sessionIdForSettle) {
+        backendFlashWarnings.push(
+          'No funded flash session in memory — refresh Flash Loan History after vault funding, then settle again to sync status.',
+        );
       }
-      if (!finalized) {
-        setFlashStatusMessage('Transaction not finalized in time. Check the explorer.');
-        setFlashLoading(false);
-        return;
+      /* Flash: open/fund/settle state lives in flash_sessions only (not transaction_history). */
+      fetchFlashSessions();
+      let settleMsg = 'Flash settle finalized successfully.';
+      if (backendFlashWarnings.length) {
+        settleMsg += ` ${backendFlashWarnings.join(' ')}`;
       }
-      await saveTransactionToSupabase(
-        publicKey,
-        finalTxId,
-        'flash_loan',
-        'aleo',
-        principal,
-        LENDING_POOL_PROGRAM_ID,
-        null,
-      ).catch(() => { });
-      fetchTransactionHistory();
-      setFlashAmountInput('');
-      setFlashStatusMessage(
-        'Flash loan finalized! Vault will send principal in 1–5 min — check Transaction History.',
-      );
+      setFlashStatusMessage(settleMsg);
       try {
         await refreshPoolState(true);
       } catch {
@@ -2347,15 +2650,12 @@ const DashboardPage: NextPageWithLayout = () => {
   useEffect(() => {
     let cancelled = false;
     const run = async () => {
-      const repay = Number(liqRepayAmountInput);
       if (!publicKey?.trim().startsWith('aleo1') || !requestRecords) {
         setLiqPreview({ loading: false, ok: false, reason: 'Connect wallet to preview self-liquidation.' });
         return;
       }
-      if (!Number.isFinite(repay) || repay <= 0) {
-        setLiqPreview({ loading: false, ok: false, reason: 'Enter repay amount > 0.' });
-        return;
-      }
+      const repayRaw = Number(liqRepayAmountInput);
+      const repay = Number.isFinite(repayRaw) && repayRaw > 0 ? repayRaw : 0;
       setLiqPreview((p) => ({ ...p, loading: true }));
       const scaled = await parseLatestLendingPositionScaled(requestRecords, LENDING_POOL_PROGRAM_ID, decrypt);
       const preview = await getLiquidationPreviewAleo(
@@ -4325,69 +4625,413 @@ const DashboardPage: NextPageWithLayout = () => {
     const principalMicro = Math.max(0, Math.round((Number.isFinite(principal) ? principal : 0) * 1_000_000));
     const flashFeeMicroPreview = aleoFlashFeeMicro(principalMicro);
     const flashTotalPreview = (principalMicro + flashFeeMicroPreview) / 1_000_000;
+    const flashUnitLabel = flashAsset === '0field' ? 'ALEO' : flashAsset === '1field' ? 'USDCx' : 'USAD';
+    const flashSettleUnitLabel =
+      flashSettleAsset === '0field' ? 'ALEO' : flashSettleAsset === '1field' ? 'USDCx' : 'USAD';
+    const availHuman =
+      flashAvailLiquidityMicro != null ? (Number(flashAvailLiquidityMicro) / 1_000_000).toFixed(6) : null;
+    const minProfitNum = Number(flashMinProfitInput || '0');
+    const openPrincipalError =
+      !Number.isFinite(principal) || principal <= 0
+        ? 'Enter a principal amount greater than 0.'
+        : flashAvailLiquidityMicro != null && BigInt(principalMicro) > flashAvailLiquidityMicro
+          ? `Principal is higher than available liquidity (${(Number(flashAvailLiquidityMicro) / 1_000_000).toFixed(6)} ${flashUnitLabel}).`
+          : null;
+    const openMinProfitError =
+      !Number.isFinite(minProfitNum) || minProfitNum < 0 ? 'Min profit must be 0 or higher.' : null;
+    const activeSettleSession = flashSessionId
+      ? flashSessions.find((s) => s.id === flashSessionId)
+      : [...flashSessions]
+          .filter((s) => !FLASH_SESSION_TERMINAL_STATUSES.has(String(s.status || '').toLowerCase()))
+          .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+    const settleAid = String(activeSettleSession?.asset_id || flashSettleAsset);
+    const settleUnitLabel =
+      settleAid === '0field' ? 'ALEO' : settleAid === '1field' ? 'USDCx' : settleAid === '2field' ? 'USAD' : flashSettleUnitLabel;
+    const settleExpectedMicro = (() => {
+      if (!activeSettleSession) return null;
+      const explicit = Number(activeSettleSession.expected_repay_micro ?? 0);
+      if (Number.isFinite(explicit) && explicit > 0) return Math.round(explicit);
+      const p = Math.round(Number(activeSettleSession.principal_micro || 0));
+      const m = Math.round(Number(activeSettleSession.min_profit_micro || 0));
+      if (!Number.isFinite(p) || p <= 0) return null;
+      return p + aleoFlashFeeMicro(p) + (Number.isFinite(m) && m > 0 ? m : 0);
+    })();
+    const repayNum = Number(flashRepayInput || '0');
+    const repayMicro = Math.round((Number.isFinite(repayNum) ? repayNum : 0) * 1_000_000);
+    const settleRepayError =
+      !flashRepayInput.trim()
+        ? null
+        : !Number.isFinite(repayNum) || repayNum <= 0
+          ? 'Enter a repay amount greater than 0.'
+          : settleExpectedMicro != null && repayMicro < settleExpectedMicro
+            ? `Repay amount is below expected minimum (${(settleExpectedMicro / 1_000_000).toFixed(6)} ${settleUnitLabel}).`
+            : null;
     return (
-      <div className="max-w-[1200px] mx-auto w-full px-4 sm:px-6 pt-4 pb-16">
-        <div className="mb-6">
-          <h1 className="text-3xl sm:text-4xl font-bold text-white">Flash</h1>
-          <p className="text-slate-400 mt-2">ALEO flash tooling and fee preview.</p>
+      <div className="max-w-[1440px] mx-auto w-full px-4 sm:px-8 pt-8 pb-20">
+        <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-gradient-to-br from-[#0a1324] via-[#0b1220] to-[#121a32] p-5 sm:p-8 mb-6">
+          <div className="pointer-events-none absolute -top-24 -right-20 h-72 w-72 rounded-full bg-cyan-500/20 blur-3xl" />
+          <div className="pointer-events-none absolute -bottom-24 -left-20 h-72 w-72 rounded-full bg-indigo-500/20 blur-3xl" />
+          <div className="relative">
+            <p className="text-[11px] uppercase tracking-[0.2em] text-cyan-300/80 mb-2">Liquidity Strategy</p>
+            <h1 className="text-3xl sm:text-5xl font-semibold text-white leading-tight">Flash Loan</h1>
+            <div className="mt-3 w-full space-y-1.5 text-sm text-slate-300/90">
+              <p>Take a short-term loan, run your action, and pay it back in the same flow.</p>
+              <p className="text-slate-400">- Pick an asset and open a flash loan session.</p>
+              <p className="text-slate-400">- You can borrow only up to the amount currently available in the pool.</p>
+              <p className="text-slate-400">- Your wallet gets funded from the vault with that same asset.</p>
+              <p className="text-slate-400">- Repay the amount plus fee (and your chosen minimum profit target).</p>
+              <p className="text-slate-400">- If you do not settle the current session successfully, it stays active and you cannot open the next flash loan session.</p>
+            </div>
+          </div>
         </div>
-        <div className="grid grid-cols-1 gap-6">
-          <div className="rounded-2xl p-5 border border-white/10 bg-slate-900/60">
-            <h2 className="text-lg font-semibold text-white mb-3">Flash Loan (ALEO)</h2>
-            <p className="text-xs text-slate-400 mb-4">
-              <span className="text-amber-300/90">Not available in xyra_lending_v9</span> — the deployed pool has no flash transition.
-              Fee model reference: {ALEO_FLASH_PREMIUM_BPS} bps (reserved for a future program).
-            </p>
-            <div className="space-y-3">
-              <input
-                type="number"
-                min={0}
-                step="any"
-                value={flashAmountInput}
-                onChange={(e) => setFlashAmountInput(e.target.value)}
-                placeholder="Principal (ALEO)"
-                className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
-              />
-              <div className="text-xs text-slate-400">
-                Fee: {(flashFeeMicroPreview / 1_000_000).toFixed(6)} ALEO | Total required: {flashTotalPreview.toFixed(6)} ALEO
-              </div>
-              <button
-                type="button"
-                disabled={flashLoading}
-                onClick={handleFlashLoan}
-                className="w-full rounded-xl bg-cyan-500/20 border border-cyan-400/30 px-3 py-2 text-cyan-300 disabled:opacity-50"
-              >
-                {flashLoading ? 'Submitting…' : 'Execute Flash Loan'}
-              </button>
-              {flashStatusMessage && <div className="text-sm text-slate-300">{flashStatusMessage}</div>}
-              {flashTxId && (
-                <a
-                  href={getProvableExplorerTxUrl(flashTxId)}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-cyan-400 text-xs underline"
+        {!connected && (connecting || !allowShowConnectCTA) && (
+          <div className="rounded-[32px] p-20 flex flex-col items-center justify-center text-center mb-6 border border-white/10 bg-slate-900/60">
+            <span className="loading loading-spinner loading-lg text-cyan-400 mb-4" />
+            <p className="text-sm text-slate-400">Loading wallet…</p>
+          </div>
+        )}
+
+        {!connected && !connecting && allowShowConnectCTA && (
+          <div className="rounded-[32px] p-20 flex flex-col items-center justify-center text-center mb-6 border border-white/10 bg-slate-900/60 relative overflow-hidden">
+            <div
+              className="absolute inset-0 pointer-events-none"
+              style={{ background: 'radial-gradient(circle at center, rgba(6,182,212,0.05) 0%, transparent 70%)' }}
+            />
+            <div className="relative z-10 flex w-full max-w-lg flex-col items-center">
+              <h2 className="text-2xl font-bold mb-3 text-white">Please, connect your wallet</h2>
+              <p className="text-slate-400 max-w-md mx-auto mb-10">
+                Connect your Aleo wallet to open and settle flash loan sessions.
+              </p>
+              <div className="w-full flex justify-center">
+                <WalletModalButton
+                  disabled={connecting}
+                  className="!m-0 !min-h-0 !h-auto !rounded-xl !border !border-white/10 !bg-[#0B1221] !px-6 !py-2 !text-sm !font-semibold !text-white !shadow-none hover:!border-white/20 hover:!bg-[#111827] disabled:!cursor-wait disabled:!opacity-60"
+                  style={{ fontFamily: "'Space Grotesk', sans-serif" }}
                 >
-                  View Flash Tx
-                </a>
-              )}
+                  {connecting ? 'Connecting...' : 'Connect'}
+                </WalletModalButton>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {connected && !dashboardDataReady && (
+          <div className="space-y-6 animate-pulse mb-6">
+            <div className="rounded-2xl border border-white/10 bg-slate-900/60 p-6">
+              <div className="h-4 w-40 rounded mb-4 bg-white/10" />
+              <div className="h-3 w-full rounded mb-2 bg-white/10" />
+              <div className="h-3 w-5/6 rounded bg-white/10" />
+            </div>
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+              <div className="rounded-2xl border border-white/10 bg-slate-900/60 p-6">
+                <div className="h-4 w-36 rounded mb-4 bg-white/10" />
+                <div className="space-y-3">
+                  <div className="h-10 rounded-xl bg-white/10" />
+                  <div className="h-10 rounded-xl bg-white/10" />
+                  <div className="h-10 rounded-xl bg-white/10" />
+                </div>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-slate-900/60 p-6">
+                <div className="h-4 w-36 rounded mb-4 bg-white/10" />
+                <div className="space-y-3">
+                  <div className="h-10 rounded-xl bg-white/10" />
+                  <div className="h-10 rounded-xl bg-white/10" />
+                  <div className="h-10 rounded-xl bg-white/10" />
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {connected && dashboardDataReady && (
+        <div className="grid grid-cols-1 gap-6">
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+            <div className="rounded-2xl p-5 border border-white/10 bg-slate-900/60">
+              <h2 className="text-lg font-semibold text-white mb-3">Open Flash Session</h2>
+              <p className="text-xs text-slate-400 mb-4">
+                Reserve pool liquidity for a selected asset and start your flash session. Fee model:{' '}
+                {ALEO_FLASH_PREMIUM_BPS} bps of principal.
+              </p>
+              <div className="space-y-3">
+                <label className="block text-xs text-slate-500 uppercase tracking-wide">Asset</label>
+                <select
+                  value={flashAsset}
+                  onChange={(e) => setFlashAsset(e.target.value as FlashLendingAssetId)}
+                  disabled={flashLoading}
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                >
+                  <option value="0field">ALEO (credits)</option>
+                  <option value="1field">USDCx</option>
+                  <option value="2field">USAD</option>
+                </select>
+                {availHuman != null && (
+                  <div className="text-xs text-slate-400">
+                    On-chain available liquidity: <span className="text-slate-200 font-mono">{availHuman}</span>{' '}
+                    {flashUnitLabel}
+                  </div>
+                )}
+                <input
+                  type="text"
+                  value={flashStrategyIdInput}
+                  onChange={(e) => setFlashStrategyIdInput(e.target.value)}
+                  placeholder="Strategy id (e.g. 1field)"
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                />
+                <input
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={flashAmountInput}
+                  onChange={(e) => setFlashAmountInput(e.target.value)}
+                  placeholder={`Principal (${flashUnitLabel})`}
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                />
+                {flashOpenAttempted && openPrincipalError && <p className="text-xs text-rose-300">{openPrincipalError}</p>}
+                <p className="text-[11px] text-slate-500">
+                  Principal = the amount you want to borrow for this flash loan.
+                </p>
+                <input
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={flashMinProfitInput}
+                  onChange={(e) => setFlashMinProfitInput(e.target.value)}
+                  placeholder={`Min profit (${flashUnitLabel})`}
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                />
+                {flashOpenAttempted && openMinProfitError && <p className="text-xs text-rose-300">{openMinProfitError}</p>}
+                <p className="text-[11px] text-slate-500">
+                  Min profit = the minimum extra amount you want to keep after repaying loan + fee.
+                </p>
+                <div className="text-xs text-slate-400">
+                  Fee: {(flashFeeMicroPreview / 1_000_000).toFixed(6)} {flashUnitLabel} | Min repay hint:{' '}
+                  {flashTotalPreview.toFixed(6)} {flashUnitLabel} (principal + fee; plus min profit on-chain)
+                </div>
+                <button
+                  type="button"
+                  disabled={flashLoading}
+                  onClick={handleFlashLoan}
+                  className="w-full rounded-xl bg-cyan-500/20 border border-cyan-400/30 px-3 py-2 text-cyan-300 disabled:opacity-50"
+                >
+                  {flashLoading ? 'Submitting…' : 'Open Flash Session'}
+                </button>
+              </div>
+            </div>
+
+            <div className="rounded-2xl p-5 border border-white/10 bg-slate-900/60">
+              <h2 className="text-lg font-semibold text-white mb-3">Settle Flash Session</h2>
+              <p className="text-xs text-slate-400 mb-4">
+                Repay and finalize an active funded session. If a funded session is found, its asset is used automatically.
+              </p>
+              <div className="space-y-3">
+                <label className="block text-xs text-slate-500 uppercase tracking-wide">Settle Asset (fallback)</label>
+                <select
+                  value={flashSettleAsset}
+                  onChange={(e) => setFlashSettleAsset(e.target.value as FlashLendingAssetId)}
+                  disabled={flashLoading}
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                >
+                  <option value="0field">ALEO (credits)</option>
+                  <option value="1field">USDCx</option>
+                  <option value="2field">USAD</option>
+                </select>
+                <input
+                  type="text"
+                  value={flashStrategyIdInput}
+                  onChange={(e) => setFlashStrategyIdInput(e.target.value)}
+                  placeholder="Strategy id (e.g. 1field)"
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                />
+                <input
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={flashRepayInput}
+                  onChange={(e) => setFlashRepayInput(e.target.value)}
+                  placeholder={`Repay Amount (e.g. 1 = 1 ${flashSettleUnitLabel})`}
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                />
+                {settleRepayError && <p className="text-xs text-rose-300">{settleRepayError}</p>}
+                <p className="text-[11px] text-slate-500">
+                  Repay amount = how much you are paying back to close this flash session.
+                </p>
+                <p className="text-[11px] text-slate-500">
+                  If a live session is found, we use that session&apos;s asset automatically. Otherwise, we use the settle asset you selected.
+                </p>
+                <button
+                  type="button"
+                  disabled={flashLoading}
+                  onClick={handleFlashSettle}
+                  className="w-full rounded-xl bg-emerald-500/20 border border-emerald-400/30 px-3 py-2 text-emerald-300 disabled:opacity-50"
+                >
+                  {flashLoading ? 'Submitting…' : 'Submit flash settle'}
+                </button>
+              </div>
             </div>
           </div>
 
-          <div className="rounded-2xl p-5 border border-indigo-400/20 bg-indigo-500/[0.06]">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <h2 className="text-lg font-semibold text-white">Need self-liquidation?</h2>
-                <p className="text-xs text-slate-300 mt-1">Moved to a dedicated page with cleaner controls.</p>
+          <div className="rounded-2xl p-5 border border-white/10 bg-slate-900/60">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-3">
+              <h2 className="text-lg font-semibold text-white">Flash Loan History</h2>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="inline-flex rounded-lg border border-white/10 bg-black/20 p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setFlashHistoryFilter('all')}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
+                      flashHistoryFilter === 'all'
+                        ? 'bg-white/15 text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFlashHistoryFilter('active')}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
+                      flashHistoryFilter === 'active'
+                        ? 'bg-white/15 text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Active only
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void fetchFlashSessions()}
+                  disabled={flashSessionsLoading || !address}
+                  className="px-3 py-1.5 rounded-lg text-xs font-mono text-slate-300 border border-white/10 bg-white/5 disabled:opacity-50"
+                >
+                  {flashSessionsLoading ? 'Loading...' : 'REFRESH'}
+                </button>
               </div>
-              <Link
-                href="/liquidation"
-                className="rounded-xl border border-indigo-300/35 bg-indigo-500/20 px-4 py-2 text-sm font-medium text-indigo-200 hover:bg-indigo-500/30 transition-colors inline-flex items-center justify-center"
-              >
-                Open Liquidation
-              </Link>
             </div>
+            {flashSessionsLoading ? (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[980px] text-left">
+                  <thead>
+                    <tr className="text-xs uppercase tracking-wider text-slate-400 border-b border-white/10">
+                      <th className="py-2 pr-4">Status</th>
+                      <th className="py-2 pr-4">Asset</th>
+                      <th className="py-2 pr-4">Principal</th>
+                      <th className="py-2 pr-4">Min Profit</th>
+                      <th className="py-2 pr-4">Strategy</th>
+                      <th className="py-2 pr-4">Open</th>
+                      <th className="py-2 pr-4">Fund</th>
+                      <th className="py-2 pr-4">Settle</th>
+                      <th className="py-2 pr-4">Created</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[0, 1, 2].map((i) => (
+                      <tr key={i} className="border-b border-white/5">
+                        <td className="py-3 pr-4"><div className="h-6 w-24 rounded bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-7 w-24 rounded-full bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-4 w-24 rounded bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-4 w-24 rounded bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-4 w-24 rounded bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-6 w-16 rounded-lg bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-6 w-16 rounded-lg bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-6 w-16 rounded-lg bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-4 w-40 rounded bg-white/10 animate-pulse" /></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : flashSessionsError ? (
+              <div className="text-sm text-amber-300">{flashSessionsError}</div>
+            ) : flashSessions.length === 0 ? (
+              <div className="text-sm text-slate-500">No flash sessions found.</div>
+            ) : displayedFlashSessions.length === 0 ? (
+              <div className="text-sm text-slate-500">
+                No active flash sessions. Switch to &quot;All&quot; to see completed or expired sessions.
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[980px] text-left">
+                  <thead>
+                    <tr className="text-xs uppercase tracking-wider text-slate-400 border-b border-white/10">
+                      <th className="py-2 pr-4">Status</th>
+                      <th className="py-2 pr-4">Asset</th>
+                      <th className="py-2 pr-4">Principal</th>
+                      <th className="py-2 pr-4">Min Profit</th>
+                      <th className="py-2 pr-4">Strategy</th>
+                      <th className="py-2 pr-4">Open</th>
+                      <th className="py-2 pr-4">Fund</th>
+                      <th className="py-2 pr-4">Settle</th>
+                      <th className="py-2 pr-4">Created</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {displayedFlashSessions.map((s) => (
+                      <tr key={s.id} className="border-b border-white/5 text-sm text-slate-300">
+                        <td className="py-3 pr-4">
+                          <StatusChip {...flashSessionStatusChipProps(s.status)} />
+                        </td>
+                        <td className="py-3 pr-4">
+                          {s.asset_id === '0field' ? (
+                            <AssetBadge asset="ALEO" compact />
+                          ) : s.asset_id === '1field' ? (
+                            <AssetBadge asset="USDCx" compact />
+                          ) : s.asset_id === '2field' ? (
+                            <AssetBadge asset="USAD" compact />
+                          ) : (
+                            <span>{s.asset_id}</span>
+                          )}
+                        </td>
+                        <td className="py-3 pr-4 font-mono">{(Number(s.principal_micro || 0) / 1_000_000).toFixed(6)}</td>
+                        <td className="py-3 pr-4 font-mono">{(Number(s.min_profit_micro || 0) / 1_000_000).toFixed(6)}</td>
+                        <td className="py-3 pr-4 font-mono">{s.strategy_id_field}</td>
+                        <td className="py-3 pr-4">
+                          {s.flash_open_tx_id ? (
+                            <a
+                              href={getProvableExplorerTxUrl(s.flash_open_tx_id)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/[0.07] px-2 py-1 text-[11px] font-semibold tracking-wide text-cyan-300 hover:bg-cyan-500/15 transition-colors"
+                            >
+                              Open Tx
+                            </a>
+                          ) : '--'}
+                        </td>
+                        <td className="py-3 pr-4">
+                          {s.vault_fund_tx_id ? (
+                            <a
+                              href={getProvableExplorerTxUrl(s.vault_fund_tx_id)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/[0.07] px-2 py-1 text-[11px] font-semibold tracking-wide text-emerald-300 hover:bg-emerald-500/15 transition-colors"
+                            >
+                              Fund Tx
+                            </a>
+                          ) : '--'}
+                        </td>
+                        <td className="py-3 pr-4">
+                          {s.flash_settle_tx_id ? (
+                            <a
+                              href={getProvableExplorerTxUrl(s.flash_settle_tx_id)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-500/40 bg-indigo-500/[0.07] px-2 py-1 text-[11px] font-semibold tracking-wide text-indigo-300 hover:bg-indigo-500/15 transition-colors"
+                            >
+                              Settle Tx
+                            </a>
+                          ) : '--'}
+                        </td>
+                        <td className="py-3 pr-4">{new Date(s.created_at).toLocaleString()}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
+
         </div>
+        )}
         {SHOW_SPRINT2_MIGRATION_UI && (
           <div className="mt-8 rounded-2xl p-5 border border-violet-500/25 bg-slate-900/60">
             <h2 className="text-lg font-semibold text-white mb-1">Sprint 2 — Private record migration (skeleton)</h2>
@@ -4432,6 +5076,78 @@ const DashboardPage: NextPageWithLayout = () => {
                 View migration tx
               </a>
             )}
+          </div>
+        )}
+
+        {flashTxModalOpen && (
+          <div className="fixed inset-0 z-[130] flex items-center justify-center p-4">
+            <div
+              className="absolute inset-0"
+              style={{ backgroundColor: 'rgba(0,0,0,0.7)' }}
+              onClick={() => {
+                if (!flashLoading) setFlashTxModalOpen(false);
+              }}
+            />
+            <div
+              className="relative rounded-[24px] p-8 w-full max-w-md"
+              style={{
+                background: 'linear-gradient(145deg, rgba(15,23,42,0.4) 0%, rgba(3,7,18,0.6) 100%)',
+                backdropFilter: 'blur(16px)',
+                WebkitBackdropFilter: 'blur(16px)',
+                border: '1px solid rgba(255,255,255,0.05)',
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              {!flashLoading && (
+                <button
+                  type="button"
+                  onClick={() => setFlashTxModalOpen(false)}
+                  className="absolute top-5 right-5 w-8 h-8 rounded-lg flex items-center justify-center hover:bg-white/10 transition-colors text-slate-400 text-lg"
+                  aria-label="Close flash transaction status"
+                >
+                  ×
+                </button>
+              )}
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-xl font-bold text-white">
+                  {flashTxModalKind === 'open' ? 'Open Flash Session' : 'Settle Flash Session'}
+                </h2>
+              </div>
+              <div className="space-y-4">
+                {flashLoading ? (
+                  <div className="flex flex-col items-center justify-center py-8 gap-3">
+                    <span className="loading loading-spinner loading-lg text-cyan-400" />
+                    <p className="text-sm text-slate-400">
+                      {flashStatusMessage || 'Processing…'}
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    {flashStatusMessage && <div className="text-sm text-slate-300">{flashStatusMessage}</div>}
+                    {flashTxId && (
+                      <a
+                        href={getProvableExplorerTxUrl(flashTxId)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-cyan-400 text-sm underline block"
+                      >
+                        View Flash Tx
+                      </a>
+                    )}
+                    {flashVaultTxId && (
+                      <a
+                        href={getProvableExplorerTxUrl(flashVaultTxId)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-emerald-400 text-sm underline block mt-1"
+                      >
+                        View Vault Funding Tx
+                      </a>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
           </div>
         )}
       </div>
@@ -5322,60 +6038,6 @@ const DashboardPage: NextPageWithLayout = () => {
         {/* Connected — full dashboard (portfolio + positions) */}
         {connected && dashboardDataReady && !needsDarkPoolPosition && (
           <>
-            {isAdminWallet && (
-              <section className="mb-8">
-                <div className="rounded-2xl p-5" style={dashGlass}>
-                  <div className="flex items-center justify-between gap-4 mb-4">
-                    <div>
-                      <h3 className="text-lg font-semibold text-white">Admin Controls</h3>
-                      <p className="text-xs text-slate-400 mt-1 font-mono">Visible only for configured admin wallet</p>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-[1fr_1fr_auto] gap-3">
-                    <select
-                      value={adminAsset}
-                      onChange={(e) => setAdminAsset(e.target.value as '0field' | '1field' | '2field')}
-                      className="rounded-xl px-3 py-2 bg-transparent text-slate-200 border border-white/10"
-                    >
-                      <option value="0field">ALEO (0field)</option>
-                      <option value="1field">USDCx (1field)</option>
-                      <option value="2field">USAD (2field)</option>
-                    </select>
-                    <input
-                      type="number"
-                      step="any"
-                      min="0"
-                      value={adminPriceInput}
-                      onChange={(e) => setAdminPriceInput(e.target.value)}
-                      placeholder="Price in USD (e.g. 0.044563)"
-                      className="rounded-xl px-3 py-2 bg-transparent text-slate-100 border border-white/10"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => void handleAdminSetAssetPrice()}
-                      disabled={adminSubmitting}
-                      className="px-4 py-2 rounded-xl font-semibold disabled:opacity-50"
-                      style={{ background: 'linear-gradient(to right, #22d3ee, #6366f1)', color: '#030712' }}
-                    >
-                      {adminSubmitting ? 'Submitting…' : 'Set Asset Price'}
-                    </button>
-                  </div>
-                  <p className="text-xs text-slate-500 mt-2">On-chain input uses `price * 1e6` (`u64`).</p>
-                  {adminStatus && <p className="text-sm text-slate-300 mt-3">{adminStatus}</p>}
-                  {adminTxId && isExplorerHash(adminTxId) && (
-                    <a
-                      href={getProvableExplorerTxUrl(adminTxId)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-block text-cyan-400 text-sm mt-2 hover:text-cyan-300"
-                    >
-                      View admin tx in explorer ↗
-                    </a>
-                  )}
-                </div>
-              </section>
-            )}
-
             {healthFactor != null && healthFactor < 1 && (
               <div
                 className="rounded-2xl p-5 mb-8 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4"

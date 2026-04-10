@@ -32,6 +32,14 @@ const Navbar = () => {
   const router = useRouter();
   const { setVisible } = useWalletModal();
   const { address, connected, connecting, disconnect } = useWallet();
+  const configuredAdminAddress = (
+    process.env.NEXT_PUBLIC_LENDING_ADMIN_ADDRESS ||
+    process.env.NEXT_PUBLIC_ADMIN_ADDRESS ||
+    'aleo1rhgdu77hgyqd3xjj8ucu3jj9r2krwz6mnzyd80gncr5fxcwlh5rsvzp9px'
+  )
+    .trim()
+    .toLowerCase();
+  const isAdminWallet = !!address && address.trim().toLowerCase() === configuredAdminAddress;
 
   const isLandingPage = router.pathname === '/';
   const isDashboardPage = router.pathname === '/dashboard';
@@ -50,17 +58,19 @@ const Navbar = () => {
     setIsDropdownOpen(false);
   }, [router.pathname]);
 
-  const navItems = [
+  const baseNavItems = [
     { name: 'DASHBOARD', id: 'dashboard', href: '/dashboard' },
     { name: 'LIQUIDATION', id: 'liquidation', href: '/liquidation' },
     {
-      name: 'FLASH',
+      name: 'FLASH LOAN',
       id: 'flash',
       href: '/flash',
     },
+    { name: 'ADMIN', id: 'admin', href: '/admin' },
     { name: 'MARKETS', id: 'markets', href: '/markets' },
     { name: 'DOCS', id: 'docs', href: '/docs' },
   ] as const;
+  const navItems = baseNavItems.filter((item) => item.id !== 'admin' || isAdminWallet);
 
   const dashboardViewParam = Array.isArray(router.query.view)
     ? router.query.view[0]

@@ -12,7 +12,7 @@ export default function FlashRedirectPage() {
   }, [router]);
   return (
     <div className="flex min-h-[40vh] items-center justify-center px-4 text-base-content/70">
-      Opening Flash...
+      Opening Flash Loan...
     </div>
   );
 }

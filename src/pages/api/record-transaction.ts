@@ -15,7 +15,6 @@ type Body = {
     | 'withdraw'
     | 'borrow'
     | 'repay'
-    | 'flash_loan'
     | 'open_position'
     | 'self_liquidate_payout';
   asset: 'aleo' | 'usdcx' | 'usad';
@@ -81,7 +80,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     'withdraw',
     'borrow',
     'repay',
-    'flash_loan',
     'open_position',
     'self_liquidate_payout',
   ];
