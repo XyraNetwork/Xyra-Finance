@@ -60,7 +60,7 @@ export function getPendingVaultTransactions(limit = 20) {
   const q = supabase
     .from('transaction_history')
     .select('wallet_address, tx_id, type, asset, amount, created_at')
-    .in('type', ['withdraw', 'borrow', 'flash_loan'])
+    .in('type', ['withdraw', 'borrow', 'self_liquidate_payout'])
     .is('vault_tx_id', null)
     .or('status.is.null,status.eq.vault_pending')
     .order('created_at', { ascending: true })
@@ -114,10 +114,122 @@ export function insertTransactionRecord(payload) {
     type: payload.type,
     asset: payload.asset,
     amount: payload.amount,
+    repay_amount: payload.repay_amount ?? null,
     program_id: payload.program_id ?? null,
     explorer_url: explorerUrl,
     vault_tx_id: null,
     vault_explorer_url: null,
   };
   return supabase.from('transaction_history').insert(row).select('id').single();
+}
+
+// -------------------------
+// Flash session persistence
+// -------------------------
+
+export function getFlashSessionById(id) {
+  if (!supabase) return Promise.resolve(null);
+  return supabase
+    .from('flash_sessions')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle()
+    .then(({ data, error }) => {
+      if (error) {
+        logSupabaseError('getFlashSessionById', error);
+        return null;
+      }
+      return data || null;
+    });
+}
+
+export function getFlashSessionByIdempotencyKey(idempotencyKey) {
+  if (!supabase) return Promise.resolve(null);
+  return supabase
+    .from('flash_sessions')
+    .select('*')
+    .eq('idempotency_key', idempotencyKey)
+    .maybeSingle()
+    .then(({ data, error }) => {
+      if (error) {
+        logSupabaseError('getFlashSessionByIdempotencyKey', error);
+        return null;
+      }
+      return data || null;
+    });
+}
+
+export function insertFlashSession(payload) {
+  if (!supabase) return Promise.resolve({ data: null, error: { message: 'Supabase not configured' } });
+  const row = {
+    status: payload.status || 'opened',
+    user_address: payload.user_address,
+    strategy_wallet: payload.strategy_wallet,
+    asset_id: payload.asset_id,
+    principal_micro: payload.principal_micro,
+    min_profit_micro: payload.min_profit_micro,
+    strategy_id_field: payload.strategy_id_field,
+    flash_open_tx_id: payload.flash_open_tx_id,
+    idempotency_key: payload.idempotency_key || null,
+    expires_at: payload.expires_at || null,
+    expected_repay_micro: payload.expected_repay_micro ?? null,
+  };
+  return supabase.from('flash_sessions').insert(row).select('*').single();
+}
+
+export function updateFlashSession(id, patch) {
+  if (!supabase) return Promise.resolve({ data: null, error: { message: 'Supabase not configured' } });
+  const next = { ...patch, updated_at: new Date().toISOString() };
+  return supabase.from('flash_sessions').update(next).eq('id', id).select('*').single();
+}
+
+export function listFlashSessionsByWallet(walletAddress, limit = 50) {
+  if (!supabase) return Promise.resolve([]);
+  return supabase
+    .from('flash_sessions')
+    .select('*')
+    .eq('user_address', walletAddress)
+    .order('created_at', { ascending: false })
+    .limit(limit)
+    .then(({ data, error }) => {
+      if (error) {
+        logSupabaseError('listFlashSessionsByWallet', error);
+        return [];
+      }
+      return Array.isArray(data) ? data : [];
+    });
+}
+
+export function getPendingFlashFundingSessions(limit = 20) {
+  if (!supabase) return Promise.resolve([]);
+  return supabase
+    .from('flash_sessions')
+    .select('*')
+    .in('status', ['opened', 'funding_pending'])
+    .order('created_at', { ascending: true })
+    .limit(limit)
+    .then(({ data, error }) => {
+      if (error) {
+        logSupabaseError('getPendingFlashFundingSessions', error);
+        return [];
+      }
+      return Array.isArray(data) ? data : [];
+    });
+}
+
+export function claimFlashSessionForFunding(id) {
+  if (!supabase) return Promise.resolve({ rowsUpdated: 0 });
+  return supabase
+    .from('flash_sessions')
+    .update({ status: 'funding_pending', updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .in('status', ['opened', 'funding_pending'])
+    .select('id')
+    .then(({ data, error }) => {
+      if (error) {
+        logSupabaseError('claimFlashSessionForFunding', error);
+        return { rowsUpdated: 0 };
+      }
+      return { rowsUpdated: Array.isArray(data) ? data.length : 0 };
+    });
 }

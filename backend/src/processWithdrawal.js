@@ -6,7 +6,6 @@ import {
   NetworkRecordProvider,
   AleoNetworkClient,
   BlockHeightSearch,
-  initializeWasm,
 } from '@provablehq/sdk';
 import fs from 'fs/promises';
 import { logTestnetStatus } from './checkTestnet.js';
@@ -22,9 +21,6 @@ if (!VAULT_ADDRESS || !VAULT_PRIVATE_KEY) {
   );
   process.exit(1);
 }
-
-// Initialize WASM once for all withdrawals
-const wasmReady = initializeWasm();
 
 export function parseCliArgs() {
   const [, , toAddress, amountStr] = process.argv;
@@ -44,7 +40,6 @@ export function parseCliArgs() {
 }
 
 export async function runWithdrawal(toAddress, amountCredits) {
-  await wasmReady;
 
   await logTestnetStatus();
 
@@ -254,7 +249,6 @@ async function findUsdcRecordsWithRetry(recordProvider, networkClient) {
  * Amount from request is u64 (human USDC, e.g. 1 = 1 USDC). We convert to 6 decimals for transfer (1 -> 1_000_000).
  */
 export async function runWithdrawalUsdc(toAddress, amountUsdcU64) {
-  await wasmReady;
   await logTestnetStatus();
 
   const amount = Number(amountUsdcU64);
@@ -304,7 +298,6 @@ export async function runWithdrawalUsdc(toAddress, amountUsdcU64) {
  * USDC borrow: vault sends USDCx to user (same as withdraw; amount in u64, convert to 6 decimals for transfer).
  */
 export async function runBorrowUsdc(toAddress, amountUsdcU64) {
-  await wasmReady;
   await logTestnetStatus();
 
   const amount = Number(amountUsdcU64);
@@ -355,7 +348,6 @@ export async function runBorrowUsdc(toAddress, amountUsdcU64) {
  * Amount from request is u64 human USAD; convert to 6-decimal base units for transfer (1 -> 1_000_000).
  */
 export async function runWithdrawalUsad(toAddress, amountUsadU64) {
-  await wasmReady;
   await logTestnetStatus();
 
   const amount = Number(amountUsadU64);
@@ -405,7 +397,6 @@ export async function runWithdrawalUsad(toAddress, amountUsadU64) {
  * USAD borrow: vault sends USAD to user via transfer_public_to_private.
  */
 export async function runBorrowUsad(toAddress, amountUsadU64) {
-  await wasmReady;
   await logTestnetStatus();
 
   const amount = Number(amountUsadU64);
@@ -451,7 +442,6 @@ export async function runBorrowUsad(toAddress, amountUsadU64) {
 }
 
 export async function runBorrow(toAddress, amountCredits) {
-  await wasmReady;
 
   await logTestnetStatus();
 

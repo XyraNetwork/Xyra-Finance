@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { useRouter } from 'next/router';
 import type { NextPageWithLayout } from '@/types';
 import Layout from '@/layouts/_layout';
@@ -38,7 +38,17 @@ import {
   lendingAccrueInterest,
   lendingAccrueInterestUsdc,
   lendingAccrueInterestUsad,
-  lendingFlashLoan,
+  lendingFlashOpen,
+  lendingFlashSettleWithCredits,
+  lendingFlashSettleWithUsdcx,
+  lendingFlashSettleWithUsad,
+  fetchAvailableLiquidityMicro,
+  type FlashLendingAssetId,
+  lendingMintPositionMigrationNote,
+  getPositionNoteSchemaFromChain,
+  POSITION_NOTE_SCHEMA_ON_CHAIN_V2,
+  getLiquidationPreviewAleo,
+  getSelfLiquidationUiLimits,
   aleoFlashFeeMicro,
   ALEO_FLASH_PREMIUM_BPS,
   debugAllRecords,
@@ -51,22 +61,74 @@ import {
   getPrivateCreditsBalance,
   getUsadLendingPoolState,
   getAssetPriceForProgram,
-  getCrossCollateralBorrowCapsFromChain,
-  getCrossCollateralWithdrawCapsFromChain,
+  getAggregatedCrossCollateralBorrowCapsFromWallet,
+  getAggregatedCrossCollateralWithdrawCapsFromWallet,
+  floorTokenMicroToDisplayDecimals,
+  parseLatestLendingPositionScaled,
+  lendingOpenLendingAccount,
+  lendingSelfLiquidateDebtCredits,
   createTestCredits,
   depositTestReal,
   logAleoTxExplorer,
   ALEO_TESTNET_TX_EXPLORER,
   type CrossCollateralChainCaps,
   type CrossCollateralWithdrawCaps,
+  type LendingPositionScaled,
+  type SelfLiquidationUiLimits,
 } from '@/components/aleo/rpc';
 import { frontendLogger } from '@/utils/logger';
 import { CURRENT_NETWORK } from '@/types';
 import { getSupabaseBrowserClient } from '@/utils/supabase/client';
+import {
+  summarizeLendingRecordsForMigration,
+  describeOnChainSchemaVersion,
+  type MigrationRecordSummary,
+} from '@/lib/migration/privateRecordMigration';
 
 // Frontend app environment: 'dev' or 'prod' (default to dev for non-production NODE_ENV)
 const APP_ENV = process.env.NEXT_PUBLIC_APP_ENV;
 const isDevAppEnv = APP_ENV ? APP_ENV === 'dev' : process.env.NODE_ENV !== 'production';
+/** Sprint 2: Flash tab panel for `mint_position_migration_note` + migration readout. */
+const SHOW_SPRINT2_MIGRATION_UI = process.env.NEXT_PUBLIC_SHOW_SPRINT2_MIGRATION_UI === 'true';
+
+/** Withdraw MAX in UI: floor to this many decimal places (same style as borrow/repay inputs). */
+const WITHDRAW_MAX_DISPLAY_DECIMALS = 2;
+
+const FLASH_SESSION_TERMINAL_STATUSES = new Set(['settled', 'expired', 'failed', 'cancelled']);
+
+function isFlashSessionStatusActive(status: string): boolean {
+  return !FLASH_SESSION_TERMINAL_STATUSES.has(String(status || '').toLowerCase());
+}
+
+function flashSessionStatusChipProps(status: string): {
+  label: string;
+  variant: 'neutral' | 'good' | 'warn' | 'danger' | 'info';
+} {
+  const s = String(status || '').toLowerCase();
+  switch (s) {
+    case 'opened':
+      return { label: 'Opened', variant: 'info' };
+    case 'funding_pending':
+      return { label: 'Funding pending', variant: 'warn' };
+    case 'funded':
+      return { label: 'Funded', variant: 'info' };
+    case 'settle_pending':
+      return { label: 'Settle pending', variant: 'warn' };
+    case 'settled':
+      return { label: 'Settled', variant: 'good' };
+    case 'expired':
+      return { label: 'Expired', variant: 'neutral' };
+    case 'failed':
+      return { label: 'Failed', variant: 'danger' };
+    default: {
+      const raw = String(status || '').trim();
+      const label = raw
+        ? raw.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+        : 'Unknown';
+      return { label, variant: 'neutral' };
+    }
+  }
+}
 
 /** Rich console output when a pool tx is rejected / failed / dropped (helps debug repay). */
 function logPoolTxRejected(
@@ -86,7 +148,9 @@ function logPoolTxRejected(
         ? [
           meta?.action === 'borrow'
             ? 'Validator rejected borrow: usually new_borrow_usd > cross-collateral headroom (integer rounding), wrong program id, or stale UI — try Max (chain) or a slightly smaller amount; confirm on-chain asset_price / LTV.'
-            : 'Validator rejected: for repay, amount > accrued debt or bad Merkle proofs; for borrow, portfolio assert failed or program mismatch.',
+            : meta?.action === 'withdraw'
+              ? 'Validator/wallet rejected withdraw: wrong `recordIndices` vs `requestRecords` order, stale oracle (`sup_idx`), or Shield spend auth (pass full record + fresh index). With **multiple** unspent `LendingPosition` notes, consolidate or use Max; cross-asset USDCx/USAD still needs treasury vault balance.'
+              : 'Validator rejected: for repay, amount > accrued debt or bad Merkle proofs; for borrow, portfolio assert failed or program mismatch.',
           'Verify NEXT_PUBLIC_* pool id matches deployment; run accrue interest; refresh balances.',
         ]
         : undefined,
@@ -99,8 +163,27 @@ function txHistoryTypeLabel(type: string): string {
   if (t === 'withdraw') return 'Withdraw Tx';
   if (t === 'borrow') return 'Borrow Tx';
   if (t === 'repay') return 'Repay Tx';
-  if (t === 'flash_loan') return 'Flash loan Tx';
-  return `${t ? t.charAt(0).toUpperCase() + t.slice(1) : 'Program'} Tx`;
+  if (t === 'flash_loan') return 'Flash Loan Tx';
+  if (t === 'open_position') return 'Open Position Tx';
+  if (t === 'self_liquidate_payout') return 'Self Liquidate Payout Tx';
+  const words = t
+    .split('_')
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+  return `${words || 'Program'} Tx`;
+}
+
+function txHistoryTypeText(type: string): string {
+  const t = String(type || '').toLowerCase();
+  if (t === 'flash_loan') return 'Flash Loan';
+  if (t === 'open_position') return 'Open Position';
+  if (t === 'self_liquidate_payout') return 'Self Liquidate Payout';
+  return t
+    .split('_')
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ') || 'Program';
 }
 
 function txHistoryAssetVaultLabel(asset: string): string {
@@ -148,10 +231,38 @@ function chainMicroOrWalletMicro(chainMicro: bigint | undefined, walletMicro: nu
 /** Temporary: extra micro-units in `amountWithinMax` for Borrow / Repay at Max (remove after testing). */
 const BORROW_REPAY_MAX_TEST_SLACK_MICRO = 50;
 
-/** Borrow Max: 2-decimal floor capped at `max` so the input never rounds above headroom. */
+/** Liquidation submit: tolerate float ↔ micro rounding vs on-chain preview. */
+const LIQ_SUBMIT_SLACK_MICRO = 50;
+
+/** Borrow / withdraw Max: 2-decimal floor so MAX and validation match `WITHDRAW_MAX_DISPLAY_DECIMALS` / chain micro floor. */
 function borrowMaxInputAmount(max: number): number {
   if (!Number.isFinite(max) || max <= 0) return 0;
   return Math.min(Math.floor(max * 100) / 100, max);
+}
+
+/**
+ * Floor to micro-units so `toFixed(2)` never rounds *above* the cap (e.g. 0.00735 → "0.01"), which
+ * would fail `amountWithinMax` and keep Repay / Submit disabled after MAX.
+ */
+function floorAmountMicro(maxHuman: number): number {
+  if (!Number.isFinite(maxHuman) || maxHuman <= 0) return 0;
+  return Math.floor(maxHuman * 1_000_000) / 1_000_000;
+}
+
+function floorAmountMicroInputString(maxHuman: number): string {
+  const n = floorAmountMicro(maxHuman);
+  if (n <= 0) return '0';
+  return n.toFixed(6).replace(/\.?0+$/, '') || '0';
+}
+
+/**
+ * USD label for debt/collateral stats. Values in (0, $0.01) are "dust" — `toFixed(2)` shows $0.00
+ * while Repay MAX in an asset can still be > 0; extra decimals avoid that mismatch.
+ */
+function formatUsdDebtLabel(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0.00';
+  if (n < 0.01) return n.toFixed(4);
+  return n.toFixed(2);
 }
 
 /** Cross-asset repay: value of `amountAsset` in USD must not exceed total portfolio debt (same rounding as amountWithinMax). */
@@ -183,7 +294,11 @@ function TxHistoryTrxPills({
   getProvableExplorerTxUrl: (id: string) => string;
 }) {
   const programHref = (explorerUrl && explorerUrl.trim()) || getProvableExplorerTxUrl(txId);
-  const needsVaultPayment = type === 'withdraw' || type === 'borrow' || type === 'flash_loan';
+  const needsVaultPayment =
+    type === 'withdraw' ||
+    type === 'borrow' ||
+    type === 'flash_loan' ||
+    type === 'self_liquidate_payout';
   const vaultAssetLabel = `${txHistoryAssetVaultLabel(asset)} Tx`;
   const firstLabel = txHistoryTypeLabel(type);
 
@@ -232,15 +347,16 @@ const DashboardPage: NextPageWithLayout = () => {
   const router = useRouter();
   const { view, setView } = useDashboardView();
 
-  // Sync URL to context when landing on /dashboard?view=markets or /dashboard?view=docs
+  // Sync URL to context when landing on /dashboard?view=...
   useEffect(() => {
     if (router.query.view === 'markets') {
       setView('markets');
     } else if (router.query.view === 'docs') {
       setView('docs');
+    } else if (router.query.view === 'liquidation') {
+      setView('liquidation');
     } else if (router.query.view === 'flash') {
-      // Flash is intentionally hidden right now.
-      setView('dashboard');
+      setView('flash');
     } else {
       setView('dashboard');
     }
@@ -389,15 +505,96 @@ const DashboardPage: NextPageWithLayout = () => {
   // Track if we've already triggered a one-time records permission request for this connection
   const [walletPermissionsInitialized, setWalletPermissionsInitialized] = useState<boolean>(false);
 
-  // Flash loan (ALEO pool only) — separate tab
+  // Flash loan (unified pool: per-asset `available_liquidity`) — separate tab
+  const [flashAsset, setFlashAsset] = useState<FlashLendingAssetId>('0field');
+  const [flashSettleAsset, setFlashSettleAsset] = useState<FlashLendingAssetId>('0field');
+  const [flashAvailLiquidityMicro, setFlashAvailLiquidityMicro] = useState<bigint | null>(null);
   const [flashAmountInput, setFlashAmountInput] = useState('');
+  const [flashMinProfitInput, setFlashMinProfitInput] = useState('0');
+  const [flashRepayInput, setFlashRepayInput] = useState('');
+  const [flashStrategyIdInput, setFlashStrategyIdInput] = useState('1field');
+  const [flashOpenAttempted, setFlashOpenAttempted] = useState(false);
   const [flashLoading, setFlashLoading] = useState(false);
   const [flashStatusMessage, setFlashStatusMessage] = useState('');
   const [flashTxId, setFlashTxId] = useState<string | null>(null);
   const [flashVaultTxId, setFlashVaultTxId] = useState<string | null>(null);
+  const [flashSessionId, setFlashSessionId] = useState<string | null>(null);
+  const [flashTxModalOpen, setFlashTxModalOpen] = useState(false);
+  const [flashTxModalKind, setFlashTxModalKind] = useState<'open' | 'settle'>('open');
+  type FlashSessionRow = {
+    id: string;
+    status: string;
+    asset_id: string;
+    principal_micro: number;
+    min_profit_micro: number;
+    strategy_id_field: string;
+    flash_open_tx_id: string | null;
+    vault_fund_tx_id: string | null;
+    flash_settle_tx_id: string | null;
+    expected_repay_micro?: number | null;
+    actual_repay_micro?: number | null;
+    profit_micro?: number | null;
+    created_at: string;
+  };
+  const [flashSessions, setFlashSessions] = useState<FlashSessionRow[]>([]);
+  const [flashSessionsLoading, setFlashSessionsLoading] = useState(false);
+  const [flashSessionsError, setFlashSessionsError] = useState<string | null>(null);
+  const [flashHistoryFilter, setFlashHistoryFilter] = useState<'all' | 'active'>('all');
+
+  const displayedFlashSessions = useMemo(() => {
+    if (flashHistoryFilter !== 'active') return flashSessions;
+    return flashSessions.filter((s) => isFlashSessionStatusActive(s.status));
+  }, [flashSessions, flashHistoryFilter]);
+
+  const prefillSettleFromSession = useCallback((s: FlashSessionRow) => {
+    const aid = String(s.asset_id || '');
+    if (aid === '0field' || aid === '1field' || aid === '2field') {
+      setFlashSettleAsset(aid as FlashLendingAssetId);
+    }
+    if (s.strategy_id_field) setFlashStrategyIdInput(String(s.strategy_id_field));
+    const expectedMicro =
+      Number(s.expected_repay_micro ?? 0) > 0
+        ? Number(s.expected_repay_micro)
+        : Math.round(Number(s.principal_micro || 0)) +
+          aleoFlashFeeMicro(Math.round(Number(s.principal_micro || 0))) +
+          Math.round(Number(s.min_profit_micro || 0));
+    if (expectedMicro > 0) setFlashRepayInput((expectedMicro / 1_000_000).toFixed(6));
+    if (s.id) setFlashSessionId(s.id);
+  }, []);
+  const [liqRepayAmountInput, setLiqRepayAmountInput] = useState('');
+  const [liqSeizeAsset, setLiqSeizeAsset] = useState<'0field' | '1field' | '2field'>('1field');
+  const [liqLoading, setLiqLoading] = useState(false);
+  const [liqStatusMessage, setLiqStatusMessage] = useState('');
+  const [liqTxId, setLiqTxId] = useState<string | null>(null);
+  const [liqPreview, setLiqPreview] = useState<{
+    loading: boolean;
+    ok: boolean;
+    reason?: string;
+    liquidatable?: boolean;
+    totalDebtUsd?: number;
+    thresholdCollateralUsd?: number;
+    aleoDebt?: number;
+    maxCloseAleo?: number;
+    seizeAmount?: number;
+    collateralSeizeAsset?: number;
+    liqBonusBps?: number;
+  }>({ loading: false, ok: false });
+  const [liqUiLimits, setLiqUiLimits] = useState<SelfLiquidationUiLimits | null>(null);
+  const [chainPositionNoteSchema, setChainPositionNoteSchema] = useState<number | null>(null);
+  const [posNoteLoading, setPosNoteLoading] = useState(false);
+  const [posNoteStatus, setPosNoteStatus] = useState('');
+  const [posNoteTxId, setPosNoteTxId] = useState<string | null>(null);
+  const [migrationRecSummary, setMigrationRecSummary] = useState<MigrationRecordSummary | null>(null);
   // Track if we've already loaded the user's position once after wallet connect
   const [userPositionInitialized, setUserPositionInitialized] = useState<boolean>(false);
-
+  /** Parsed private `LendingPosition` (v8) for caps / previews — no public mapping. */
+  const [lendingPositionScaled, setLendingPositionScaled] = useState<LendingPositionScaled | null>(null);
+  /** Modal for `open_lending_account`: same flow as other txs (submit → poll → explorer). */
+  const [openAccountModalOpen, setOpenAccountModalOpen] = useState(false);
+  const [openAccountSubmitted, setOpenAccountSubmitted] = useState(false);
+  const [openAccountStatusMsg, setOpenAccountStatusMsg] = useState('');
+  /** True once submit finishes (success, timeout, chain reject, or catch). Allows closing the modal. */
+  const [openAccountFlowDone, setOpenAccountFlowDone] = useState(false);
   // Transaction history from Supabase (by wallet address)
   type TxHistoryRow = {
     id: string;
@@ -405,6 +602,7 @@ const DashboardPage: NextPageWithLayout = () => {
     type: string;
     asset: string;
     amount: number;
+    repay_amount?: number | null;
     explorer_url: string | null;
     vault_tx_id: string | null;
     vault_explorer_url: string | null;
@@ -932,7 +1130,7 @@ const DashboardPage: NextPageWithLayout = () => {
     try {
       const { data, error } = await supabase
         .from('transaction_history')
-        .select('id, wallet_address, tx_id, type, asset, amount, program_id, explorer_url, vault_tx_id, vault_explorer_url, created_at')
+        .select('id, wallet_address, tx_id, type, asset, amount, repay_amount, program_id, explorer_url, vault_tx_id, vault_explorer_url, created_at')
         .eq('wallet_address', address)
         .order('created_at', { ascending: false })
         .limit(100);
@@ -951,14 +1149,49 @@ const DashboardPage: NextPageWithLayout = () => {
     }
   }, [address]);
 
+  const fetchFlashSessions = useCallback(async () => {
+    if (!address?.trim()) return;
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
+    if (!backendUrl) {
+      setFlashSessionsError('NEXT_PUBLIC_BACKEND_URL is not configured.');
+      setFlashSessions([]);
+      return;
+    }
+    setFlashSessionsLoading(true);
+    setFlashSessionsError(null);
+    try {
+      const resp = await fetch(`${backendUrl}/flash/sessions?wallet=${encodeURIComponent(address.trim())}&limit=100`);
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || data?.ok === false) {
+        setFlashSessionsError(data?.error || 'Failed to load flash sessions.');
+        setFlashSessions([]);
+        return;
+      }
+      setFlashSessions(Array.isArray(data?.sessions) ? data.sessions : []);
+    } catch (e: any) {
+      setFlashSessionsError(e?.message || 'Network error while loading flash sessions.');
+      setFlashSessions([]);
+    } finally {
+      setFlashSessionsLoading(false);
+    }
+  }, [address]);
+
   const saveTransactionToSupabase = async (
     walletAddress: string,
     txId: string,
-    type: 'deposit' | 'withdraw' | 'borrow' | 'repay' | 'flash_loan',
+    type:
+      | 'deposit'
+      | 'withdraw'
+      | 'borrow'
+      | 'repay'
+      | 'liquidation'
+      | 'open_position'
+      | 'self_liquidate_payout',
     asset: 'aleo' | 'usdc' | 'usad',
     amount: number,
     programId?: string,
     _vaultTxId?: string | null,
+    repayAmount?: number | null,
   ) => {
     try {
       const res = await fetch('/api/record-transaction', {
@@ -970,6 +1203,7 @@ const DashboardPage: NextPageWithLayout = () => {
           type,
           asset: asset === 'usdc' ? 'usdcx' : asset,
           amount,
+          repay_amount: repayAmount ?? null,
           program_id: programId ?? null,
         }),
       });
@@ -988,18 +1222,43 @@ const DashboardPage: NextPageWithLayout = () => {
   const CHAIN_CAPS_RETRY_MS = [0, 120, 320, 700];
   const refreshChainPortfolioCaps = useCallback(async () => {
     const addr = publicKey?.trim();
-    if (!addr) {
+    if (!addr || !requestRecords) {
       setChainBorrowCaps(null);
       setChainWithdrawCaps(null);
+      setLendingPositionScaled(null);
       return;
+    }
+    let scaled: LendingPositionScaled | null = null;
+    let lendingSnap: any[] | undefined;
+    try {
+      lendingSnap = await requestRecords(LENDING_POOL_PROGRAM_ID, false);
+      scaled = await parseLatestLendingPositionScaled(
+        requestRecords,
+        LENDING_POOL_PROGRAM_ID,
+        decrypt,
+        lendingSnap,
+      );
+      setLendingPositionScaled(scaled);
+    } catch {
+      setLendingPositionScaled(null);
     }
     for (let i = 0; i < CHAIN_CAPS_RETRY_MS.length; i++) {
       const ms = CHAIN_CAPS_RETRY_MS[i];
       if (ms > 0) await new Promise((r) => setTimeout(r, ms));
       try {
         const [borrow, withdraw] = await Promise.all([
-          getCrossCollateralBorrowCapsFromChain(LENDING_POOL_PROGRAM_ID, addr),
-          getCrossCollateralWithdrawCapsFromChain(LENDING_POOL_PROGRAM_ID, addr),
+          getAggregatedCrossCollateralBorrowCapsFromWallet(
+            LENDING_POOL_PROGRAM_ID,
+            requestRecords,
+            decrypt,
+            lendingSnap,
+          ),
+          getAggregatedCrossCollateralWithdrawCapsFromWallet(
+            LENDING_POOL_PROGRAM_ID,
+            requestRecords,
+            decrypt,
+            lendingSnap,
+          ),
         ]);
         if (borrow && withdraw) {
           setChainBorrowCaps(borrow);
@@ -1016,7 +1275,7 @@ const DashboardPage: NextPageWithLayout = () => {
     if (isDevAppEnv) console.warn('[chain caps] all retries exhausted for', addr);
     setChainBorrowCaps(null);
     setChainWithdrawCaps(null);
-  }, [publicKey]);
+  }, [publicKey, requestRecords, decrypt]);
 
   const refreshPoolState = async (includeUserPosition: boolean = false) => {
     try {
@@ -1037,10 +1296,20 @@ const DashboardPage: NextPageWithLayout = () => {
       setSupplyAPY(sApy);
       setBorrowAPY(bApy);
 
-      if (includeUserPosition && publicKey) {
+      if (includeUserPosition && publicKey && requestRecords) {
         try {
           await fetchRecordsInBackground(LENDING_POOL_PROGRAM_ID);
-          const effective = await getAleoPoolUserEffectivePosition(LENDING_POOL_PROGRAM_ID, publicKey, '0field');
+          const scaled = await parseLatestLendingPositionScaled(
+            requestRecords,
+            LENDING_POOL_PROGRAM_ID,
+            decrypt,
+          );
+          const effective = await getAleoPoolUserEffectivePosition(
+            LENDING_POOL_PROGRAM_ID,
+            publicKey,
+            '0field',
+            scaled,
+          );
           if (effective) {
             setEffectiveUserSupplied(effective.effectiveSupplyBalance);
             setEffectiveUserBorrowed(effective.effectiveBorrowDebt);
@@ -1109,7 +1378,24 @@ const DashboardPage: NextPageWithLayout = () => {
       if (includeUserPosition && requestRecords && publicKey) {
         try {
           await fetchRecordsInBackgroundUsdc();
-          const effective = await getAleoPoolUserEffectivePosition(USDC_LENDING_POOL_PROGRAM_ID, publicKey, '1field');
+          const scaledUsdc =
+            USDC_LENDING_POOL_PROGRAM_ID === LENDING_POOL_PROGRAM_ID
+              ? await parseLatestLendingPositionScaled(
+                  requestRecords,
+                  LENDING_POOL_PROGRAM_ID,
+                  decrypt,
+                )
+              : await parseLatestLendingPositionScaled(
+                  requestRecords,
+                  USDC_LENDING_POOL_PROGRAM_ID,
+                  decrypt,
+                );
+          const effective = await getAleoPoolUserEffectivePosition(
+            USDC_LENDING_POOL_PROGRAM_ID,
+            publicKey,
+            '1field',
+            scaledUsdc,
+          );
           if (effective) {
             setEffectiveUserSuppliedUsdc(effective.effectiveSupplyBalance);
             setEffectiveUserBorrowedUsdc(effective.effectiveBorrowDebt);
@@ -1168,7 +1454,24 @@ const DashboardPage: NextPageWithLayout = () => {
       if (includeUserPosition && requestRecords && publicKey) {
         try {
           await fetchRecordsInBackgroundUsad();
-          const effective = await getAleoPoolUserEffectivePosition(USAD_LENDING_POOL_PROGRAM_ID, publicKey, '2field');
+          const scaledUsad =
+            USAD_LENDING_POOL_PROGRAM_ID === LENDING_POOL_PROGRAM_ID
+              ? await parseLatestLendingPositionScaled(
+                  requestRecords,
+                  LENDING_POOL_PROGRAM_ID,
+                  decrypt,
+                )
+              : await parseLatestLendingPositionScaled(
+                  requestRecords,
+                  USAD_LENDING_POOL_PROGRAM_ID,
+                  decrypt,
+                );
+          const effective = await getAleoPoolUserEffectivePosition(
+            USAD_LENDING_POOL_PROGRAM_ID,
+            publicKey,
+            '2field',
+            scaledUsad,
+          );
           if (effective) {
             setEffectiveUserSuppliedUsad(effective.effectiveSupplyBalance);
             setEffectiveUserBorrowedUsad(effective.effectiveBorrowDebt);
@@ -1316,17 +1619,62 @@ const DashboardPage: NextPageWithLayout = () => {
   useEffect(() => {
     if (address?.trim()) {
       fetchTransactionHistory();
+      fetchFlashSessions();
     } else {
       setTxHistory([]);
+      setFlashSessions([]);
     }
-  }, [address, fetchTransactionHistory]);
+  }, [address, fetchTransactionHistory, fetchFlashSessions]);
 
   // Auto-refresh transaction history every 1 min (e.g. to show vault_tx_id when backend completes)
   useEffect(() => {
     if (!address?.trim()) return;
-    const interval = setInterval(() => fetchTransactionHistory(), 60_000);
+    const interval = setInterval(() => {
+      fetchTransactionHistory();
+      fetchFlashSessions();
+    }, 60_000);
     return () => clearInterval(interval);
-  }, [address, fetchTransactionHistory]);
+  }, [address, fetchTransactionHistory, fetchFlashSessions]);
+
+  useEffect(() => {
+    if (!flashSessionId) return;
+    const row = flashSessions.find((s) => s.id === flashSessionId);
+    if (row?.vault_fund_tx_id) setFlashVaultTxId(row.vault_fund_tx_id);
+  }, [flashSessionId, flashSessions]);
+
+  useEffect(() => {
+    if (view !== 'flash' || !flashSessions.length) return;
+    const latest = [...flashSessions].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+    )[0];
+    if (!latest) return;
+    const latestStatus = String(latest.status || '').toLowerCase();
+    if (FLASH_SESSION_TERMINAL_STATUSES.has(latestStatus)) {
+      // No latest active session to settle -> keep settle fields empty/default.
+      setFlashSessionId(null);
+      setFlashRepayInput('');
+      setFlashSettleAsset('0field');
+      setFlashStrategyIdInput('1field');
+      return;
+    }
+    prefillSettleFromSession(latest);
+  }, [view, flashSessions, prefillSettleFromSession]);
+
+  useEffect(() => {
+    if (view !== 'flash') return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const v = await fetchAvailableLiquidityMicro(LENDING_POOL_PROGRAM_ID, flashAsset);
+        if (!cancelled) setFlashAvailLiquidityMicro(v);
+      } catch {
+        if (!cancelled) setFlashAvailLiquidityMicro(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [view, flashAsset]);
 
   const inlineTxClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // After inline panel tx finalizes: clear inputs + overview (brief delay so explorer link can show)
@@ -1406,10 +1754,12 @@ const DashboardPage: NextPageWithLayout = () => {
         }
       }
 
-      // Vault liquidity check (borrow/withdraw payouts come from backend vault).
+      // Vault liquidity check (borrow/withdraw payouts are settled from backend vault).
       // Keep existing portfolio/on-chain checks; this is an additional safety gate.
+      let vaultBalancesHuman: { aleo: number; usdcx: number; usad: number } | null = null;
       if (action === 'borrow' || action === 'withdraw') {
-        const vault = await fetchVaultBalancesHuman();
+        vaultBalancesHuman = await fetchVaultBalancesHuman();
+        const vault = vaultBalancesHuman;
         if (vault && amountToUse > (vault.aleo ?? 0)) {
           const max = Math.max(0, vault.aleo ?? 0);
           const msg = `Insufficient vault liquidity. You can ${action} at most ${max.toFixed(2)} ALEO right now (vault wallet balance).`;
@@ -1457,18 +1807,27 @@ const DashboardPage: NextPageWithLayout = () => {
         ? Math.min(netSupplied, availableLiquidity, maxWithdrawByLtv)
         : Math.min(netSupplied, maxWithdrawByLtv);
 
-      // Withdraw can be satisfied cross-asset on-chain; use the chain-derived cap when available.
-      const chainCapWithdrawAleoHuman = chainWithdrawCaps
-        ? Number(chainWithdrawCaps.maxWithdrawMicroAleo) / 1_000_000
-        : null;
-      // If chain caps aren't available, use the same cross-asset withdraw budget
-      // used by the modal/MAX button (`availableWithdrawAleo`) rather than same-asset supply.
-      const effectiveMaxWithdraw = chainCapWithdrawAleoHuman ?? availableWithdrawAleo;
+      // Withdraw: same shared USD budget ÷ price as inline Withdraw + modal (`withdrawMaxAleoUi`), not the
+      // per-asset micro cap alone (integer rounding can under-report vs supplied / vs portfolio max USD).
+      const effectiveMaxWithdraw = withdrawMaxAleoUi;
 
       if (action === 'withdraw' && amountToUse > effectiveMaxWithdraw) {
-        const msg = `You can withdraw at most ${effectiveMaxWithdraw.toFixed(
-          4,
-        )} ALEO (frontend estimate from on-chain caps). Final limit is enforced on-chain by cross-collateral portfolio checks.`;
+        const caps = chainWithdrawCaps;
+        const softCapped =
+          caps != null && caps.maxWithdrawMicroAleoPortfolio > caps.maxWithdrawMicroAleo;
+        const portfolioAleoHuman = caps
+          ? Number(caps.maxWithdrawMicroAleoPortfolio) / 1_000_000
+          : null;
+        const mappingAleoHuman =
+          caps?.availableLiquidityMicroAleo != null
+            ? Number(caps.availableLiquidityMicroAleo) / 1_000_000
+            : null;
+        const vaultAleo = vaultBalancesHuman?.aleo ?? null;
+        const msg = softCapped
+          ? `You can withdraw at most ${effectiveMaxWithdraw.toFixed(2)} ALEO. Cross-asset withdraw is capped at the lower of your collateral (~${portfolioAleoHuman != null ? portfolioAleoHuman.toFixed(2) : '?'} ALEO) and treasury liquidity${vaultAleo != null && Number.isFinite(vaultAleo) ? ` (~${vaultAleo.toFixed(2)} ALEO in vault)` : ''}. If the transaction still reverts, the on-chain pool counter may be below the vault — deposit ALEO into the pool or use USDCx/USAD withdraw.${mappingAleoHuman != null && mappingAleoHuman + 1e-9 < (portfolioAleoHuman ?? Infinity) ? ` (Program mapping idle ALEO ~${mappingAleoHuman.toFixed(2)}.)` : ''}`
+          : `You can withdraw at most ${effectiveMaxWithdraw.toFixed(
+              2,
+            )} ALEO (frontend estimate from on-chain caps). Final limit is enforced on-chain by cross-collateral portfolio checks.`;
         setAmountError(msg);
         setStatusMessage(msg);
         setLoading(false);
@@ -1509,7 +1868,13 @@ const DashboardPage: NextPageWithLayout = () => {
         case 'borrow':
           console.log('📥 BORROW: Starting borrow transaction (executeTransaction)...');
           setVaultBorrowTxId(null);
-          tx = await lendingBorrow(executeTransaction, amountToUse);
+          tx = await lendingBorrow(
+            executeTransaction,
+            amountToUse,
+            publicKey || undefined,
+            requestRecords,
+            decrypt,
+          );
           console.log('📥 BORROW: Transaction submitted successfully:', tx);
           break;
         case 'repay':
@@ -1526,7 +1891,22 @@ const DashboardPage: NextPageWithLayout = () => {
         case 'withdraw':
           console.log('💸 WITHDRAW: Starting withdraw transaction (executeTransaction)...');
           setVaultWithdrawTxId(null);
-          tx = await lendingWithdraw(executeTransaction, amountToUse);
+          {
+            let microOverride: bigint | undefined;
+            if (chainWithdrawCaps?.maxWithdrawMicroAleo != null) {
+              const cap = chainWithdrawCaps.maxWithdrawMicroAleo;
+              const req = BigInt(Math.floor(amountToUse * 1_000_000 + 1e-9));
+              microOverride = req > cap ? cap : req;
+            }
+            tx = await lendingWithdraw(
+              executeTransaction,
+              amountToUse,
+              publicKey || undefined,
+              requestRecords,
+              decrypt,
+              microOverride,
+            );
+          }
           console.log('💸 WITHDRAW: Transaction submitted successfully:', tx);
           break;
         default:
@@ -1592,7 +1972,9 @@ const DashboardPage: NextPageWithLayout = () => {
                 action,
                 program: LENDING_POOL_PROGRAM_ID,
               });
-              setStatusMessage(`Transaction ${statusLower}. Vault transfer was not requested.`);
+              setStatusMessage(
+                `Transaction ${statusLower} on-chain (not a vault step). Try a slightly lower amount, refresh caps, or repay any remaining borrow dust and retry.`,
+              );
               setLoading(false);
               console.log('========================================\n');
               return;
@@ -1713,8 +2095,57 @@ const DashboardPage: NextPageWithLayout = () => {
     }
   };
 
-  /** ALEO pool: flash_loan_with_credits — uncollateralized; capped by pool liquidity only. */
+  async function waitForPoolTxFinalization(
+    tx: string,
+    action: 'flash_open' | 'flash_settle',
+  ): Promise<string> {
+    let finalTxId = tx;
+    let finalized = false;
+    const maxAttempts = 45;
+    const delayMs = 2000;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (transactionStatus) {
+        try {
+          const statusResult = await transactionStatus(tx);
+          const statusText =
+            typeof statusResult === 'string'
+              ? statusResult
+              : (statusResult as { status?: string })?.status ?? '';
+          const statusLower = (statusText || '').toLowerCase();
+          if (statusLower === 'finalized' || statusLower === 'accepted') {
+            finalized = true;
+            const resolvedId =
+              (typeof statusResult === 'object' &&
+                (statusResult as { transactionId?: string }).transactionId) ||
+              tx;
+            finalTxId = resolvedId;
+            setFlashTxId(isExplorerHash(resolvedId) ? resolvedId : null);
+            break;
+          }
+          if (statusLower === 'rejected' || statusLower === 'failed' || statusLower === 'dropped') {
+            logPoolTxRejected('ALEO pool', statusLower, tx, {
+              action,
+              program: LENDING_POOL_PROGRAM_ID,
+            });
+            throw new Error(`Transaction ${statusLower}.`);
+          }
+          setFlashStatusMessage(`Transaction ${statusText || 'pending'}… (${attempt}/${maxAttempts})`);
+        } catch (e) {
+          if (e instanceof Error && e.message.startsWith('Transaction ')) throw e;
+          console.warn('Flash tx status poll:', e);
+        }
+      }
+    }
+    if (!finalized) {
+      throw new Error('Transaction not finalized in time. Check the explorer.');
+    }
+    return finalTxId;
+  }
+
+  /** Unified pool flash: open session (`flash_open`) for selected asset. */
   const handleFlashLoan = async () => {
+    setFlashOpenAttempted(true);
     if (!connected || !publicKey || !executeTransaction || !requestRecords) {
       setFlashStatusMessage('Please connect your wallet.');
       return;
@@ -1728,105 +2159,112 @@ const DashboardPage: NextPageWithLayout = () => {
       setFlashStatusMessage('Enter a valid principal amount.');
       return;
     }
-    const poolSuppliedMicro = Number(totalSupplied) || 0;
-    const poolBorrowedMicro = Number(totalBorrowed) || 0;
-    /** On-chain liquidity (micro); must not skip check when both totals are 0 — that means 0 available. */
-    const availableLiquidityMicro = Math.max(0, poolSuppliedMicro - poolBorrowedMicro);
     const principalMicro = Math.round(principal * 1_000_000);
-    if (principalMicro > availableLiquidityMicro) {
+    let onChainAvail: bigint | null = null;
+    try {
+      onChainAvail = await fetchAvailableLiquidityMicro(LENDING_POOL_PROGRAM_ID, flashAsset);
+      setFlashAvailLiquidityMicro(onChainAvail);
+    } catch {
+      onChainAvail = null;
+    }
+    if (onChainAvail != null && BigInt(principalMicro) > onChainAvail) {
       setFlashStatusMessage(
-        `Principal exceeds pool liquidity (${(availableLiquidityMicro / 1_000_000).toFixed(6)} ALEO available).`,
+        `Principal exceeds on-chain available liquidity for this asset (${(Number(onChainAvail) / 1_000_000).toFixed(6)}).`,
       );
+      return;
+    }
+    const minProfit = Number(flashMinProfitInput || '0');
+    if (!Number.isFinite(minProfit) || minProfit < 0) {
+      setFlashStatusMessage('Enter valid min profit (>= 0).');
+      return;
+    }
+    const strategyId = (flashStrategyIdInput || '').trim();
+    if (!/^\d+field$/.test(strategyId)) {
+      setFlashStatusMessage("Strategy id must be Leo field like '1field'.");
       return;
     }
     const feeMicro = aleoFlashFeeMicro(principalMicro);
-    const totalMicro = principalMicro + feeMicro;
-    let balance = privateAleoBalance;
-    if (balance === null && requestRecords) {
-      balance = await getPrivateCreditsBalance(requestRecords, decrypt);
-      setPrivateAleoBalance(balance);
+    const totalMicro = principalMicro + feeMicro + Math.round(minProfit * 1_000_000);
+    if (flashAsset === '0field') {
+      let balance = privateAleoBalance;
+      if (balance === null && requestRecords) {
+        balance = await getPrivateCreditsBalance(requestRecords, decrypt);
+        setPrivateAleoBalance(balance);
+      }
+      if (totalMicro / 1_000_000 > (balance ?? 0) + 1e-9) {
+        setFlashStatusMessage(
+          `Need one private credits record covering principal + fee + min profit (${(totalMicro / 1_000_000).toFixed(6)} ALEO).`,
+        );
+        return;
+      }
+    } else if (flashAsset === '1field') {
+      const rec = await getSuitableUsdcTokenRecord(requestRecords, totalMicro, publicKey, decrypt);
+      if (!rec) {
+        setFlashStatusMessage(
+          `Need one USDCx Token record covering principal + fee + min profit (${(totalMicro / 1_000_000).toFixed(6)} USDC).`,
+        );
+        return;
+      }
+    } else {
+      const rec = await getSuitableUsadTokenRecord(requestRecords, totalMicro, publicKey, decrypt);
+      if (!rec) {
+        setFlashStatusMessage(
+          `Need one USAD Token record covering principal + fee + min profit (${(totalMicro / 1_000_000).toFixed(6)} USAD).`,
+        );
+        return;
+      }
     }
-    if (totalMicro / 1_000_000 > (balance ?? 0) + 1e-9) {
-      setFlashStatusMessage(
-        `Need one private credits record covering principal + fee (${(totalMicro / 1_000_000).toFixed(6)} ALEO).`,
-      );
-      return;
-    }
-
     try {
+      setFlashTxModalKind('open');
+      setFlashTxModalOpen(true);
       setFlashLoading(true);
-      setFlashStatusMessage('Submitting flash loan…');
+      setFlashStatusMessage('Submitting flash open…');
       setFlashVaultTxId(null);
       setFlashTxId(null);
-      const tx = await lendingFlashLoan(executeTransaction, principal, publicKey, requestRecords, decrypt);
+      const tx = await lendingFlashOpen(
+        executeTransaction,
+        principal,
+        minProfit,
+        strategyId,
+        publicKey,
+        requestRecords,
+        decrypt,
+        LENDING_POOL_PROGRAM_ID,
+        flashAsset,
+      );
       if (tx === '__CANCELLED__') {
         setFlashStatusMessage('Transaction cancelled by user.');
         setFlashLoading(false);
         return;
       }
-      let finalTxId = tx;
-      let finalized = false;
-      let txFailed = false;
-      const maxAttempts = 45;
-      const delayMs = 2000;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-        if (transactionStatus) {
-          try {
-            const statusResult = await transactionStatus(tx);
-            const statusText =
-              typeof statusResult === 'string'
-                ? statusResult
-                : (statusResult as { status?: string })?.status ?? '';
-            const statusLower = (statusText || '').toLowerCase();
-            if (statusLower === 'finalized' || statusLower === 'accepted') {
-              finalized = true;
-              const resolvedId =
-                (typeof statusResult === 'object' && (statusResult as { transactionId?: string }).transactionId) ||
-                tx;
-              finalTxId = resolvedId;
-              setFlashTxId(isExplorerHash(resolvedId) ? resolvedId : null);
-              break;
-            }
-            if (statusLower === 'rejected' || statusLower === 'failed' || statusLower === 'dropped') {
-              txFailed = true;
-              logPoolTxRejected('ALEO pool', statusLower, tx, {
-                action: 'flash_loan',
-                program: LENDING_POOL_PROGRAM_ID,
-              });
-              setFlashStatusMessage(`Transaction ${statusLower}.`);
-              setFlashLoading(false);
-              return;
-            }
-            setFlashStatusMessage(`Transaction ${statusText || 'pending'}… (${attempt}/${maxAttempts})`);
-          } catch (e) {
-            console.warn('Flash loan status poll:', e);
-          }
-        }
+      const finalTxId = await waitForPoolTxFinalization(tx, 'flash_open');
+      const idempotencyKey = `flash-${publicKey}-${Date.now()}`;
+      const recResp = await fetch('/api/flash-record-open', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_address: publicKey,
+          strategy_wallet: publicKey,
+          asset_id: flashAsset,
+          principal_micro: principalMicro,
+          min_profit_micro: Math.round(minProfit * 1_000_000),
+          strategy_id: strategyId,
+          flash_open_tx_id: finalTxId,
+          idempotency_key: idempotencyKey,
+        }),
+      });
+      const recJson = await recResp.json().catch(() => ({}));
+      if (!recResp.ok) {
+        throw new Error(recJson?.error || 'Flash open finalized, but failed to record session');
       }
-      if (txFailed) {
-        setFlashLoading(false);
-        return;
-      }
-      if (!finalized) {
-        setFlashStatusMessage('Transaction not finalized in time. Check the explorer.');
-        setFlashLoading(false);
-        return;
-      }
-      await saveTransactionToSupabase(
-        publicKey,
-        finalTxId,
-        'flash_loan',
-        'aleo',
-        principal,
-        LENDING_POOL_PROGRAM_ID,
-        null,
-      ).catch(() => { });
+      const session = recJson?.session;
+      if (session?.id) setFlashSessionId(session.id);
+      setFlashOpenAttempted(false);
+      setFlashTxId(finalTxId);
+      setFlashRepayInput(((totalMicro) / 1_000_000).toFixed(6));
+      setFlashStatusMessage('Flash session opened. Backend watcher will fund from vault shortly.');
       fetchTransactionHistory();
-      setFlashAmountInput('');
-      setFlashStatusMessage(
-        'Flash loan finalized! Vault will send principal in 1–5 min — check Transaction History.',
-      );
+      fetchFlashSessions();
       try {
         await refreshPoolState(true);
       } catch {
@@ -1836,6 +2274,627 @@ const DashboardPage: NextPageWithLayout = () => {
       setFlashStatusMessage(getErrorMessage(e));
     } finally {
       setFlashLoading(false);
+    }
+  };
+
+  const handleFlashSettle = async () => {
+    if (!connected || !publicKey || !executeTransaction || !requestRecords) {
+      setFlashStatusMessage('Please connect your wallet.');
+      return;
+    }
+    const repay = Number(flashRepayInput);
+    if (!Number.isFinite(repay) || repay <= 0) {
+      setFlashStatusMessage('Enter valid repay amount (> 0).');
+      return;
+    }
+    const strategyId = (flashStrategyIdInput || '').trim();
+    if (!/^\d+field$/.test(strategyId)) {
+      setFlashStatusMessage("Strategy id must be Leo field like '1field'.");
+      return;
+    }
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
+    let sessionsSnapshot = flashSessions;
+    if (backendUrl && publicKey?.trim()) {
+      try {
+        const resp = await fetch(
+          `${backendUrl.replace(/\/$/, '')}/flash/sessions?wallet=${encodeURIComponent(publicKey.trim())}&limit=100`,
+        );
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok && Array.isArray(data?.sessions)) sessionsSnapshot = data.sessions;
+      } catch {
+        /* keep flashSessions */
+      }
+    }
+    const explicitSession = flashSessionId?.trim();
+    const rowForAsset = explicitSession
+      ? sessionsSnapshot.find((s) => s.id === explicitSession)
+      : [...sessionsSnapshot]
+          .filter((s) => ['funded', 'settle_pending'].includes(String(s.status || '').toLowerCase()))
+          .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+    const aid = rowForAsset?.asset_id;
+    const settleAsset: FlashLendingAssetId =
+      aid === '0field' || aid === '1field' || aid === '2field' ? aid : flashSettleAsset;
+    const repayMicro = Math.round(repay * 1_000_000);
+    const principalMicro = Number(rowForAsset?.principal_micro ?? 0);
+    if (Number.isFinite(principalMicro) && principalMicro > 0) {
+      const principalMicroRounded = Math.round(principalMicro);
+      const feeMicro = aleoFlashFeeMicro(principalMicroRounded);
+      const minRequiredMicro = principalMicroRounded + feeMicro;
+      if (repayMicro < minRequiredMicro) {
+        const settleUnit = settleAsset === '0field' ? 'ALEO' : settleAsset === '1field' ? 'USDCx' : 'USAD';
+        setFlashStatusMessage(
+          `Repay amount is too low. Minimum needed is ${(minRequiredMicro / 1_000_000).toFixed(6)} ${settleUnit} (principal + fee).`,
+        );
+        return;
+      }
+    }
+    try {
+      setFlashTxModalKind('settle');
+      setFlashTxModalOpen(true);
+      setFlashLoading(true);
+      setFlashStatusMessage('Submitting flash settle…');
+      setFlashTxId(null);
+      let tx: string;
+      if (settleAsset === '0field') {
+        tx = await lendingFlashSettleWithCredits(
+          executeTransaction,
+          repay,
+          strategyId,
+          publicKey,
+          requestRecords,
+          decrypt,
+        );
+      } else if (settleAsset === '1field') {
+        tx = await lendingFlashSettleWithUsdcx(
+          executeTransaction,
+          repay,
+          strategyId,
+          publicKey,
+          requestRecords,
+          decrypt,
+        );
+      } else {
+        tx = await lendingFlashSettleWithUsad(
+          executeTransaction,
+          repay,
+          strategyId,
+          publicKey,
+          requestRecords,
+          decrypt,
+        );
+      }
+      if (tx === '__CANCELLED__') {
+        setFlashStatusMessage('Transaction cancelled by user.');
+        setFlashLoading(false);
+        return;
+      }
+      const finalTxId = await waitForPoolTxFinalization(tx, 'flash_settle');
+      setFlashTxId(finalTxId);
+      let sessionsForResolve = sessionsSnapshot;
+      if (backendUrl && publicKey?.trim()) {
+        try {
+          const resp = await fetch(
+            `${backendUrl.replace(/\/$/, '')}/flash/sessions?wallet=${encodeURIComponent(publicKey.trim())}&limit=100`,
+          );
+          const data = await resp.json().catch(() => ({}));
+          if (resp.ok && Array.isArray(data?.sessions)) sessionsForResolve = data.sessions;
+        } catch {
+          /* use snapshot */
+        }
+      }
+      const sessionIdForSettle = (() => {
+        const explicit = flashSessionId?.trim();
+        if (explicit) return explicit;
+        const candidates = sessionsForResolve.filter((s) =>
+          ['funded', 'settle_pending'].includes(String(s.status || '').toLowerCase()),
+        );
+        if (!candidates.length) return null;
+        return [...candidates].sort(
+          (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+        )[0]?.id ?? null;
+      })();
+      const readFlashBackendError = async (r: Response) => {
+        try {
+          const j = await r.json();
+          return typeof j?.error === 'string' ? j.error : r.statusText || 'Request failed';
+        } catch {
+          return r.statusText || 'Request failed';
+        }
+      };
+      const backendFlashWarnings: string[] = [];
+      if (backendUrl && sessionIdForSettle) {
+        try {
+          const r1 = await fetch(`${backendUrl}/flash/mark-settle-pending`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionIdForSettle, flash_settle_tx_id: finalTxId }),
+          });
+          if (!r1.ok) backendFlashWarnings.push(`mark-settle-pending: ${await readFlashBackendError(r1)}`);
+        } catch (e) {
+          backendFlashWarnings.push(`mark-settle-pending: ${getErrorMessage(e)}`);
+        }
+        try {
+          const r2 = await fetch(`${backendUrl}/flash/complete-session`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              session_id: sessionIdForSettle,
+              flash_settle_tx_id: finalTxId,
+              actual_repay_micro: Math.round(repay * 1_000_000),
+            }),
+          });
+          if (!r2.ok) backendFlashWarnings.push(`complete-session: ${await readFlashBackendError(r2)}`);
+        } catch (e) {
+          backendFlashWarnings.push(`complete-session: ${getErrorMessage(e)}`);
+        }
+      } else if (!backendUrl) {
+        backendFlashWarnings.push('NEXT_PUBLIC_BACKEND_URL not set — flash_sessions not updated.');
+      } else if (!sessionIdForSettle) {
+        backendFlashWarnings.push(
+          'No funded flash session in memory — refresh Flash Loan History after vault funding, then settle again to sync status.',
+        );
+      }
+      /* Flash: open/fund/settle state lives in flash_sessions only (not transaction_history). */
+      fetchFlashSessions();
+      let settleMsg = 'Flash settle finalized successfully.';
+      if (backendFlashWarnings.length) {
+        settleMsg += ` ${backendFlashWarnings.join(' ')}`;
+      }
+      setFlashStatusMessage(settleMsg);
+      try {
+        await refreshPoolState(true);
+      } catch {
+        setFlashStatusMessage((s) => s + ' (Refresh pool manually.)');
+      }
+    } catch (e: unknown) {
+      setFlashStatusMessage(getErrorMessage(e));
+    } finally {
+      setFlashLoading(false);
+    }
+  };
+
+  const openOpenAccountModal = () => {
+    setOpenAccountSubmitted(false);
+    setOpenAccountStatusMsg('');
+    setOpenAccountFlowDone(false);
+    setOpenAccountModalOpen(true);
+    // Auto-submit so the modal opens directly in processing state.
+    setTimeout(() => {
+      void handleOpenDarkPoolPosition();
+    }, 0);
+  };
+
+  const closeOpenAccountModal = () => {
+    if (openAccountSubmitted && !openAccountFlowDone) return;
+    setOpenAccountModalOpen(false);
+    setOpenAccountSubmitted(false);
+    setOpenAccountFlowDone(false);
+  };
+
+  const handleOpenDarkPoolPosition = async () => {
+    setOpenAccountStatusMsg('');
+    if (!executeTransaction) {
+      setOpenAccountStatusMsg('Wallet not ready.');
+      return;
+    }
+    if (!publicKey) {
+      setOpenAccountStatusMsg('Connect your wallet first.');
+      return;
+    }
+    setOpenAccountSubmitted(true);
+    setOpenAccountFlowDone(false);
+    setOpenAccountStatusMsg('Submitting transaction…');
+    try {
+      const tx = await lendingOpenLendingAccount(executeTransaction, LENDING_POOL_PROGRAM_ID);
+      logAleoTxExplorer('Create Dark Pool position', tx);
+      let finalTxId = tx;
+      let finalized = false;
+      const maxAttempts = 45;
+      const delayMs = 2000;
+      setOpenAccountStatusMsg('Transaction submitted. Waiting for finalization…');
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (!transactionStatus) continue;
+        try {
+          const statusResult = await transactionStatus(tx);
+          const statusText =
+            typeof statusResult === 'string'
+              ? statusResult
+              : (statusResult as { status?: string })?.status ?? '';
+          const statusLower = (statusText || '').toLowerCase();
+          if (statusLower === 'finalized' || statusLower === 'accepted') {
+            finalized = true;
+            const resolvedId =
+              (typeof statusResult === 'object' && (statusResult as { transactionId?: string }).transactionId) || tx;
+            finalTxId = resolvedId;
+            break;
+          }
+          if (statusLower === 'rejected' || statusLower === 'failed' || statusLower === 'dropped') {
+            logPoolTxRejected('ALEO pool', statusLower, tx, {
+              action: 'open_position',
+              program: LENDING_POOL_PROGRAM_ID,
+            });
+            setOpenAccountStatusMsg(
+              `Transaction ${statusLower} on-chain. Check the explorer or try again.`,
+            );
+            setOpenAccountFlowDone(true);
+            return;
+          }
+          setOpenAccountStatusMsg(`Transaction ${statusText || 'pending'}… (${attempt}/${maxAttempts})`);
+        } catch {
+          // continue polling
+        }
+      }
+      if (!finalized) {
+        setOpenAccountStatusMsg('Transaction not finalized in time. Check the explorer and use Refresh.');
+        setOpenAccountFlowDone(true);
+        return;
+      }
+      setOpenAccountStatusMsg('Transaction finalized. Syncing your private position…');
+      await saveTransactionToSupabase(
+        publicKey,
+        finalTxId,
+        'open_position',
+        'aleo',
+        0,
+        LENDING_POOL_PROGRAM_ID,
+        null,
+      ).catch(() => { });
+      fetchTransactionHistory();
+      // Keep spinner visible and refresh in background until wallet exposes the new LendingPosition.
+      const maxRecordAttempts = 90; // ~3 minutes at 2s interval
+      const recordDelayMs = 2000;
+      let foundPosition = false;
+      for (let i = 1; i <= maxRecordAttempts; i++) {
+        setOpenAccountStatusMsg(`Syncing private position… (${i}/${maxRecordAttempts})`);
+        await new Promise((resolve) => setTimeout(resolve, recordDelayMs));
+        try {
+          await refreshChainPortfolioCaps();
+          if (requestRecords) {
+            const maybeScaled = await parseLatestLendingPositionScaled(
+              requestRecords,
+              LENDING_POOL_PROGRAM_ID,
+              decrypt,
+            );
+            if (maybeScaled != null) {
+              foundPosition = true;
+              break;
+            }
+          }
+        } catch {
+          // Keep polling until the position record appears.
+        }
+      }
+      if (foundPosition) {
+        setOpenAccountModalOpen(false);
+        setOpenAccountSubmitted(false);
+        setOpenAccountFlowDone(false);
+        setOpenAccountStatusMsg('');
+        return;
+      }
+      setOpenAccountStatusMsg('Position not visible yet. Keep this open or click Refresh.');
+      setOpenAccountFlowDone(true);
+    } catch (e: unknown) {
+      setOpenAccountStatusMsg(getErrorMessage(e));
+      setOpenAccountFlowDone(true);
+    }
+  };
+
+  const handleMintPositionMigrationNote = async () => {
+    if (!connected || !publicKey || !executeTransaction) {
+      setPosNoteStatus('Connect your wallet.');
+      return;
+    }
+    if (chainPositionNoteSchema === POSITION_NOTE_SCHEMA_ON_CHAIN_V2) {
+      setPosNoteStatus('On-chain migration flag already set — repeating would revert.');
+      return;
+    }
+    try {
+      setPosNoteLoading(true);
+      setPosNoteStatus('Submitting mint_position_migration_note…');
+      setPosNoteTxId(null);
+      const tx = await lendingMintPositionMigrationNote(executeTransaction);
+      if (tx === '__CANCELLED__') {
+        setPosNoteStatus('Transaction cancelled by user.');
+        return;
+      }
+      let finalTxId = tx;
+      let finalized = false;
+      const maxAttempts = 45;
+      const delayMs = 2000;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (!transactionStatus) continue;
+        try {
+          const statusResult = await transactionStatus(tx);
+          const statusText =
+            typeof statusResult === 'string'
+              ? statusResult
+              : (statusResult as { status?: string })?.status ?? '';
+          const statusLower = (statusText || '').toLowerCase();
+          if (statusLower === 'finalized' || statusLower === 'accepted') {
+            finalized = true;
+            const resolvedId =
+              (typeof statusResult === 'object' && (statusResult as { transactionId?: string }).transactionId) || tx;
+            finalTxId = resolvedId;
+            setPosNoteTxId(isExplorerHash(resolvedId) ? resolvedId : null);
+            break;
+          }
+          if (statusLower === 'rejected' || statusLower === 'failed' || statusLower === 'dropped') {
+            setPosNoteStatus(`Transaction ${statusLower}.`);
+            return;
+          }
+          setPosNoteStatus(`Transaction ${statusText || 'pending'}… (${attempt}/${maxAttempts})`);
+        } catch {
+          // continue polling
+        }
+      }
+      if (!finalized) {
+        setPosNoteStatus('Transaction not finalized in time. Check explorer.');
+        return;
+      }
+      setPosNoteStatus('Finalized. Refresh wallet records to see PositionNote.');
+      const v = await getPositionNoteSchemaFromChain(LENDING_POOL_PROGRAM_ID, publicKey);
+      setChainPositionNoteSchema(v);
+      if (requestRecords) {
+        const recs = await requestRecords(LENDING_POOL_PROGRAM_ID, false);
+        setMigrationRecSummary(summarizeLendingRecordsForMigration(LENDING_POOL_PROGRAM_ID, recs));
+      }
+    } catch (e: unknown) {
+      setPosNoteStatus(getErrorMessage(e));
+    } finally {
+      setPosNoteLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      if (!publicKey?.trim().startsWith('aleo1') || !requestRecords) {
+        setLiqPreview({ loading: false, ok: false, reason: 'Connect wallet to preview self-liquidation.' });
+        return;
+      }
+      const repayRaw = Number(liqRepayAmountInput);
+      const repay = Number.isFinite(repayRaw) && repayRaw > 0 ? repayRaw : 0;
+      setLiqPreview((p) => ({ ...p, loading: true }));
+      const scaled = await parseLatestLendingPositionScaled(requestRecords, LENDING_POOL_PROGRAM_ID, decrypt);
+      const preview = await getLiquidationPreviewAleo(
+        LENDING_POOL_PROGRAM_ID,
+        repay,
+        liqSeizeAsset,
+        scaled,
+      );
+      if (cancelled) return;
+      setLiqPreview({
+        loading: false,
+        ok: preview.ok,
+        reason: preview.reason,
+        liquidatable: preview.liquidatable,
+        totalDebtUsd: preview.totalDebtUsd,
+        thresholdCollateralUsd: preview.thresholdCollateralUsd,
+        aleoDebt: preview.aleoDebt,
+        maxCloseAleo: preview.maxCloseAleo,
+        seizeAmount: preview.seizeAmount,
+        collateralSeizeAsset: preview.collateralSeizeAsset,
+        liqBonusBps: preview.liqBonusBps,
+      });
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [liqRepayAmountInput, liqSeizeAsset, publicKey, requestRecords, decrypt]);
+
+  useEffect(() => {
+    if (view !== 'liquidation' || !connected || !requestRecords || !publicKey?.trim().startsWith('aleo1')) {
+      setLiqUiLimits(null);
+      return;
+    }
+    let cancelled = false;
+    setLiqUiLimits(null);
+    void (async () => {
+      try {
+        const lim = await getSelfLiquidationUiLimits(LENDING_POOL_PROGRAM_ID, requestRecords, decrypt);
+        if (!cancelled) setLiqUiLimits(lim);
+      } catch (e: unknown) {
+        if (!cancelled) {
+          setLiqUiLimits({
+            ok: false,
+            reason: e instanceof Error ? e.message : 'Failed to load limits.',
+            maxCloseAleo: 0,
+            maxCreditsSingleRecordAleo: 0,
+            effectiveMaxRepayAleo: 0,
+            seizeOptions: [],
+            aleoDebt: 0,
+            realSupAleo: 0,
+            realSupUsdcx: 0,
+            realSupUsad: 0,
+          });
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [view, connected, publicKey, requestRecords, decrypt]);
+
+  useEffect(() => {
+    if (!liqUiLimits?.ok || !liqUiLimits.seizeOptions.length) return;
+    setLiqSeizeAsset((prev) =>
+      liqUiLimits.seizeOptions.includes(prev) ? prev : liqUiLimits.seizeOptions[0],
+    );
+  }, [liqUiLimits]);
+
+  useEffect(() => {
+    if (!SHOW_SPRINT2_MIGRATION_UI || view !== 'flash' || !connected || !publicKey) {
+      return;
+    }
+    let cancelled = false;
+    const run = async () => {
+      const [schema, recs] = await Promise.all([
+        getPositionNoteSchemaFromChain(LENDING_POOL_PROGRAM_ID, publicKey),
+        requestRecords ? requestRecords(LENDING_POOL_PROGRAM_ID, false) : Promise.resolve([]),
+      ]);
+      if (cancelled) return;
+      setChainPositionNoteSchema(schema);
+      setMigrationRecSummary(summarizeLendingRecordsForMigration(LENDING_POOL_PROGRAM_ID, recs));
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [SHOW_SPRINT2_MIGRATION_UI, view, connected, publicKey, requestRecords]);
+
+  const liquidationSubmitGate = useMemo(() => {
+    if (liqLoading) return { disabled: true as const, reason: 'Submitting…' };
+    if (!connected) return { disabled: true as const, reason: 'Connect wallet.' };
+    if (view === 'liquidation' && connected && publicKey?.trim().startsWith('aleo1') && liqUiLimits === null) {
+      return { disabled: true as const, reason: 'Loading repay limits…' };
+    }
+    if (liqUiLimits?.ok && liqUiLimits.seizeOptions.length === 0) {
+      return { disabled: true as const, reason: 'No collateral available to seize (zero supplied balances).' };
+    }
+    if (liqPreview.loading) return { disabled: true as const, reason: 'Loading preview…' };
+    const repayNum = Number(liqRepayAmountInput);
+    if (!publicKey?.trim().startsWith('aleo1')) {
+      return { disabled: true as const, reason: 'Connect a valid Aleo wallet.' };
+    }
+    if (!Number.isFinite(repayNum) || repayNum <= 0) {
+      return { disabled: true as const, reason: 'Enter repay amount.' };
+    }
+    if (!liqPreview.ok) {
+      return { disabled: true as const, reason: liqPreview.reason ?? 'Preview unavailable.' };
+    }
+    if (!liqPreview.liquidatable) {
+      return { disabled: true as const, reason: 'Position is not liquidatable (debt ≤ liquidation threshold).' };
+    }
+    if ((liqPreview.aleoDebt ?? 0) <= 0) {
+      return { disabled: true as const, reason: 'No ALEO debt to liquidate with this action.' };
+    }
+    const repayMicro = Math.round(repayNum * 1_000_000);
+    const maxCloseMicro = Math.round((liqPreview.maxCloseAleo ?? 0) * 1_000_000);
+    if (repayMicro > maxCloseMicro + LIQ_SUBMIT_SLACK_MICRO) {
+      return {
+        disabled: true as const,
+        reason: `Repay exceeds max close (${(liqPreview.maxCloseAleo ?? 0).toFixed(6)} ALEO).`,
+      };
+    }
+    if (liqUiLimits?.ok) {
+      const effMax = liqUiLimits.effectiveMaxRepayAleo;
+      const effMicro = Math.round(effMax * 1_000_000);
+      if (effMax <= 0 && repayMicro > LIQ_SUBMIT_SLACK_MICRO) {
+        return {
+          disabled: true as const,
+          reason:
+            'No effective max repay (check ALEO debt, close factor, and a single credits.aleo record large enough).',
+        };
+      }
+      if (effMax > 0 && repayMicro > effMicro + LIQ_SUBMIT_SLACK_MICRO) {
+        return {
+          disabled: true as const,
+          reason: `Repay exceeds max (${effMax.toFixed(6)} ALEO) — min(close factor cap, largest single credits record).`,
+        };
+      }
+    }
+    const seizeMicro = Math.round((liqPreview.seizeAmount ?? 0) * 1_000_000);
+    const collMicro = Math.round((liqPreview.collateralSeizeAsset ?? 0) * 1_000_000);
+    if (seizeMicro > collMicro + LIQ_SUBMIT_SLACK_MICRO) {
+      return {
+        disabled: true as const,
+        reason: 'Estimated seize exceeds borrower collateral in the selected asset — lower repay or choose another collateral.',
+      };
+    }
+    return { disabled: false as const, reason: null as string | null };
+  }, [connected, liqLoading, liqPreview, publicKey, liqRepayAmountInput, view, liqUiLimits]);
+
+  const handleLiquidation = async () => {
+    if (!connected || !publicKey || !executeTransaction || !requestRecords) {
+      setLiqStatusMessage('Please connect your wallet.');
+      return;
+    }
+    if (liquidationSubmitGate.disabled) {
+      setLiqStatusMessage(liquidationSubmitGate.reason ?? 'Cannot submit liquidation.');
+      return;
+    }
+    const repay = Number(liqRepayAmountInput);
+    if (!Number.isFinite(repay) || repay <= 0) {
+      setLiqStatusMessage('Enter a valid repay amount.');
+      return;
+    }
+    try {
+      setLiqLoading(true);
+      setLiqStatusMessage('Submitting self-liquidation…');
+      setLiqTxId(null);
+      const tx = await lendingSelfLiquidateDebtCredits(
+        executeTransaction,
+        repay,
+        liqSeizeAsset,
+        publicKey,
+        requestRecords,
+        decrypt,
+      );
+      if (tx === '__CANCELLED__') {
+        setLiqStatusMessage('Transaction cancelled by user.');
+        return;
+      }
+      let finalTxId = tx;
+      let finalized = false;
+      const maxAttempts = 45;
+      const delayMs = 2000;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (!transactionStatus) continue;
+        try {
+          const statusResult = await transactionStatus(tx);
+          const statusText =
+            typeof statusResult === 'string'
+              ? statusResult
+              : (statusResult as { status?: string })?.status ?? '';
+          const statusLower = (statusText || '').toLowerCase();
+          if (statusLower === 'finalized' || statusLower === 'accepted') {
+            finalized = true;
+            const resolvedId =
+              (typeof statusResult === 'object' && (statusResult as { transactionId?: string }).transactionId) || tx;
+            finalTxId = resolvedId;
+            setLiqTxId(isExplorerHash(resolvedId) ? resolvedId : null);
+            break;
+          }
+          if (statusLower === 'rejected' || statusLower === 'failed' || statusLower === 'dropped') {
+            setLiqStatusMessage(`Transaction ${statusLower}.`);
+            return;
+          }
+          setLiqStatusMessage(`Transaction ${statusText || 'pending'}… (${attempt}/${maxAttempts})`);
+        } catch {
+          // continue polling
+        }
+      }
+      if (!finalized) {
+        setLiqStatusMessage('Transaction not finalized in time. Check explorer.');
+        return;
+      }
+      const seizeAssetKey =
+        liqSeizeAsset === '0field' ? 'aleo' : liqSeizeAsset === '1field' ? 'usdc' : 'usad';
+      const seizeOutHuman = liqPreview?.seizeAmount ?? 0;
+      const repayHuman = Number.isFinite(repay) && repay > 0 ? repay : null;
+      if (seizeOutHuman > 0) {
+        await saveTransactionToSupabase(
+          publicKey,
+          finalTxId,
+          'self_liquidate_payout',
+          seizeAssetKey,
+          seizeOutHuman,
+          LENDING_POOL_PROGRAM_ID,
+          null,
+          repayHuman,
+        ).catch(() => { });
+      }
+      fetchTransactionHistory();
+      setLiqStatusMessage('Liquidation finalized. Pool state refreshed.');
+      await Promise.all([refreshPoolState(true), refreshUsdcPoolState(true), refreshUsadPoolState(true)]);
+    } catch (e: unknown) {
+      setLiqStatusMessage(getErrorMessage(e));
+    } finally {
+      setLiqLoading(false);
     }
   };
 
@@ -1884,7 +2943,7 @@ const DashboardPage: NextPageWithLayout = () => {
         const vault = await fetchVaultBalancesHuman();
         if (vault && amountToUse > (vault.usdcx ?? 0)) {
           const max = Math.max(0, vault.usdcx ?? 0);
-          const msg = `Insufficient vault liquidity. You can ${action} at most ${max.toFixed(2)} USDCx right now (vault wallet balance).`;
+          const msg = `Insufficient vault liquidity. You can ${action} at most ${max.toFixed(2)} USDCx right now (treasury wallet). Cross-asset USDCx payouts require USDCx in the vault even when your collateral is only ALEO.`;
           setAmountErrorUsdc(msg);
           setStatusMessage(msg);
           setLoading(false);
@@ -1906,15 +2965,11 @@ const DashboardPage: NextPageWithLayout = () => {
       const maxWithdrawHuman = poolStateLoadedUsdc
         ? Math.min(netSuppliedHuman, availableLiquidityHuman, maxWithdrawUsdcByLtv)
         : Math.min(netSuppliedHuman, maxWithdrawUsdcByLtv);
-      // Withdraw can be satisfied cross-asset on-chain; use the chain-derived cap when available.
-      const chainCapWithdrawUsdcHuman = chainWithdrawCaps
-        ? Number(chainWithdrawCaps.maxWithdrawMicroUsdcx) / 1_000_000
-        : null;
-      const effectiveMaxWithdrawUsdc = chainCapWithdrawUsdcHuman ?? availableWithdrawUsdc;
+      const effectiveMaxWithdrawUsdc = withdrawMaxUsdcUi;
 
       if (action === 'withdraw' && amountToUse > effectiveMaxWithdrawUsdc) {
         const msg = `You can withdraw at most ${effectiveMaxWithdrawUsdc.toFixed(
-          4,
+          2,
         )} USDCx (frontend estimate from on-chain caps). Final limit is enforced on-chain by cross-collateral portfolio checks.`;
         setAmountErrorUsdc(msg);
         setStatusMessage(msg);
@@ -1969,7 +3024,14 @@ const DashboardPage: NextPageWithLayout = () => {
               }
             }
           }
-          tx = await lendingDepositUsdc(executeTransaction, amountToUse, tokenRecord);
+          tx = await lendingDepositUsdc(
+            executeTransaction,
+            amountToUse,
+            tokenRecord,
+            undefined,
+            requestRecords,
+            decrypt,
+          );
           break;
         }
         case 'repay': {
@@ -2004,15 +3066,45 @@ const DashboardPage: NextPageWithLayout = () => {
               }
             }
           }
-          tx = await lendingRepayUsdc(executeTransaction, amountToUse, tokenRecord);
+          tx = await lendingRepayUsdc(
+            executeTransaction,
+            amountToUse,
+            tokenRecord,
+            undefined,
+            requestRecords,
+            decrypt,
+          );
           break;
         }
         case 'withdraw': {
-          tx = await lendingWithdrawUsdc(executeTransaction, amountToUse);
+          if (
+            chainBorrowCaps != null &&
+            chainBorrowCaps.totalDebtUsd > BigInt(0) &&
+            portfolioDebtUsdForRepay < 0.01
+          ) {
+            console.warn(
+              '[USDC withdraw] On-chain debt is sub-cent but non-zero; if the tx fails, accrue interest and repay USDCx dust, then retry.',
+            );
+          }
+          // Cap clamp runs inside lendingWithdrawUsdc using the same LendingPosition as the tx (avoids a
+          // second requestRecords snapshot disagreeing with getLatestLendingPositionRecordInput).
+          tx = await lendingWithdrawUsdc(
+            executeTransaction,
+            amountToUse,
+            publicKey || undefined,
+            requestRecords,
+            decrypt,
+          );
           break;
         }
         case 'borrow': {
-          tx = await lendingBorrowUsdc(executeTransaction, amountToUse);
+          tx = await lendingBorrowUsdc(
+            executeTransaction,
+            amountToUse,
+            publicKey || undefined,
+            requestRecords,
+            decrypt,
+          );
           break;
         }
         default:
@@ -2049,7 +3141,9 @@ const DashboardPage: NextPageWithLayout = () => {
                 action,
                 program: USDC_LENDING_POOL_PROGRAM_ID,
               });
-              setStatusMessage(`Transaction ${statusLower}. Vault transfer was not requested.`);
+              setStatusMessage(
+                `Transaction ${statusLower} on-chain (not a vault step). Try a slightly lower amount, refresh caps, or repay any remaining borrow dust and retry.`,
+              );
               setLoading(false);
               return;
             }
@@ -2191,15 +3285,11 @@ const DashboardPage: NextPageWithLayout = () => {
         ? Math.min(netSuppliedHuman, availableLiquidityHuman, maxWithdrawUsadByLtv)
         : Math.min(netSuppliedHuman, maxWithdrawUsadByLtv);
 
-      // Withdraw can be satisfied cross-asset on-chain; use the chain-derived cap when available.
-      const chainCapWithdrawUsadHuman = chainWithdrawCaps
-        ? Number(chainWithdrawCaps.maxWithdrawMicroUsad) / 1_000_000
-        : null;
-      const effectiveMaxWithdrawUsad = chainCapWithdrawUsadHuman ?? availableWithdrawUsad;
+      const effectiveMaxWithdrawUsad = withdrawMaxUsadUi;
 
       if (action === 'withdraw' && amountToUse > effectiveMaxWithdrawUsad) {
         const msg = `You can withdraw at most ${effectiveMaxWithdrawUsad.toFixed(
-          4,
+          2,
         )} USAD (frontend estimate from on-chain caps). Final limit is enforced on-chain by cross-collateral portfolio checks.`;
         setAmountErrorUsad(msg);
         setStatusMessage(msg);
@@ -2256,7 +3346,15 @@ const DashboardPage: NextPageWithLayout = () => {
               }
             }
           }
-          tx = await lendingDepositUsad(executeTransaction, amountToUse, tokenRecord, undefined, publicKey);
+          tx = await lendingDepositUsad(
+            executeTransaction,
+            amountToUse,
+            tokenRecord,
+            undefined,
+            publicKey,
+            requestRecords,
+            decrypt,
+          );
           break;
         }
 
@@ -2291,17 +3389,37 @@ const DashboardPage: NextPageWithLayout = () => {
               }
             }
           }
-          tx = await lendingRepayUsad(executeTransaction, amountToUse, tokenRecord, undefined, publicKey);
+          tx = await lendingRepayUsad(
+            executeTransaction,
+            amountToUse,
+            tokenRecord,
+            undefined,
+            publicKey,
+            requestRecords,
+            decrypt,
+          );
           break;
         }
 
         case 'withdraw': {
-          tx = await lendingWithdrawUsad(executeTransaction, amountToUse);
+          tx = await lendingWithdrawUsad(
+            executeTransaction,
+            amountToUse,
+            publicKey || undefined,
+            requestRecords,
+            decrypt,
+          );
           break;
         }
 
         case 'borrow': {
-          tx = await lendingBorrowUsad(executeTransaction, amountToUse);
+          tx = await lendingBorrowUsad(
+            executeTransaction,
+            amountToUse,
+            publicKey || undefined,
+            requestRecords,
+            decrypt,
+          );
           break;
         }
 
@@ -2344,7 +3462,9 @@ const DashboardPage: NextPageWithLayout = () => {
                 action,
                 program: USAD_LENDING_POOL_PROGRAM_ID,
               });
-              setStatusMessage(`Transaction ${statusLower}. Vault transfer was not requested.`);
+              setStatusMessage(
+                `Transaction ${statusLower} on-chain (not a vault step). Try a slightly lower amount, refresh caps, or repay any remaining borrow dust and retry.`,
+              );
               setLoading(false);
               return;
             }
@@ -2870,10 +3990,20 @@ const DashboardPage: NextPageWithLayout = () => {
   const repaySuggestedUsadHuman =
     USAD_PRICE_USD > 0 ? portfolioDebtUsdForRepay / USAD_PRICE_USD : 0;
 
+  const hasScaledBorrowDebt =
+    lendingPositionScaled != null &&
+    (lendingPositionScaled.scaledBorNative > BigInt(0) ||
+      lendingPositionScaled.scaledBorUsdcx > BigInt(0) ||
+      lendingPositionScaled.scaledBorUsad > BigInt(0));
+
   const hasAnyDebt =
     chainBorrowCaps != null
       ? chainBorrowCaps.totalDebtUsd > BigInt(0)
-      : borrowDebtAleo > 0 || borrowDebtUsdc > 0 || borrowDebtUsad > 0;
+      : borrowDebtAleo > 0 ||
+        borrowDebtUsdc > 0 ||
+        borrowDebtUsad > 0 ||
+        hasScaledBorrowDebt ||
+        totalDebtUsd > 1e-12;
 
   // Simple loading flags for balances
   const walletBalancesLoading = connected && !userPositionInitialized;
@@ -2889,6 +4019,9 @@ const DashboardPage: NextPageWithLayout = () => {
     totalBorrowedUsdc !== null &&
     totalSuppliedUsad !== null &&
     totalBorrowedUsad !== null;
+
+  /** No private `LendingPosition` yet — show onboarding before portfolio table and stats. */
+  const needsDarkPoolPosition = dashboardDataReady && lendingPositionScaled === null;
   const availableAleo = Math.max(
     0,
     ((Number(totalSupplied) || 0) - (Number(totalBorrowed) || 0)) / 1_000_000,
@@ -2920,11 +4053,9 @@ const DashboardPage: NextPageWithLayout = () => {
   const availableBorrowUsdcUsd = availableBorrowUsdc * USDCX_PRICE_USD;
   const availableBorrowUsadUsd = availableBorrowUsad * USAD_PRICE_USD;
 
-  // Withdraw availability is constrained by BOTH:
-  // - User balance (cannot withdraw more than supplied)
-  // - Pool liquidity (availableAleo/availableUsdc)
-  // - Frontend estimate of collateral safety after withdrawal
-  //   D <= 0.75 * (C - w)  =>  w <= C - D/0.75
+  // Withdraw: chain caps mirror Leo `withdraw` (cross-asset burn ladder + health); treasury caps via `/vault-balances`.
+  // Not gated by “user supplied this payout asset” — collateral is portfolio-wide.
+  // LTV-style local estimates (below) are fallback hints when chain caps are missing.
   const maxWithdrawAleoByLtv = Math.max(0, supplyBalanceAleo - borrowDebtAleo / 0.75);
   const maxWithdrawUsdcByLtv = Math.max(0, supplyBalanceUsdc - borrowDebtUsdc / 0.75);
   const maxWithdrawUsadByLtv = Math.max(0, supplyBalanceUsad - borrowDebtUsad / 0.75);
@@ -2934,31 +4065,82 @@ const DashboardPage: NextPageWithLayout = () => {
   // not LTV-weighted collateral — so with zero debt the max withdraw USD ≈ totalCollateralUsd,
   // not borrowable (weightedCollateralUsd - totalDebtUsd). Using borrow headroom here made
   // withdraw MAX match "Borrowable (USD)" incorrectly.
+  // Mirror on-chain withdraw: with any debt (including sub-cent dust), health uses weighted collateral vs raw debt USD.
+  // Do not treat as "zero debt" when scaled bor is non-zero but float debt rounds to 0 — that overstated max cross-asset withdraw.
   const withdrawUsdFallback =
-    !hasAnyDebt || totalDebtUsd < 1e-9
+    !hasAnyDebt || (totalDebtUsd < 1e-9 && !hasScaledBorrowDebt)
       ? Math.max(0, totalCollateralUsd)
       : Math.max(0, weightedCollateralUsd - totalDebtUsd);
   // Cross-asset withdraw caps must come from the chain (mirrors `finalize_withdraw`).
   const availableWithdrawAleo = chainWithdrawCaps
-    ? Math.max(0, Number(chainWithdrawCaps.maxWithdrawMicroAleo) / 1_000_000)
+    ? Math.max(
+        0,
+        Number(
+          floorTokenMicroToDisplayDecimals(
+            chainWithdrawCaps.maxWithdrawMicroAleo,
+            WITHDRAW_MAX_DISPLAY_DECIMALS,
+          ),
+        ) / 1_000_000,
+      )
     : ALEO_PRICE_USD > 0 ? withdrawUsdFallback / ALEO_PRICE_USD : 0;
   const availableWithdrawUsdc = chainWithdrawCaps
-    ? Math.max(0, Number(chainWithdrawCaps.maxWithdrawMicroUsdcx) / 1_000_000)
+    ? Math.max(
+        0,
+        Number(
+          floorTokenMicroToDisplayDecimals(
+            chainWithdrawCaps.maxWithdrawMicroUsdcx,
+            WITHDRAW_MAX_DISPLAY_DECIMALS,
+          ),
+        ) / 1_000_000,
+      )
     : USDCX_PRICE_USD > 0 ? withdrawUsdFallback / USDCX_PRICE_USD : 0;
   const availableWithdrawUsad = chainWithdrawCaps
-    ? Math.max(0, Number(chainWithdrawCaps.maxWithdrawMicroUsad) / 1_000_000)
+    ? Math.max(
+        0,
+        Number(
+          floorTokenMicroToDisplayDecimals(
+            chainWithdrawCaps.maxWithdrawMicroUsad,
+            WITHDRAW_MAX_DISPLAY_DECIMALS,
+          ),
+        ) / 1_000_000,
+      )
     : USAD_PRICE_USD > 0 ? withdrawUsdFallback / USAD_PRICE_USD : 0;
 
   const availableWithdrawAleoUsd = availableWithdrawAleo * ALEO_PRICE_USD;
   const availableWithdrawUsdcUsd = availableWithdrawUsdc * USDCX_PRICE_USD;
   const availableWithdrawUsadUsd = availableWithdrawUsad * USAD_PRICE_USD;
 
-  // Cross-asset UX: shared USD budget for withdraw hints. Per-asset caps should represent the same
-  // max withdraw_usd; use max() so integer rounding does not under-report vs min().
+  /** True when effective ALEO withdraw &lt; portfolio-derived max (treasury, mapping fallback, or liquidity). */
+  const aleoWithdrawCappedByPoolLiquidity =
+    chainWithdrawCaps != null &&
+    chainWithdrawCaps.maxWithdrawMicroAleoPortfolio > chainWithdrawCaps.maxWithdrawMicroAleo;
+
+  // Cross-asset UX: shared USD from floored per-asset withdraw caps (2 dp; matches single-note tx path).
   const portfolioWithdrawUsd =
     chainWithdrawCaps != null
       ? Math.max(availableWithdrawAleoUsd, availableWithdrawUsdcUsd, availableWithdrawUsadUsd)
       : withdrawUsdFallback;
+
+  /**
+   * One `withdraw` tx spends a **single** `LendingPosition` record. `getAggregatedCrossCollateralWithdrawCapsFromWallet`
+   * now composes caps from the **best note per payout asset** (same as `lendingWithdraw*`), not `max()` across mismatched notes.
+   */
+  const withdrawMaxUsdBudget = portfolioWithdrawUsd;
+  const withdrawMaxAleoUi = chainWithdrawCaps
+    ? availableWithdrawAleo
+    : borrowMaxInputAmount(
+        ALEO_PRICE_USD > 0 ? withdrawUsdFallback / ALEO_PRICE_USD : availableWithdrawAleo,
+      );
+  const withdrawMaxUsdcUi = chainWithdrawCaps
+    ? availableWithdrawUsdc
+    : borrowMaxInputAmount(
+        USDCX_PRICE_USD > 0 ? withdrawUsdFallback / USDCX_PRICE_USD : availableWithdrawUsdc,
+      );
+  const withdrawMaxUsadUi = chainWithdrawCaps
+    ? availableWithdrawUsad
+    : borrowMaxInputAmount(
+        USAD_PRICE_USD > 0 ? withdrawUsdFallback / USAD_PRICE_USD : availableWithdrawUsad,
+  );
 
   const modalAmount = (() => {
     const n = Number(modalAmountInput);
@@ -3024,10 +4206,10 @@ const DashboardPage: NextPageWithLayout = () => {
       ? privateBalanceModal
       : actionModalMode === 'withdraw'
         ? actionModalAsset === 'aleo'
-          ? availableWithdrawAleo
+          ? withdrawMaxAleoUi
           : actionModalAsset === 'usdc'
-            ? availableWithdrawUsdc
-            : availableWithdrawUsad
+            ? withdrawMaxUsdcUi
+            : withdrawMaxUsadUi
         : actionModalMode === 'repay'
           ? Math.min(privateBalanceModal, repaySuggestedModalHuman)
         : actionModalMode === 'borrow'
@@ -3121,8 +4303,13 @@ const DashboardPage: NextPageWithLayout = () => {
     const assetSymbol = assetKey === 'aleo' ? 'ALEO' : assetKey === 'usdc' ? 'USDCx' : 'USAD';
     const selectedPriceUsd = assetKey === 'aleo' ? ALEO_PRICE_USD : assetKey === 'usdc' ? USDCX_PRICE_USD : USAD_PRICE_USD;
 
-    // Withdraw uses a shared USD budget across output-asset rows (UX matches the modal's "~$" behavior).
-    const modalMaxWithdraw = selectedPriceUsd > 0 ? portfolioWithdrawUsd / selectedPriceUsd : 0;
+    // Withdraw: per-asset UI max (2 dp), same as modal / `getInlineMaxAmount('Withdraw', ...)`.
+    const modalMaxWithdraw =
+      assetKey === 'aleo'
+        ? withdrawMaxAleoUi
+        : assetKey === 'usdc'
+          ? withdrawMaxUsdcUi
+          : withdrawMaxUsadUi;
     const selectedDebt = assetKey === 'aleo' ? borrowDebtAleo : assetKey === 'usdc' ? borrowDebtUsdc : borrowDebtUsad;
     const selectedSupply =
       assetKey === 'aleo' ? supplyBalanceAleo : assetKey === 'usdc' ? supplyBalanceUsdc : supplyBalanceUsad;
@@ -3233,16 +4420,10 @@ const DashboardPage: NextPageWithLayout = () => {
             : (privateUsadBalance ?? 0);
       case 'Withdraw':
         return assetKey === 'aleo'
-          ? ALEO_PRICE_USD > 0
-            ? portfolioWithdrawUsd / ALEO_PRICE_USD
-            : 0
+          ? withdrawMaxAleoUi
           : assetKey === 'usdc'
-            ? USDCX_PRICE_USD > 0
-              ? portfolioWithdrawUsd / USDCX_PRICE_USD
-              : 0
-            : USAD_PRICE_USD > 0
-              ? portfolioWithdrawUsd / USAD_PRICE_USD
-              : 0;
+            ? withdrawMaxUsdcUi
+            : withdrawMaxUsadUi;
       case 'Borrow':
         return assetKey === 'aleo'
           ? availableBorrowAleo
@@ -3413,21 +4594,7 @@ const DashboardPage: NextPageWithLayout = () => {
     collateralUsdUsad,
   ]);
 
-  if (view === 'flash') {
-    // Flash page intentionally hidden.
-    return null;
-  }
-
-  if (view === 'markets') {
-    return <MarketsView />;
-  }
-
-  if (view === 'docs') {
-    // Reuse the docs page content inside the dashboard layout so wallet state is shared
-    return <DocsPage />;
-  }
-
-  // Inject dashboard dark styles
+  // Inject dashboard dark styles — must run on every render path (before any view early return).
   useEffect(() => {
     const style = document.createElement('style');
     style.textContent = `
@@ -3448,8 +4615,977 @@ const DashboardPage: NextPageWithLayout = () => {
       }
     `;
     document.head.appendChild(style);
-    return () => { document.head.removeChild(style); };
+    return () => {
+      document.head.removeChild(style);
+    };
   }, []);
+
+  if (view === 'flash') {
+    const principal = Number(flashAmountInput || '0');
+    const principalMicro = Math.max(0, Math.round((Number.isFinite(principal) ? principal : 0) * 1_000_000));
+    const flashFeeMicroPreview = aleoFlashFeeMicro(principalMicro);
+    const flashTotalPreview = (principalMicro + flashFeeMicroPreview) / 1_000_000;
+    const flashUnitLabel = flashAsset === '0field' ? 'ALEO' : flashAsset === '1field' ? 'USDCx' : 'USAD';
+    const flashSettleUnitLabel =
+      flashSettleAsset === '0field' ? 'ALEO' : flashSettleAsset === '1field' ? 'USDCx' : 'USAD';
+    const availHuman =
+      flashAvailLiquidityMicro != null ? (Number(flashAvailLiquidityMicro) / 1_000_000).toFixed(6) : null;
+    const minProfitNum = Number(flashMinProfitInput || '0');
+    const openPrincipalError =
+      !Number.isFinite(principal) || principal <= 0
+        ? 'Enter a principal amount greater than 0.'
+        : flashAvailLiquidityMicro != null && BigInt(principalMicro) > flashAvailLiquidityMicro
+          ? `Principal is higher than available liquidity (${(Number(flashAvailLiquidityMicro) / 1_000_000).toFixed(6)} ${flashUnitLabel}).`
+          : null;
+    const openMinProfitError =
+      !Number.isFinite(minProfitNum) || minProfitNum < 0 ? 'Min profit must be 0 or higher.' : null;
+    const activeSettleSession = flashSessionId
+      ? flashSessions.find((s) => s.id === flashSessionId)
+      : [...flashSessions]
+          .filter((s) => !FLASH_SESSION_TERMINAL_STATUSES.has(String(s.status || '').toLowerCase()))
+          .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+    const settleAid = String(activeSettleSession?.asset_id || flashSettleAsset);
+    const settleUnitLabel =
+      settleAid === '0field' ? 'ALEO' : settleAid === '1field' ? 'USDCx' : settleAid === '2field' ? 'USAD' : flashSettleUnitLabel;
+    const settleExpectedMicro = (() => {
+      if (!activeSettleSession) return null;
+      const explicit = Number(activeSettleSession.expected_repay_micro ?? 0);
+      if (Number.isFinite(explicit) && explicit > 0) return Math.round(explicit);
+      const p = Math.round(Number(activeSettleSession.principal_micro || 0));
+      const m = Math.round(Number(activeSettleSession.min_profit_micro || 0));
+      if (!Number.isFinite(p) || p <= 0) return null;
+      return p + aleoFlashFeeMicro(p) + (Number.isFinite(m) && m > 0 ? m : 0);
+    })();
+    const repayNum = Number(flashRepayInput || '0');
+    const repayMicro = Math.round((Number.isFinite(repayNum) ? repayNum : 0) * 1_000_000);
+    const settleRepayError =
+      !flashRepayInput.trim()
+        ? null
+        : !Number.isFinite(repayNum) || repayNum <= 0
+          ? 'Enter a repay amount greater than 0.'
+          : settleExpectedMicro != null && repayMicro < settleExpectedMicro
+            ? `Repay amount is below expected minimum (${(settleExpectedMicro / 1_000_000).toFixed(6)} ${settleUnitLabel}).`
+            : null;
+    return (
+      <div className="max-w-[1440px] mx-auto w-full px-4 sm:px-8 pt-8 pb-20">
+        <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-gradient-to-br from-[#0a1324] via-[#0b1220] to-[#121a32] p-5 sm:p-8 mb-6">
+          <div className="pointer-events-none absolute -top-24 -right-20 h-72 w-72 rounded-full bg-cyan-500/20 blur-3xl" />
+          <div className="pointer-events-none absolute -bottom-24 -left-20 h-72 w-72 rounded-full bg-indigo-500/20 blur-3xl" />
+          <div className="relative">
+            <p className="text-[11px] uppercase tracking-[0.2em] text-cyan-300/80 mb-2">Liquidity Strategy</p>
+            <h1 className="text-3xl sm:text-5xl font-semibold text-white leading-tight">Flash Loan</h1>
+            <div className="mt-3 w-full space-y-1.5 text-sm text-slate-300/90">
+              <p>Take a short-term loan, run your action, and pay it back in the same flow.</p>
+              <p className="text-slate-400">- Pick an asset and open a flash loan session.</p>
+              <p className="text-slate-400">- You can borrow only up to the amount currently available in the pool.</p>
+              <p className="text-slate-400">- Your wallet gets funded from the vault with that same asset.</p>
+              <p className="text-slate-400">- Repay the amount plus fee (and your chosen minimum profit target).</p>
+              <p className="text-slate-400">- If you do not settle the current session successfully, it stays active and you cannot open the next flash loan session.</p>
+            </div>
+          </div>
+        </div>
+        {!connected && (connecting || !allowShowConnectCTA) && (
+          <div className="rounded-[32px] p-20 flex flex-col items-center justify-center text-center mb-6 border border-white/10 bg-slate-900/60">
+            <span className="loading loading-spinner loading-lg text-cyan-400 mb-4" />
+            <p className="text-sm text-slate-400">Loading wallet…</p>
+          </div>
+        )}
+
+        {!connected && !connecting && allowShowConnectCTA && (
+          <div className="rounded-[32px] p-20 flex flex-col items-center justify-center text-center mb-6 border border-white/10 bg-slate-900/60 relative overflow-hidden">
+            <div
+              className="absolute inset-0 pointer-events-none"
+              style={{ background: 'radial-gradient(circle at center, rgba(6,182,212,0.05) 0%, transparent 70%)' }}
+            />
+            <div className="relative z-10 flex w-full max-w-lg flex-col items-center">
+              <h2 className="text-2xl font-bold mb-3 text-white">Please, connect your wallet</h2>
+              <p className="text-slate-400 max-w-md mx-auto mb-10">
+                Connect your Aleo wallet to open and settle flash loan sessions.
+              </p>
+              <div className="w-full flex justify-center">
+                <WalletModalButton
+                  disabled={connecting}
+                  className="!m-0 !min-h-0 !h-auto !rounded-xl !border !border-white/10 !bg-[#0B1221] !px-6 !py-2 !text-sm !font-semibold !text-white !shadow-none hover:!border-white/20 hover:!bg-[#111827] disabled:!cursor-wait disabled:!opacity-60"
+                  style={{ fontFamily: "'Space Grotesk', sans-serif" }}
+                >
+                  {connecting ? 'Connecting...' : 'Connect'}
+                </WalletModalButton>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {connected && !dashboardDataReady && (
+          <div className="space-y-6 animate-pulse mb-6">
+            <div className="rounded-2xl border border-white/10 bg-slate-900/60 p-6">
+              <div className="h-4 w-40 rounded mb-4 bg-white/10" />
+              <div className="h-3 w-full rounded mb-2 bg-white/10" />
+              <div className="h-3 w-5/6 rounded bg-white/10" />
+            </div>
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+              <div className="rounded-2xl border border-white/10 bg-slate-900/60 p-6">
+                <div className="h-4 w-36 rounded mb-4 bg-white/10" />
+                <div className="space-y-3">
+                  <div className="h-10 rounded-xl bg-white/10" />
+                  <div className="h-10 rounded-xl bg-white/10" />
+                  <div className="h-10 rounded-xl bg-white/10" />
+                </div>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-slate-900/60 p-6">
+                <div className="h-4 w-36 rounded mb-4 bg-white/10" />
+                <div className="space-y-3">
+                  <div className="h-10 rounded-xl bg-white/10" />
+                  <div className="h-10 rounded-xl bg-white/10" />
+                  <div className="h-10 rounded-xl bg-white/10" />
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {connected && dashboardDataReady && (
+        <div className="grid grid-cols-1 gap-6">
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+            <div className="rounded-2xl p-5 border border-white/10 bg-slate-900/60">
+              <h2 className="text-lg font-semibold text-white mb-3">Open Flash Session</h2>
+              <p className="text-xs text-slate-400 mb-4">
+                Reserve pool liquidity for a selected asset and start your flash session. Fee model:{' '}
+                {ALEO_FLASH_PREMIUM_BPS} bps of principal.
+              </p>
+              <div className="space-y-3">
+                <label className="block text-xs text-slate-500 uppercase tracking-wide">Asset</label>
+                <select
+                  value={flashAsset}
+                  onChange={(e) => setFlashAsset(e.target.value as FlashLendingAssetId)}
+                  disabled={flashLoading}
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                >
+                  <option value="0field">ALEO (credits)</option>
+                  <option value="1field">USDCx</option>
+                  <option value="2field">USAD</option>
+                </select>
+                {availHuman != null && (
+                  <div className="text-xs text-slate-400">
+                    On-chain available liquidity: <span className="text-slate-200 font-mono">{availHuman}</span>{' '}
+                    {flashUnitLabel}
+                  </div>
+                )}
+                <input
+                  type="text"
+                  value={flashStrategyIdInput}
+                  onChange={(e) => setFlashStrategyIdInput(e.target.value)}
+                  placeholder="Strategy id (e.g. 1field)"
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                />
+                <input
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={flashAmountInput}
+                  onChange={(e) => setFlashAmountInput(e.target.value)}
+                  placeholder={`Principal (${flashUnitLabel})`}
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                />
+                {flashOpenAttempted && openPrincipalError && <p className="text-xs text-rose-300">{openPrincipalError}</p>}
+                <p className="text-[11px] text-slate-500">
+                  Principal = the amount you want to borrow for this flash loan.
+                </p>
+                <input
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={flashMinProfitInput}
+                  onChange={(e) => setFlashMinProfitInput(e.target.value)}
+                  placeholder={`Min profit (${flashUnitLabel})`}
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                />
+                {flashOpenAttempted && openMinProfitError && <p className="text-xs text-rose-300">{openMinProfitError}</p>}
+                <p className="text-[11px] text-slate-500">
+                  Min profit = the minimum extra amount you want to keep after repaying loan + fee.
+                </p>
+                <div className="text-xs text-slate-400">
+                  Fee: {(flashFeeMicroPreview / 1_000_000).toFixed(6)} {flashUnitLabel} | Min repay hint:{' '}
+                  {flashTotalPreview.toFixed(6)} {flashUnitLabel} (principal + fee; plus min profit on-chain)
+                </div>
+                <button
+                  type="button"
+                  disabled={flashLoading}
+                  onClick={handleFlashLoan}
+                  className="w-full rounded-xl bg-cyan-500/20 border border-cyan-400/30 px-3 py-2 text-cyan-300 disabled:opacity-50"
+                >
+                  {flashLoading ? 'Submitting…' : 'Open Flash Session'}
+                </button>
+              </div>
+            </div>
+
+            <div className="rounded-2xl p-5 border border-white/10 bg-slate-900/60">
+              <h2 className="text-lg font-semibold text-white mb-3">Settle Flash Session</h2>
+              <p className="text-xs text-slate-400 mb-4">
+                Repay and finalize an active funded session. If a funded session is found, its asset is used automatically.
+              </p>
+              <div className="space-y-3">
+                <label className="block text-xs text-slate-500 uppercase tracking-wide">Settle Asset (fallback)</label>
+                <select
+                  value={flashSettleAsset}
+                  onChange={(e) => setFlashSettleAsset(e.target.value as FlashLendingAssetId)}
+                  disabled={flashLoading}
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                >
+                  <option value="0field">ALEO (credits)</option>
+                  <option value="1field">USDCx</option>
+                  <option value="2field">USAD</option>
+                </select>
+                <input
+                  type="text"
+                  value={flashStrategyIdInput}
+                  onChange={(e) => setFlashStrategyIdInput(e.target.value)}
+                  placeholder="Strategy id (e.g. 1field)"
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                />
+                <input
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={flashRepayInput}
+                  onChange={(e) => setFlashRepayInput(e.target.value)}
+                  placeholder={`Repay Amount (e.g. 1 = 1 ${flashSettleUnitLabel})`}
+                  className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-white outline-none"
+                />
+                {settleRepayError && <p className="text-xs text-rose-300">{settleRepayError}</p>}
+                <p className="text-[11px] text-slate-500">
+                  Repay amount = how much you are paying back to close this flash session.
+                </p>
+                <p className="text-[11px] text-slate-500">
+                  If a live session is found, we use that session&apos;s asset automatically. Otherwise, we use the settle asset you selected.
+                </p>
+                <button
+                  type="button"
+                  disabled={flashLoading}
+                  onClick={handleFlashSettle}
+                  className="w-full rounded-xl bg-emerald-500/20 border border-emerald-400/30 px-3 py-2 text-emerald-300 disabled:opacity-50"
+                >
+                  {flashLoading ? 'Submitting…' : 'Submit flash settle'}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-2xl p-5 border border-white/10 bg-slate-900/60">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-3">
+              <h2 className="text-lg font-semibold text-white">Flash Loan History</h2>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="inline-flex rounded-lg border border-white/10 bg-black/20 p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setFlashHistoryFilter('all')}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
+                      flashHistoryFilter === 'all'
+                        ? 'bg-white/15 text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFlashHistoryFilter('active')}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
+                      flashHistoryFilter === 'active'
+                        ? 'bg-white/15 text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Active only
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void fetchFlashSessions()}
+                  disabled={flashSessionsLoading || !address}
+                  className="px-3 py-1.5 rounded-lg text-xs font-mono text-slate-300 border border-white/10 bg-white/5 disabled:opacity-50"
+                >
+                  {flashSessionsLoading ? 'Loading...' : 'REFRESH'}
+                </button>
+              </div>
+            </div>
+            {flashSessionsLoading ? (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[980px] text-left">
+                  <thead>
+                    <tr className="text-xs uppercase tracking-wider text-slate-400 border-b border-white/10">
+                      <th className="py-2 pr-4">Status</th>
+                      <th className="py-2 pr-4">Asset</th>
+                      <th className="py-2 pr-4">Principal</th>
+                      <th className="py-2 pr-4">Min Profit</th>
+                      <th className="py-2 pr-4">Strategy</th>
+                      <th className="py-2 pr-4">Open</th>
+                      <th className="py-2 pr-4">Fund</th>
+                      <th className="py-2 pr-4">Settle</th>
+                      <th className="py-2 pr-4">Created</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[0, 1, 2].map((i) => (
+                      <tr key={i} className="border-b border-white/5">
+                        <td className="py-3 pr-4"><div className="h-6 w-24 rounded bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-7 w-24 rounded-full bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-4 w-24 rounded bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-4 w-24 rounded bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-4 w-24 rounded bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-6 w-16 rounded-lg bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-6 w-16 rounded-lg bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-6 w-16 rounded-lg bg-white/10 animate-pulse" /></td>
+                        <td className="py-3 pr-4"><div className="h-4 w-40 rounded bg-white/10 animate-pulse" /></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : flashSessionsError ? (
+              <div className="text-sm text-amber-300">{flashSessionsError}</div>
+            ) : flashSessions.length === 0 ? (
+              <div className="text-sm text-slate-500">No flash sessions found.</div>
+            ) : displayedFlashSessions.length === 0 ? (
+              <div className="text-sm text-slate-500">
+                No active flash sessions. Switch to &quot;All&quot; to see completed or expired sessions.
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[980px] text-left">
+                  <thead>
+                    <tr className="text-xs uppercase tracking-wider text-slate-400 border-b border-white/10">
+                      <th className="py-2 pr-4">Status</th>
+                      <th className="py-2 pr-4">Asset</th>
+                      <th className="py-2 pr-4">Principal</th>
+                      <th className="py-2 pr-4">Min Profit</th>
+                      <th className="py-2 pr-4">Strategy</th>
+                      <th className="py-2 pr-4">Open</th>
+                      <th className="py-2 pr-4">Fund</th>
+                      <th className="py-2 pr-4">Settle</th>
+                      <th className="py-2 pr-4">Created</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {displayedFlashSessions.map((s) => (
+                      <tr key={s.id} className="border-b border-white/5 text-sm text-slate-300">
+                        <td className="py-3 pr-4">
+                          <StatusChip {...flashSessionStatusChipProps(s.status)} />
+                        </td>
+                        <td className="py-3 pr-4">
+                          {s.asset_id === '0field' ? (
+                            <AssetBadge asset="ALEO" compact />
+                          ) : s.asset_id === '1field' ? (
+                            <AssetBadge asset="USDCx" compact />
+                          ) : s.asset_id === '2field' ? (
+                            <AssetBadge asset="USAD" compact />
+                          ) : (
+                            <span>{s.asset_id}</span>
+                          )}
+                        </td>
+                        <td className="py-3 pr-4 font-mono">{(Number(s.principal_micro || 0) / 1_000_000).toFixed(6)}</td>
+                        <td className="py-3 pr-4 font-mono">{(Number(s.min_profit_micro || 0) / 1_000_000).toFixed(6)}</td>
+                        <td className="py-3 pr-4 font-mono">{s.strategy_id_field}</td>
+                        <td className="py-3 pr-4">
+                          {s.flash_open_tx_id ? (
+                            <a
+                              href={getProvableExplorerTxUrl(s.flash_open_tx_id)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/[0.07] px-2 py-1 text-[11px] font-semibold tracking-wide text-cyan-300 hover:bg-cyan-500/15 transition-colors"
+                            >
+                              Open Tx
+                            </a>
+                          ) : '--'}
+                        </td>
+                        <td className="py-3 pr-4">
+                          {s.vault_fund_tx_id ? (
+                            <a
+                              href={getProvableExplorerTxUrl(s.vault_fund_tx_id)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/[0.07] px-2 py-1 text-[11px] font-semibold tracking-wide text-emerald-300 hover:bg-emerald-500/15 transition-colors"
+                            >
+                              Fund Tx
+                            </a>
+                          ) : '--'}
+                        </td>
+                        <td className="py-3 pr-4">
+                          {s.flash_settle_tx_id ? (
+                            <a
+                              href={getProvableExplorerTxUrl(s.flash_settle_tx_id)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-500/40 bg-indigo-500/[0.07] px-2 py-1 text-[11px] font-semibold tracking-wide text-indigo-300 hover:bg-indigo-500/15 transition-colors"
+                            >
+                              Settle Tx
+                            </a>
+                          ) : '--'}
+                        </td>
+                        <td className="py-3 pr-4">{new Date(s.created_at).toLocaleString()}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+        </div>
+        )}
+        {SHOW_SPRINT2_MIGRATION_UI && (
+          <div className="mt-8 rounded-2xl p-5 border border-violet-500/25 bg-slate-900/60">
+            <h2 className="text-lg font-semibold text-white mb-1">Sprint 2 — Private record migration (skeleton)</h2>
+            <p className="text-xs text-slate-400 mb-4">
+              Mints a <span className="font-mono text-violet-300">PositionNote</span> and sets on-chain{' '}
+              <span className="font-mono text-violet-300">position_note_schema</span>. Requires a pool deployment that
+              includes <span className="font-mono">mint_position_migration_note</span>. Does not move collateral or debt.
+            </p>
+            <div className="text-xs text-slate-300 space-y-2 mb-4">
+              <div>
+                <span className="text-slate-500">On-chain flag: </span>
+                {describeOnChainSchemaVersion(chainPositionNoteSchema)}
+              </div>
+              {migrationRecSummary && (
+                <div>
+                  <span className="text-slate-500">Wallet records (heuristic): </span>
+                  UserActivity-like {migrationRecSummary.userActivityLikeCount}, PositionNote-like{' '}
+                  {migrationRecSummary.positionNoteLikeCount}
+                </div>
+              )}
+            </div>
+            <button
+              type="button"
+              disabled={
+                posNoteLoading ||
+                !connected ||
+                chainPositionNoteSchema === POSITION_NOTE_SCHEMA_ON_CHAIN_V2
+              }
+              onClick={handleMintPositionMigrationNote}
+              className="rounded-xl bg-violet-500/20 border border-violet-400/30 px-4 py-2 text-violet-200 text-sm disabled:opacity-50"
+            >
+              {posNoteLoading ? 'Submitting…' : 'Mint PositionNote (migration skeleton)'}
+            </button>
+            {posNoteStatus && <div className="text-sm text-slate-300 mt-3">{posNoteStatus}</div>}
+            {posNoteTxId && (
+              <a
+                href={getProvableExplorerTxUrl(posNoteTxId)}
+                target="_blank"
+                rel="noreferrer"
+                className="text-cyan-400 text-xs underline mt-2 inline-block"
+              >
+                View migration tx
+              </a>
+            )}
+          </div>
+        )}
+
+        {flashTxModalOpen && (
+          <div className="fixed inset-0 z-[130] flex items-center justify-center p-4">
+            <div
+              className="absolute inset-0"
+              style={{ backgroundColor: 'rgba(0,0,0,0.7)' }}
+              onClick={() => {
+                if (!flashLoading) setFlashTxModalOpen(false);
+              }}
+            />
+            <div
+              className="relative rounded-[24px] p-8 w-full max-w-md"
+              style={{
+                background: 'linear-gradient(145deg, rgba(15,23,42,0.4) 0%, rgba(3,7,18,0.6) 100%)',
+                backdropFilter: 'blur(16px)',
+                WebkitBackdropFilter: 'blur(16px)',
+                border: '1px solid rgba(255,255,255,0.05)',
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              {!flashLoading && (
+                <button
+                  type="button"
+                  onClick={() => setFlashTxModalOpen(false)}
+                  className="absolute top-5 right-5 w-8 h-8 rounded-lg flex items-center justify-center hover:bg-white/10 transition-colors text-slate-400 text-lg"
+                  aria-label="Close flash transaction status"
+                >
+                  ×
+                </button>
+              )}
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-xl font-bold text-white">
+                  {flashTxModalKind === 'open' ? 'Open Flash Session' : 'Settle Flash Session'}
+                </h2>
+              </div>
+              <div className="space-y-4">
+                {flashLoading ? (
+                  <div className="flex flex-col items-center justify-center py-8 gap-3">
+                    <span className="loading loading-spinner loading-lg text-cyan-400" />
+                    <p className="text-sm text-slate-400">
+                      {flashStatusMessage || 'Processing…'}
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    {flashStatusMessage && <div className="text-sm text-slate-300">{flashStatusMessage}</div>}
+                    {flashTxId && (
+                      <a
+                        href={getProvableExplorerTxUrl(flashTxId)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-cyan-400 text-sm underline block"
+                      >
+                        View Flash Tx
+                      </a>
+                    )}
+                    {flashVaultTxId && (
+                      <a
+                        href={getProvableExplorerTxUrl(flashVaultTxId)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-emerald-400 text-sm underline block mt-1"
+                      >
+                        View Vault Funding Tx
+                      </a>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (view === 'liquidation') {
+    const formatLiqAmount = (value: number) => {
+      if (!Number.isFinite(value) || value <= 0) return '--';
+      return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 });
+    };
+    const payoutSymbol = liqSeizeAsset === '0field' ? 'ALEO' : liqSeizeAsset === '1field' ? 'USDCx' : 'USAD';
+    const enteredRepay = Number(liqRepayAmountInput);
+    const enteredRepayDisplay = Number.isFinite(enteredRepay) && enteredRepay > 0 ? enteredRepay : 0;
+    const effectiveMaxRepay = liqUiLimits?.ok ? liqUiLimits.effectiveMaxRepayAleo : 0;
+    const canSelfLiquidateNow = !!(liqPreview.ok && liqPreview.liquidatable);
+    const liquidationHistory = txHistory.filter((row) => {
+      const t = String(row.type || '').toLowerCase();
+      return t === 'liquidation' || t === 'self_liquidate_payout';
+    });
+    return (
+      <div className="max-w-[1440px] mx-auto w-full px-4 sm:px-8 pt-8 pb-20">
+        <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-gradient-to-br from-[#0a1324] via-[#0b1220] to-[#121a32] p-5 sm:p-8 mb-6">
+          <div className="pointer-events-none absolute -top-24 -right-20 h-72 w-72 rounded-full bg-cyan-500/20 blur-3xl" />
+          <div className="pointer-events-none absolute -bottom-24 -left-20 h-72 w-72 rounded-full bg-indigo-500/20 blur-3xl" />
+          <div className="relative">
+            <p className="text-[11px] uppercase tracking-[0.2em] text-cyan-300/80 mb-2">Risk Management</p>
+            <h1 className="text-3xl sm:text-5xl font-semibold text-white leading-tight">Self Liquidation</h1>
+            <div className="mt-3 w-full space-y-1.5 text-sm text-slate-300/90">
+              <p>Repay part of your ALEO loan and get one asset back as payout.</p>
+              <p className="text-slate-400">- Self liquidation is available only when your Health Factor drops below 1 (liquidation zone).</p>
+              <p className="text-slate-400">- Per transaction limit: up to 50% of current ALEO debt (and within one spendable credits note).</p>
+              <p className="text-slate-400">- Enter amount, select payout asset, check estimate, then confirm.</p>
+            </div>
+          </div>
+        </div>
+
+        {!connected && (connecting || !allowShowConnectCTA) && (
+          <div className="rounded-[32px] px-6 py-14 sm:p-20 flex flex-col items-center justify-center text-center border border-white/10 bg-slate-900/60">
+            <span className="loading loading-spinner loading-lg text-cyan-400 mb-4" />
+            <p className="text-sm text-slate-400">Loading wallet...</p>
+          </div>
+        )}
+
+        {!connected && !connecting && allowShowConnectCTA && (
+          <div className="rounded-[32px] px-6 py-14 sm:p-20 flex flex-col items-center justify-center text-center border border-white/10 bg-slate-900/60 relative overflow-hidden">
+            <div
+              className="absolute inset-0 pointer-events-none"
+              style={{ background: 'radial-gradient(circle at center, rgba(6,182,212,0.05) 0%, transparent 70%)' }}
+            />
+            <div className="relative z-10 flex w-full max-w-lg flex-col items-center">
+              <h2 className="text-2xl font-bold mb-3 text-white">Please, connect your wallet</h2>
+              <p className="text-slate-400 max-w-md mx-auto mb-10">
+                Connect your Aleo wallet to view liquidation preview and submit self liquidation.
+              </p>
+              <div className="w-full flex justify-center">
+                <WalletModalButton
+                  disabled={connecting}
+                  className="!m-0 !min-h-0 !h-auto !rounded-xl !border !border-white/10 !bg-[#0B1221] !px-6 !py-2 !text-sm !font-semibold !text-white !shadow-none hover:!border-white/20 hover:!bg-[#111827] disabled:!cursor-wait disabled:!opacity-60"
+                  style={{ fontFamily: "'Space Grotesk', sans-serif" }}
+                >
+                  {connecting ? 'Connecting...' : 'Connect'}
+                </WalletModalButton>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {connected && !dashboardDataReady && (
+          <div className="grid grid-cols-1 xl:grid-cols-[1.35fr_1fr] gap-6 animate-pulse">
+            <div className="rounded-3xl border border-white/10 bg-slate-900/60 p-5 sm:p-6">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-5">
+                {[0, 1].map((i) => (
+                  <div key={i} className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+                    <div className="h-3 w-24 rounded mb-3 bg-white/10" />
+                    <div className="h-5 w-36 rounded bg-white/10" />
+                  </div>
+                ))}
+              </div>
+              <div className="space-y-3">
+                <div className="h-4 w-48 rounded bg-white/10" />
+                <div className="h-12 rounded-2xl bg-white/10" />
+                <div className="h-12 rounded-2xl bg-white/10" />
+                <div className="h-4 w-40 rounded bg-white/10" />
+                <div className="h-12 rounded-2xl bg-white/10" />
+              </div>
+            </div>
+            <div className="rounded-3xl border border-white/10 bg-slate-900/60 p-5 sm:p-6">
+              <div className="h-16 rounded-2xl bg-white/10 mb-4" />
+              <div className="space-y-3">
+                <div className="h-20 rounded-2xl bg-white/10" />
+                <div className="h-20 rounded-2xl bg-white/10" />
+                <div className="h-20 rounded-2xl bg-white/10" />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {connected && dashboardDataReady && (
+          <div className="grid grid-cols-1 xl:grid-cols-[1.35fr_1fr] gap-6">
+          <div className="rounded-3xl border border-white/10 bg-slate-900/60 p-5 sm:p-6 backdrop-blur-xl">
+            {canSelfLiquidateNow && (
+              <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 mb-5">
+                <p className="text-[11px] uppercase tracking-wide text-slate-400 mb-3">Liquidation flow</p>
+                <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
+                  <div className="rounded-xl border border-cyan-400/20 bg-cyan-500/[0.06] p-3">
+                    <p className="text-[10px] uppercase tracking-wide text-cyan-300/80">You repay</p>
+                    <p className="mt-1 text-sm font-mono text-cyan-200">
+                      {formatLiqAmount(enteredRepayDisplay)} ALEO
+                    </p>
+                  </div>
+                  <div className="text-slate-500 text-lg">→</div>
+                  <div className="rounded-xl border border-indigo-400/20 bg-indigo-500/[0.06] p-3">
+                    <p className="text-[10px] uppercase tracking-wide text-indigo-300/80">You receive (est.)</p>
+                    <p className="mt-1 text-sm font-mono text-indigo-200">
+                      {formatLiqAmount(liqPreview.seizeAmount ?? 0)} {payoutSymbol}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {canSelfLiquidateNow ? (
+              <div className="space-y-3">
+                <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-[11px] text-slate-300">
+                  In one self-liquidation, you can repay only up to the allowed part of your current debt.
+                  <span className="text-cyan-200"> Use Max</span> to auto-fill the highest safe amount.
+                </div>
+                <div className="flex gap-2 items-stretch">
+                  <input
+                    type="number"
+                    min={0}
+                    step="any"
+                    max={effectiveMaxRepay > 0 ? effectiveMaxRepay : undefined}
+                    value={liqRepayAmountInput}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      const n = Number(raw);
+                      if (!Number.isFinite(n) || n <= 0 || effectiveMaxRepay <= 0) {
+                        setLiqRepayAmountInput(raw);
+                        return;
+                      }
+                      const capped = Math.min(n, effectiveMaxRepay);
+                      setLiqRepayAmountInput(String(capped));
+                    }}
+                    placeholder="Repay amount (ALEO)"
+                    className="flex-1 min-w-0 rounded-2xl bg-white/5 border border-white/10 px-4 py-3 text-white outline-none placeholder:text-slate-500"
+                  />
+                  <button
+                    type="button"
+                    disabled={!liqUiLimits?.ok || (liqUiLimits.effectiveMaxRepayAleo ?? 0) <= 0}
+                    onClick={() => {
+                      const v = liqUiLimits?.effectiveMaxRepayAleo;
+                      if (v == null || !Number.isFinite(v) || v <= 0) return;
+                      const s = v.toFixed(6).replace(/\.?0+$/, '');
+                      setLiqRepayAmountInput(s || '0');
+                    }}
+                    className="shrink-0 rounded-2xl bg-white/10 border border-white/15 px-4 py-3 text-sm text-slate-200 disabled:opacity-40"
+                  >
+                    Max
+                  </button>
+                </div>
+
+                <select
+                  value={
+                    (() => {
+                      const opts =
+                        liqUiLimits?.ok === true
+                          ? liqUiLimits.seizeOptions
+                          : (['0field', '1field', '2field'] as const);
+                      return opts.includes(liqSeizeAsset) ? liqSeizeAsset : opts[0] ?? '0field';
+                    })()
+                  }
+                  onChange={(e) => setLiqSeizeAsset(e.target.value as '0field' | '1field' | '2field')}
+                  disabled={liqUiLimits?.ok === true && liqUiLimits.seizeOptions.length === 0}
+                  className="w-full rounded-2xl bg-white/5 border border-white/10 px-4 py-3 text-white outline-none disabled:opacity-50"
+                >
+                  {liqUiLimits?.ok === true && liqUiLimits.seizeOptions.length === 0 ? (
+                    <option value="0field">No collateral available</option>
+                  ) : (
+                    (liqUiLimits?.ok === true ? liqUiLimits.seizeOptions : (['0field', '1field', '2field'] as const)).map((field) => (
+                      <option key={field} value={field}>
+                        {field === '0field' ? 'Payout in ALEO' : field === '1field' ? 'Payout in USDCx' : 'Payout in USAD'}
+                      </option>
+                    ))
+                  )}
+                </select>
+
+                {!liqPreview.ok && liqPreview.reason && !liquidationSubmitGate.reason && (
+                  <div className="text-xs text-amber-300">{liqPreview.reason}</div>
+                )}
+                {liquidationSubmitGate.disabled && !liqLoading && liquidationSubmitGate.reason && (
+                  <div className="text-xs text-amber-300/90">{liquidationSubmitGate.reason}</div>
+                )}
+
+                <button
+                  type="button"
+                  disabled={liqLoading || liquidationSubmitGate.disabled}
+                  onClick={handleLiquidation}
+                  className="w-full rounded-2xl bg-gradient-to-r from-cyan-500/30 to-indigo-500/30 border border-cyan-300/30 px-4 py-3 text-cyan-100 font-medium disabled:opacity-50"
+                >
+                  {liqLoading ? 'Submitting...' : 'Execute Self Liquidation'}
+                </button>
+                {liqStatusMessage && <div className="text-sm text-slate-300">{liqStatusMessage}</div>}
+                {liqTxId && (
+                  <a
+                    href={getProvableExplorerTxUrl(liqTxId)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-cyan-400 text-xs underline"
+                  >
+                    View Liquidation Tx
+                  </a>
+                )}
+              </div>
+            ) : (
+              <div className="rounded-2xl border border-emerald-400/20 bg-emerald-500/[0.06] p-4">
+                <p className="text-sm font-medium text-emerald-200">Your position is healthy</p>
+                <p className="text-xs text-emerald-100/80 mt-1">
+                  Self liquidation unlocks only if Health Factor drops below 1.0. Right now no action is needed.
+                </p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Link
+                    href="/dashboard"
+                    className="rounded-xl border border-emerald-300/35 bg-emerald-500/20 px-3 py-2 text-xs font-medium text-emerald-100 hover:bg-emerald-500/30 transition-colors"
+                  >
+                    Open Dashboard
+                  </Link>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-3xl border border-white/10 bg-slate-900/60 p-5 sm:p-6 backdrop-blur-xl">
+            <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 mb-4">
+              <p className="text-[11px] uppercase tracking-wide text-slate-400">Position status</p>
+              <p className={`mt-1 text-sm font-medium ${liqPreview.liquidatable ? 'text-rose-300' : 'text-emerald-300'}`}>
+                {liqPreview.ok ? (liqPreview.liquidatable ? 'Liquidatable' : 'Healthy') : 'Unavailable'}
+              </p>
+            </div>
+            <div className="space-y-3">
+              <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+                <p className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Debt / Threshold (USD)</p>
+                <p className="font-mono text-slate-200">
+                  ${(liqPreview.totalDebtUsd ?? 0).toFixed(2)} / ${(liqPreview.thresholdCollateralUsd ?? 0).toFixed(2)}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+                <p className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Liquidation bonus</p>
+                <p className="font-mono text-slate-200">{liqPreview.liqBonusBps ?? 0} bps</p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+                <p className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Mode</p>
+                <p className="text-slate-300 text-sm">Owner-only self liquidation and payout</p>
+              </div>
+            </div>
+          </div>
+          </div>
+        )}
+
+        {connected && dashboardDataReady && (
+          <section className="mt-8">
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-xl font-bold text-white">Liquidation History</h3>
+              <div className="flex gap-2">
+                <button
+                  onClick={fetchTransactionHistory}
+                  disabled={txHistoryLoading || !address}
+                  className="px-4 py-1.5 rounded-lg text-xs font-mono text-slate-400 hover:text-white transition-colors disabled:opacity-40 border border-white/10 bg-slate-900/60"
+                >
+                  {txHistoryLoading ? 'Loading...' : 'REFRESH'}
+                </button>
+              </div>
+            </div>
+
+            {txHistoryError ? (
+              <div className="rounded-2xl p-6 text-sm" style={{ backgroundColor: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)' }}>
+                <p className="font-medium text-amber-400">Could not load transaction history</p>
+                <p className="mt-1 text-amber-300/70">{txHistoryError}</p>
+              </div>
+            ) : (
+              <div className="rounded-[32px] overflow-hidden border border-white/10 bg-slate-900/60">
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[1100px] text-left border-collapse">
+                    <thead>
+                      <tr className="font-mono text-xs text-slate-400 uppercase tracking-widest" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}>
+                        <th className="px-8 py-4 font-medium">Type</th>
+                        <th className="px-8 py-4 font-medium min-w-[250px]">Asset</th>
+                        <th className="px-8 py-4 font-medium">Amount</th>
+                        <th className="px-8 py-4 font-medium">Date</th>
+                        <th className="px-8 py-4 font-medium text-left">Transaction</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {txHistoryLoading && liquidationHistory.length === 0 ? (
+                        <tr><td colSpan={5} className="py-8 text-center text-slate-500 text-sm">Loading transactions...</td></tr>
+                      ) : liquidationHistory.length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="py-16 text-center text-slate-500 text-sm">
+                            No liquidation transactions found
+                          </td>
+                        </tr>
+                      ) : (() => {
+                        const pageSize = 10;
+                        const totalPages = Math.max(1, Math.ceil(liquidationHistory.length / pageSize));
+                        const cur = Math.min(txHistoryPage, totalPages);
+                        const start = (cur - 1) * pageSize;
+                        return liquidationHistory.slice(start, start + pageSize).map((row) => (
+                          <tr key={row.id} style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }} className="hover:bg-white/5 transition-colors">
+                            <td className="px-8 py-5 text-slate-300">{txHistoryTypeText(String(row.type))}</td>
+                            <td className="px-8 py-5 text-slate-300 min-w-[250px]">
+                              {(() => {
+                                const typeLower = String(row.type || '').toLowerCase();
+                                const payoutLabel =
+                                  row.asset === 'usdcx'
+                                    ? 'USDCx'
+                                    : row.asset === 'usad' || row.asset === 'usadx'
+                                      ? 'USAD'
+                                      : 'ALEO';
+                                if (typeLower === 'self_liquidate_payout') {
+                                  return (
+                                    <div className="text-sm leading-5 space-y-1">
+                                      <div className="flex items-center gap-2 text-slate-400 whitespace-nowrap">
+                                        <img src="/logos/aleo-dark.svg" alt="ALEO" className="w-5 h-5 rounded-md" />
+                                        <span>Repay: <span className="text-slate-200">ALEO</span></span>
+                                      </div>
+                                      <div className="flex items-center gap-2 text-slate-400 whitespace-nowrap">
+                                        <img
+                                          src={row.asset === 'usdcx' ? '/logos/usdc.svg' : row.asset === 'usad' || row.asset === 'usadx' ? '/logos/usad.svg' : '/logos/aleo-dark.svg'}
+                                          alt={payoutLabel}
+                                          className="w-5 h-5 rounded-md"
+                                        />
+                                        <span>Payout: <span className="text-slate-200">{payoutLabel}</span></span>
+                                      </div>
+                                    </div>
+                                  );
+                                }
+                                return (
+                                  <div className="flex items-center gap-3">
+                                    <img
+                                      src={
+                                        row.asset === 'usdcx'
+                                          ? '/logos/usdc.svg'
+                                          : row.asset === 'usad' || row.asset === 'usadx'
+                                            ? '/logos/usad.svg'
+                                            : '/logos/aleo-dark.svg'
+                                      }
+                                      alt={payoutLabel}
+                                      className="w-7 h-7 rounded-lg"
+                                    />
+                                    <span>{payoutLabel}</span>
+                                  </div>
+                                );
+                              })()}
+                            </td>
+                            <td className="px-8 py-5 font-mono text-slate-300">
+                              {(() => {
+                                const typeLower = String(row.type || '').toLowerCase();
+                                const amountText = Number(row.amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                                if (typeLower === 'self_liquidate_payout') {
+                                  const payoutSym = row.asset === 'usdcx' ? 'USDCx' : row.asset === 'usad' || row.asset === 'usadx' ? 'USAD' : 'ALEO';
+                                  const repayText =
+                                    row.repay_amount != null
+                                      ? `${Number(row.repay_amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ALEO`
+                                      : '--';
+                                  return (
+                                    <div className="space-y-1 text-sm">
+                                      <div className="text-slate-400">Repay: <span className="text-slate-200">{repayText}</span></div>
+                                      <div className="text-slate-400">Payout: <span className="text-slate-200">{amountText} {payoutSym}</span></div>
+                                    </div>
+                                  );
+                                }
+                                return amountText;
+                              })()}
+                            </td>
+                            <td className="px-8 py-5 text-slate-500 text-sm">{new Date(row.created_at).toLocaleString()}</td>
+                            <td className="px-8 py-5 text-slate-300 align-top">
+                              <TxHistoryTrxPills
+                                txId={row.tx_id}
+                                explorerUrl={row.explorer_url ?? null}
+                                vaultExplorerUrl={row.vault_explorer_url ?? null}
+                                type={row.type}
+                                asset={row.asset}
+                                getProvableExplorerTxUrl={getProvableExplorerTxUrl}
+                              />
+                            </td>
+                          </tr>
+                        ));
+                      })()}
+                    </tbody>
+                  </table>
+                </div>
+                {(() => {
+                  const pageSize = 10;
+                  const totalPages = Math.max(1, Math.ceil(liquidationHistory.length / pageSize));
+                  if (totalPages <= 1) return null;
+                  return (
+                    <div className="flex items-center justify-between px-6 py-4 border-t border-white/10 text-xs text-slate-400 font-mono">
+                      <span>
+                        Page {Math.min(txHistoryPage, totalPages)} / {totalPages}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={txHistoryPage <= 1}
+                          onClick={() => setTxHistoryPage((p) => Math.max(1, p - 1))}
+                          className="px-3 py-1 rounded-md border border-white/15 disabled:opacity-40"
+                        >
+                          Prev
+                        </button>
+                        <button
+                          type="button"
+                          disabled={txHistoryPage >= totalPages}
+                          onClick={() => setTxHistoryPage((p) => Math.min(totalPages, p + 1))}
+                          className="px-3 py-1 rounded-md border border-white/15 disabled:opacity-40"
+                        >
+                          Next
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+          </section>
+        )}
+      </div>
+    );
+  }
+
+  if (view === 'markets') {
+    return <MarketsView />;
+  }
+
+  if (view === 'docs') {
+    // Reuse the docs page content inside the dashboard layout so wallet state is shared
+    return <DocsPage />;
+  }
 
   const dashGlass: React.CSSProperties = {
     background: 'linear-gradient(145deg, rgba(15,23,42,0.4) 0%, rgba(3,7,18,0.6) 100%)',
@@ -3526,22 +5662,37 @@ const DashboardPage: NextPageWithLayout = () => {
                         className="text-xs font-bold text-cyan-400 hover:text-cyan-300 transition-colors ml-2"
                           onClick={() => {
                           const maxVal = actionModalMode === 'withdraw'
-                            ? (actionModalAsset === 'aleo' ? availableWithdrawAleo : actionModalAsset === 'usdc' ? availableWithdrawUsdc : availableWithdrawUsad)
+                            ? (actionModalAsset === 'aleo' ? withdrawMaxAleoUi : actionModalAsset === 'usdc' ? withdrawMaxUsdcUi : withdrawMaxUsadUi)
                             : actionModalMode === 'deposit' ? privateBalanceModal
                               : actionModalMode === 'repay' ? Math.min(privateBalanceModal, repaySuggestedModalHuman)
                                 : actionModalMode === 'borrow' ? modalBorrowPortfolioMax
                                     : debtBalanceModal;
                           const adjusted =
-                            actionModalMode === 'borrow'
+                            actionModalMode === 'borrow' || actionModalMode === 'withdraw'
                               ? borrowMaxInputAmount(maxVal)
-                              : maxVal;
-                          setModalAmountInput(adjusted.toFixed(2));
+                              : floorAmountMicro(maxVal);
+                          const displayStr =
+                            actionModalMode === 'borrow' || actionModalMode === 'withdraw'
+                              ? adjusted.toFixed(2)
+                              : floorAmountMicroInputString(maxVal);
+                          setModalAmountInput(displayStr);
                           if (actionModalAsset === 'usdc') setAmountUsdc(adjusted);
                           else if (actionModalAsset === 'usad') setAmountUsad(adjusted);
                           else setAmount(adjusted);
                         }}
                       >MAX</button>
                     </div>
+                    {actionModalMode === 'withdraw' &&
+                      actionModalAsset === 'aleo' &&
+                      aleoWithdrawCappedByPoolLiquidity &&
+                      chainWithdrawCaps && (
+                        <p className="mt-2 text-xs text-slate-400 leading-relaxed">
+                          Max ALEO withdraw uses min(collateral, treasury via backend vault). Collateral headroom up to{' '}
+                          {(Number(chainWithdrawCaps.maxWithdrawMicroAleoPortfolio) / 1_000_000).toFixed(2)} ALEO; shown
+                          cap is lower when vault or on-chain pool liquidity is tighter. Cross-asset: supply any asset,
+                          withdraw another — same pattern as USDCx/USAD.
+                        </p>
+                      )}
                   </div>
                   <div className="rounded-xl p-4 space-y-2" style={{ backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)' }}>
                     <div className="text-sm font-medium text-slate-300 mb-1">Transaction overview</div>
@@ -3555,7 +5706,7 @@ const DashboardPage: NextPageWithLayout = () => {
                       <div className="flex justify-between text-sm text-slate-400">
                         <span>{actionModalMode === 'borrow' ? 'Total debt after (USD est.)' : 'Remaining total debt (USD est.)'}</span>
                         <span className="text-white font-mono">
-                          ${(actionModalMode === 'borrow' ? postTotalDebtUsd : remainingDebtUsdAfterRepay).toFixed(2)}
+                          ${formatUsdDebtLabel(actionModalMode === 'borrow' ? postTotalDebtUsd : remainingDebtUsdAfterRepay)}
                       </span>
                     </div>
                     )}
@@ -3566,7 +5717,7 @@ const DashboardPage: NextPageWithLayout = () => {
                     {(actionModalMode !== 'borrow' && actionModalMode !== 'repay') && (
                       <div className="flex justify-between text-sm text-slate-400">
                         <span>Est. total debt (USD)</span>
-                        <span className="text-white font-mono">${postTotalDebtUsd.toFixed(2)}</span>
+                        <span className="text-white font-mono">${formatUsdDebtLabel(postTotalDebtUsd)}</span>
                       </div>
                     )}
                     <div className="flex justify-between text-sm text-slate-400">
@@ -3642,6 +5793,58 @@ const DashboardPage: NextPageWithLayout = () => {
         </div>
       )}
 
+      {/* Create Dark Pool position — same modal pattern as Supply/Borrow (submit → poll → explorer) */}
+      {openAccountModalOpen && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center p-4"
+          style={{ backgroundColor: 'rgba(0,0,0,0.7)' }}
+          onClick={(e) => {
+            const canClose = !openAccountSubmitted || openAccountFlowDone;
+            if (e.target === e.currentTarget && canClose) closeOpenAccountModal();
+          }}
+        >
+          <div
+            className="relative rounded-[24px] p-8 w-full max-w-md"
+            style={dashGlass}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="text-xl font-bold text-white">Create Dark Pool position</h2>
+              {(!openAccountSubmitted || openAccountFlowDone) && (
+                <button
+                  type="button"
+                  onClick={closeOpenAccountModal}
+                  className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-white/10 transition-colors text-slate-400 text-lg"
+                  aria-label="Close"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+            <div className="space-y-4">
+              {!openAccountFlowDone && (
+                <div className="flex flex-col items-center justify-center py-6 gap-3">
+                  <span className="loading loading-spinner loading-lg text-cyan-400" />
+                  <p className="text-sm text-slate-400 text-center">{openAccountStatusMsg || 'Processing…'}</p>
+                </div>
+              )}
+              {openAccountFlowDone && openAccountStatusMsg && (
+                <div className="rounded-lg px-4 py-3 text-sm text-center text-slate-300">{openAccountStatusMsg}</div>
+              )}
+              {openAccountFlowDone && (
+                <button
+                  type="button"
+                  onClick={closeOpenAccountModal}
+                  className="w-full py-3 rounded-xl font-bold text-white border border-white/10 hover:bg-white/10 transition-all"
+                >
+                  Close
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       <main className="max-w-[1440px] mx-auto px-4 sm:px-8 pt-8 pb-20">
         {/* Page header */}
         <div className="flex flex-col md:flex-row md:items-end justify-between mb-10">
@@ -3649,18 +5852,20 @@ const DashboardPage: NextPageWithLayout = () => {
             <h1 className="text-4xl font-bold mb-2 text-white">Private Dashboard</h1>
             <p className="font-mono text-sm tracking-wide" style={{ color: '#64748b' }}>SHIELDED OVERVIEW • ALEO TESTNET</p>
           </div>
-          <div className="flex mt-6 md:mt-0">
+          <div className="flex flex-wrap gap-2 mt-6 md:mt-0 md:justify-end">
             {connected && (
-              <button
-                type="button"
-                onClick={() => { refreshPoolState(true); refreshUsdcPoolState(true); refreshUsadPoolState(true); }}
-                disabled={loading || isRefreshingState || isRefreshingUsdcState || isRefreshingUsadState}
-                className="px-5 py-2 rounded-xl text-sm font-mono transition-all self-end disabled:opacity-50"
-                style={dashGlass}
-              >
-                <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block mr-2" />
-                {isRefreshingState || isRefreshingUsdcState || isRefreshingUsadState ? 'Refreshing...' : 'Refresh'}
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={() => { refreshPoolState(true); refreshUsdcPoolState(true); refreshUsadPoolState(true); }}
+                  disabled={loading || isRefreshingState || isRefreshingUsdcState || isRefreshingUsadState}
+                  className="px-5 py-2 rounded-xl text-sm font-mono transition-all self-end disabled:opacity-50"
+                  style={dashGlass}
+                >
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block mr-2" />
+                  {isRefreshingState || isRefreshingUsdcState || isRefreshingUsadState ? 'Refreshing...' : 'Refresh'}
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -3748,7 +5953,7 @@ const DashboardPage: NextPageWithLayout = () => {
                     <div className="h-4 w-14 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.08)' }} />
                     <div className="h-3 w-20 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }} />
                   </div>
-                  <div className="flex justify-end">
+            <div className="flex justify-end">
                     <div className="h-9 w-20 rounded-xl" style={{ backgroundColor: 'rgba(255,255,255,0.06)' }} />
                   </div>
                 </div>
@@ -3790,15 +5995,75 @@ const DashboardPage: NextPageWithLayout = () => {
           </div>
         )}
 
-        {/* Connected — full dashboard */}
-        {connected && dashboardDataReady && (
+        {/* Connected — create private position first (no LendingPosition record yet) */}
+        {connected && dashboardDataReady && needsDarkPoolPosition && (
+          <section className="mb-10">
+            <div
+              className="rounded-[32px] px-8 py-14 sm:px-12 sm:py-16 text-center max-w-2xl mx-auto"
+              style={dashGlass}
+            >
+              <div
+                className="inline-flex items-center justify-center w-16 h-16 rounded-2xl mb-6 border border-cyan-500/25 mx-auto"
+                style={{ backgroundColor: 'rgba(6,182,212,0.08)' }}
+              >
+                <svg
+                  className="w-8 h-8 text-cyan-400"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  aria-hidden
+                >
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                </svg>
+              </div>
+              <h2 className="text-2xl sm:text-3xl font-bold text-white mb-3">Create your Dark Pool position</h2>
+              <p className="text-slate-400 text-sm sm:text-base leading-relaxed mb-8 max-w-md mx-auto">
+                One shielded transaction creates your private portfolio record on Aleo. After it finalizes, you can supply
+                assets, borrow against collateral, and see balances and health here.
+              </p>
+              <button
+                type="button"
+                onClick={openOpenAccountModal}
+                className="px-8 py-3.5 rounded-xl font-bold text-sm sm:text-base transition-all"
+                style={{ background: 'linear-gradient(to right, #22d3ee, #6366f1)', color: '#030712' }}
+              >
+                Create position
+              </button>
+              <p className="mt-6 text-xs text-slate-500 font-mono">Required once per wallet before supply and borrow.</p>
+            </div>
+          </section>
+        )}
+
+        {/* Connected — full dashboard (portfolio + positions) */}
+        {connected && dashboardDataReady && !needsDarkPoolPosition && (
           <>
+            {healthFactor != null && healthFactor < 1 && (
+              <div
+                className="rounded-2xl p-5 mb-8 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4"
+                style={{ backgroundColor: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.35)' }}
+              >
+                <div>
+                  <p className="text-sm font-semibold text-red-300">Position at liquidation risk</p>
+                  <p className="text-sm text-red-200/90 mt-1">
+                    Health Factor is below 1.0. Repay debt or run self-liquidation to move back to a safe range.
+                  </p>
+                </div>
+                <Link
+                  href="/liquidation"
+                  className="px-4 py-2 rounded-xl text-sm font-mono transition-all border border-red-300/40 text-red-100 hover:bg-red-500/15 inline-flex items-center justify-center shrink-0"
+                >
+                  Open Self-liquidation
+                </Link>
+              </div>
+            )}
+
             {/* Stats row */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-10">
               {[
                 { label: 'Total Collateral (USD)', value: `$${totalCollateralUsd.toFixed(2)}`, color: 'text-white' },
                 { label: 'Borrowable (USD)', value: `$${borrowableUsd.toFixed(2)}`, color: 'text-cyan-400' },
-                { label: 'Total Debt (USD)', value: `$${totalDebtUsdForHf.toFixed(2)}`, color: 'text-indigo-400' },
+                { label: 'Total Debt (USD)', value: `$${formatUsdDebtLabel(totalDebtUsdForHf)}`, color: 'text-indigo-400' },
                 { label: 'Health Factor', value: healthFactor == null ? '∞' : healthFactor.toFixed(2), color: healthFactor != null && healthFactor < 1 ? 'text-red-400' : 'text-emerald-400' },
               ].map(stat => (
                 <div key={stat.label} className="rounded-2xl p-6 relative overflow-hidden" style={dashGlass}>
@@ -3813,7 +6078,7 @@ const DashboardPage: NextPageWithLayout = () => {
 
             {/* Asset management table */}
             <div className="rounded-[32px] overflow-hidden mb-10" style={dashGlass}>
-              <div className="overflow-x-auto">
+                <div className="overflow-x-auto">
                 <div className="min-w-[920px]">
                   <div className="grid grid-cols-[2fr_1.2fr_1.2fr_1.2fr_1fr] gap-4 items-center px-8 py-5 font-mono text-xs text-slate-400 uppercase tracking-widest" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}>
                     <div>Asset</div>
@@ -3895,7 +6160,7 @@ const DashboardPage: NextPageWithLayout = () => {
                                   : `Repay with any asset. Payments reduce debt in order: ALEO → USDCx → USAD. This row only uses your ${asset.label} wallet.`;
 
                               const totalDebtTip =
-                                'Sum of borrowed principal across ALEO, USDCx, and USAD, valued in USD (on-chain totals when available).';
+                                'Sum of borrowed principal across ALEO, USDCx, and USAD, valued in USD (on-chain totals when available). Sub-cent dust shows up to 4 decimals so it is not confused with zero.';
                               const withdrawOnlyTip = `You receive ${asset.label}. The program may reduce supplied collateral across reserves to keep your health factor safe.`;
                               const borrowOnlyTip = `How much more you can borrow in USD before hitting weighted collateral vs debt limits. You receive ${asset.label}; the program checks your full portfolio.`;
                               const supplyWalletTip =
@@ -3908,7 +6173,7 @@ const DashboardPage: NextPageWithLayout = () => {
                                       <span>
                                         Wallet ({asset.label}):{' '}
                                         <span className="tabular-nums text-slate-200">{asset.wallet.toFixed(2)}</span>
-                                      </span>
+                          </span>
                                       <InfoTooltip variant="onDark" tip={supplyWalletTip} />
                                     </div>
                                   )}
@@ -3916,17 +6181,17 @@ const DashboardPage: NextPageWithLayout = () => {
                                     <div className="flex items-center justify-end gap-0.5 text-slate-400">
                                       <span>
                                         Available Withdrawable (USD):{' '}
-                                        <span className="tabular-nums text-slate-200">${portfolioWithdrawUsd.toFixed(2)}</span>
+                                        <span className="tabular-nums text-slate-200">${withdrawMaxUsdBudget.toFixed(2)}</span>
                             </span>
                                       <InfoTooltip variant="onDark" tip={withdrawOnlyTip} />
-                                    </div>
+                </div>
                                   )}
                                   {activeManageTab === 'Borrow' && (
                                     <div className="flex items-center justify-end gap-0.5 text-slate-400">
                                       <span>
                                         Available Borrowable (USD):{' '}
                                         <span className="tabular-nums text-cyan-300">${borrowableUsd.toFixed(2)}</span>
-                                      </span>
+                            </span>
                                       <InfoTooltip variant="onDark" tip={borrowOnlyTip} />
                                     </div>
                                   )}
@@ -3935,14 +6200,14 @@ const DashboardPage: NextPageWithLayout = () => {
                                       <div className="flex items-center justify-end gap-0.5 text-slate-400">
                                         <span>
                                           Total Debt (USD):{' '}
-                                          <span className="tabular-nums text-indigo-300">${totalDebtUsdForHf.toFixed(2)}</span>
+                                          <span className="tabular-nums text-indigo-300">${formatUsdDebtLabel(totalDebtUsdForHf)}</span>
                             </span>
                                         <InfoTooltip variant="onDark" tip={totalDebtTip} />
                                       </div>
                                       <div className="flex items-center justify-end gap-0.5 text-slate-400">
                                         <span>
                                           Max repay with {asset.label} (USD):{' '}
-                                          <span className="tabular-nums text-slate-200">${maxPayThisAssetUsd.toFixed(2)}</span>
+                                          <span className="tabular-nums text-slate-200">${formatUsdDebtLabel(maxPayThisAssetUsd)}</span>
                                         </span>
                                         <InfoTooltip variant="onDark" tip={repayWalletTip} />
                                       </div>
@@ -3963,8 +6228,14 @@ const DashboardPage: NextPageWithLayout = () => {
                                 onClick={async () => {
                                   const m = await resolveInlineMaxAmount(activeManageTab, asset.id);
                                   const fill =
-                                    activeManageTab === 'Borrow' ? borrowMaxInputAmount(m) : m;
-                                  setManageAmountInput(fill.toFixed(2));
+                                    activeManageTab === 'Borrow' || activeManageTab === 'Withdraw'
+                                      ? borrowMaxInputAmount(m)
+                                      : floorAmountMicro(m);
+                                  setManageAmountInput(
+                                    activeManageTab === 'Borrow' || activeManageTab === 'Withdraw'
+                                      ? fill.toFixed(2)
+                                      : floorAmountMicroInputString(m),
+                                  );
                                 }}
                                 type="button"
                                 className="text-sm font-bold text-cyan-400 hover:text-cyan-300 px-4 py-2.5 rounded-xl transition-colors uppercase tracking-wide"
@@ -3981,8 +6252,15 @@ const DashboardPage: NextPageWithLayout = () => {
                                   (async () => {
                                     const m = await resolveInlineMaxAmount(activeManageTab, asset.id);
                                     const cap =
-                                      activeManageTab === 'Borrow' ? borrowMaxInputAmount(m) : m;
-                                    setManageAmountInput(((cap * pct) / 100).toFixed(2));
+                                      activeManageTab === 'Borrow' || activeManageTab === 'Withdraw'
+                                        ? borrowMaxInputAmount(m)
+                                        : floorAmountMicro(m);
+                                    const rawFrac = (cap * pct) / 100;
+                                    if (activeManageTab === 'Borrow' || activeManageTab === 'Withdraw') {
+                                      setManageAmountInput(borrowMaxInputAmount(rawFrac).toFixed(2));
+                                    } else {
+                                      setManageAmountInput(floorAmountMicroInputString(rawFrac));
+                                    }
                                   })();
                                 }}
                                 className="flex-1 py-3.5 text-sm font-medium text-slate-400 rounded-xl hover:text-slate-200 transition-colors min-h-[48px]"
@@ -4014,10 +6292,14 @@ const DashboardPage: NextPageWithLayout = () => {
                                 activeManageTab === 'Borrow' || activeManageTab === 'Repay'
                                   ? BORROW_REPAY_MAX_TEST_SLACK_MICRO
                                   : 0;
+                              const noDebtToRepay =
+                                activeManageTab === 'Repay' &&
+                                portfolioDebtUsdForRepay <= 1e-12 &&
+                                !hasScaledBorrowDebt;
                               return (
                                 loading ||
                                 !Number.isFinite(r) ||
-                                (activeManageTab === 'Repay' && !hasAnyDebt) ||
+                                noDebtToRepay ||
                                 !amountWithinMax(r, m, borrowRepaySlack)
                               );
                             })()}
@@ -4085,7 +6367,7 @@ const DashboardPage: NextPageWithLayout = () => {
         )}
 
         {/* Transaction History (same readiness gate as portfolio so the whole dashboard loads together) */}
-        {connected && dashboardDataReady && (
+        {connected && dashboardDataReady && !needsDarkPoolPosition && (
           <section className="mb-10">
             <div className="flex items-center justify-between mb-6">
               <h3 className="text-xl font-bold text-white">Transaction History</h3>
@@ -4103,7 +6385,7 @@ const DashboardPage: NextPageWithLayout = () => {
             </div>
             ) : (
               <div className="rounded-[32px] overflow-hidden" style={dashGlass}>
-                <div className="overflow-x-auto">
+              <div className="overflow-x-auto">
                   <table className="w-full min-w-[920px] text-left border-collapse">
                   <thead>
                     <tr className="font-mono text-xs text-slate-400 uppercase tracking-widest" style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}>
@@ -4136,7 +6418,7 @@ const DashboardPage: NextPageWithLayout = () => {
                       const start = (cur - 1) * pageSize;
                       return txHistory.slice(start, start + pageSize).map((row) => (
                         <tr key={row.id} style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }} className="hover:bg-white/5 transition-colors">
-                          <td className="px-8 py-5 capitalize text-slate-300">{row.type}</td>
+                          <td className="px-8 py-5 text-slate-300">{txHistoryTypeText(String(row.type))}</td>
                           <td className="px-8 py-5 text-slate-300">
                             <div className="flex items-center gap-3">
                               <img
@@ -4162,8 +6444,8 @@ const DashboardPage: NextPageWithLayout = () => {
                       ));
                     })()}
                   </tbody>
-                  </table>
-                </div>
+                </table>
+              </div>
                 {txHistory.length > 10 && (() => {
                     const pageSize = 10;
                     const totalPages = Math.max(1, Math.ceil(txHistory.length / pageSize));

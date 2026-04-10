@@ -48,10 +48,6 @@ async function runWatchCycle() {
     if (!wallet_address || !tx_id || !type || !Number.isFinite(amountNum) || amountNum <= 0) continue;
 
     const assetLower = (asset || '').toLowerCase();
-    if (type === 'flash_loan' && assetLower !== 'aleo') {
-      console.warn('Vault watcher: flash_loan is only supported for asset aleo, skipping row', tx_id);
-      continue;
-    }
 
     const key = vaultTaskKey(wallet_address, tx_id, type);
     if (inProgressKeys.has(key)) {
@@ -65,9 +61,9 @@ async function runWatchCycle() {
 
     const isUsdc = assetLower === 'usdcx';
     const isUsad = assetLower === 'usad' || assetLower === 'usadx';
-    // flash_loan (ALEO): not withdraw — falls through to same runBorrow as borrow (principal → user).
+    const isSelfLiqPayout = type === 'self_liquidate_payout';
     const run =
-      type === 'withdraw'
+      type === 'withdraw' || isSelfLiqPayout
         ? isUsad
           ? () => runWithdrawalUsad(wallet_address, amountNum)
           : isUsdc

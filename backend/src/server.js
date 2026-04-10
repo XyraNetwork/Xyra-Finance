@@ -12,9 +12,26 @@ import {
   runBorrowUsad,
 } from './processWithdrawal.js';
 import { logTestnetStatus } from './checkTestnet.js';
-import { updateVaultTx, setVaultStatus, insertTransactionRecord } from './supabase.js';
+import {
+  updateVaultTx,
+  setVaultStatus,
+  insertTransactionRecord,
+  getFlashSessionById,
+  getFlashSessionByIdempotencyKey,
+  insertFlashSession,
+  updateFlashSession,
+  listFlashSessionsByWallet,
+  getPendingFlashFundingSessions,
+  claimFlashSessionForFunding,
+} from './supabase.js';
 import { startVaultWatcher } from './vaultWatcher.js';
 import { startAleoPricePoller } from './aleoPricePoller.js';
+import { startAccrueScheduler } from './processAccrueScheduler.js';
+import {
+  runSetFlashParams,
+  runSetFlashStrategyAllowed,
+  runFlashOpen,
+} from './processFlash.js';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -25,6 +42,10 @@ const USDC_TOKEN_PROGRAM_ID = process.env.USDC_TOKEN_PROGRAM_ID || 'test_usdcx_s
 const USAD_TOKEN_PROGRAM_ID = process.env.USAD_TOKEN_PROGRAM_ID || 'test_usad_stablecoin.aleo';
 
 const DECIMALS_6 = 1_000_000n; // stablecoins/base units in this project
+const FLASH_SESSION_TIMEOUT_MS = Number(process.env.FLASH_SESSION_TIMEOUT_MS || '3600000');
+const FLASH_WATCHER_INTERVAL_MS = Math.max(15_000, Number(process.env.FLASH_WATCHER_INTERVAL_MS) || 30_000);
+const FLASH_WATCHER_BATCH_LIMIT = Math.min(50, Math.max(1, Number(process.env.FLASH_WATCHER_BATCH_LIMIT) || 10));
+const inProgressFlashFunding = new Set();
 
 let vaultBalancesCache = {
   ts: 0,
@@ -506,16 +527,26 @@ app.post('/record-transaction', async (req, res) => {
     }
   }
   try {
-    const { wallet_address, tx_id, type, asset, amount, program_id } = req.body || {};
+    const { wallet_address, tx_id, type, asset, amount, program_id, repay_amount } = req.body || {};
     if (!wallet_address || typeof wallet_address !== 'string' || !wallet_address.trim()) {
       return res.status(400).json({ error: 'Missing or invalid wallet_address' });
     }
     if (!tx_id || typeof tx_id !== 'string' || !tx_id.trim()) {
       return res.status(400).json({ error: 'Missing or invalid tx_id' });
     }
-    const validTypes = ['deposit', 'withdraw', 'borrow', 'repay', 'flash_loan'];
+    const validTypes = [
+      'deposit',
+      'withdraw',
+      'borrow',
+      'repay',
+      'open_position',
+      'self_liquidate_payout',
+    ];
     if (!validTypes.includes(type)) {
-      return res.status(400).json({ error: 'Invalid type. Must be one of: deposit, withdraw, borrow, repay, flash_loan' });
+      return res.status(400).json({
+        error:
+          'Invalid type. Must be one of: deposit, withdraw, borrow, repay, open_position, self_liquidate_payout (flash uses flash_sessions, not transaction_history)',
+      });
     }
     const validAssets = ['aleo', 'usdcx', 'usad'];
     if (!validAssets.includes(asset)) {
@@ -525,12 +556,18 @@ app.post('/record-transaction', async (req, res) => {
     if (!Number.isFinite(amountNum) || amountNum < 0) {
       return res.status(400).json({ error: 'Missing or invalid amount' });
     }
+    const repayAmountNum =
+      repay_amount == null || repay_amount === '' ? null : Number(repay_amount);
+    if (repayAmountNum != null && (!Number.isFinite(repayAmountNum) || repayAmountNum < 0)) {
+      return res.status(400).json({ error: 'Invalid repay_amount' });
+    }
     const { data, error } = await insertTransactionRecord({
       wallet_address: wallet_address.trim(),
       tx_id: tx_id.trim(),
       type,
       asset,
       amount: amountNum,
+      repay_amount: repayAmountNum,
       program_id: program_id ? String(program_id).trim() : null,
     });
     if (error) {
@@ -563,6 +600,256 @@ app.get('/vault-balances', async (_req, res) => {
   }
 });
 
+// Flash admin + strategy endpoints (v1).
+app.post('/flash/set-params', async (req, res) => {
+  try {
+    const { asset_id, enabled, premium_bps, max_amount_micro } = req.body || {};
+    const out = await runSetFlashParams({
+      assetIdField: String(asset_id || '').trim(),
+      enabled: !!enabled,
+      premiumBps: premium_bps,
+      maxAmountMicro: max_amount_micro,
+    });
+    return res.json({ ok: true, ...out });
+  } catch (err) {
+    console.error('❌ /flash/set-params failed:', err);
+    return res.status(400).json({ ok: false, error: err?.message || 'Failed to set flash params' });
+  }
+});
+
+app.post('/flash/set-strategy', async (req, res) => {
+  try {
+    const { strategy_id, allowed } = req.body || {};
+    const out = await runSetFlashStrategyAllowed({
+      strategyId: String(strategy_id || '').trim(),
+      allowed: !!allowed,
+    });
+    return res.json({ ok: true, ...out });
+  } catch (err) {
+    console.error('❌ /flash/set-strategy failed:', err);
+    return res.status(400).json({ ok: false, error: err?.message || 'Failed to set flash strategy flag' });
+  }
+});
+
+app.post('/flash/open', async (req, res) => {
+  try {
+    const { asset_id, principal_micro, min_profit_micro, strategy_id } = req.body || {};
+    const out = await runFlashOpen({
+      assetIdField: String(asset_id || '').trim(),
+      principalMicro: principal_micro,
+      minProfitMicro: min_profit_micro ?? 0,
+      strategyId: String(strategy_id || '').trim(),
+    });
+    return res.json({ ok: true, ...out });
+  } catch (err) {
+    console.error('❌ /flash/open failed:', err);
+    return res.status(400).json({ ok: false, error: err?.message || 'Failed to open flash session' });
+  }
+});
+
+// Flash session orchestration APIs (DB-backed): open -> fund -> settle.
+app.post('/flash/open-session', async (req, res) => {
+  try {
+    const { user_address, strategy_wallet, asset_id, principal_micro, min_profit_micro, strategy_id, idempotency_key } = req.body || {};
+    const userAddress = String(user_address || '').trim();
+    const strategyWallet = String(strategy_wallet || '').trim();
+    const assetIdField = String(asset_id || '').trim();
+    const strategyId = String(strategy_id || '').trim();
+    const principalMicro = Number(principal_micro);
+    const minProfitMicro = Number(min_profit_micro ?? 0);
+    const idempotencyKey = String(idempotency_key || req.headers['x-idempotency-key'] || '').trim();
+
+    if (!userAddress) return res.status(400).json({ ok: false, error: 'user_address is required' });
+    if (!['0field', '1field', '2field'].includes(assetIdField)) return res.status(400).json({ ok: false, error: 'asset_id must be 0field|1field|2field' });
+    if (!Number.isFinite(principalMicro) || principalMicro <= 0) return res.status(400).json({ ok: false, error: 'principal_micro must be > 0' });
+    if (!Number.isFinite(minProfitMicro) || minProfitMicro < 0) return res.status(400).json({ ok: false, error: 'min_profit_micro must be >= 0' });
+    if (!strategyId.endsWith('field')) return res.status(400).json({ ok: false, error: 'strategy_id must be a field literal' });
+
+    if (idempotencyKey) {
+      const existing = await getFlashSessionByIdempotencyKey(idempotencyKey);
+      if (existing) return res.json({ ok: true, reused: true, session: existing });
+    }
+
+    const openResult = await runFlashOpen({
+      assetIdField,
+      principalMicro,
+      minProfitMicro,
+      strategyId,
+    });
+
+    const expiresAt = new Date(Date.now() + FLASH_SESSION_TIMEOUT_MS).toISOString();
+    const { data, error } = await insertFlashSession({
+      status: 'opened',
+      user_address: userAddress,
+      strategy_wallet: openResult.signer || strategyWallet || userAddress,
+      asset_id: assetIdField,
+      principal_micro: Math.round(principalMicro),
+      min_profit_micro: Math.round(minProfitMicro),
+      strategy_id_field: strategyId,
+      flash_open_tx_id: openResult.txId,
+      idempotency_key: idempotencyKey || null,
+      expires_at: expiresAt,
+    });
+    if (error) {
+      console.error('❌ /flash/open-session insert failed:', error);
+      return res.status(500).json({ ok: false, error: error.message || 'Failed to persist flash session' });
+    }
+    return res.json({ ok: true, session: data, open: openResult });
+  } catch (err) {
+    console.error('❌ /flash/open-session failed:', err);
+    return res.status(400).json({ ok: false, error: err?.message || 'Failed to open flash session' });
+  }
+});
+
+app.post('/flash/record-open', async (req, res) => {
+  if (RECORD_TRANSACTION_SECRET) {
+    const raw = req.headers['x-record-transaction-secret'] || req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
+    const provided = (typeof raw === 'string' ? raw : String(raw)).trim();
+    if (provided !== RECORD_TRANSACTION_SECRET) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
+  }
+  try {
+    const { user_address, strategy_wallet, asset_id, principal_micro, min_profit_micro, strategy_id, flash_open_tx_id, idempotency_key } = req.body || {};
+    const userAddress = String(user_address || '').trim();
+    const strategyWallet = String(strategy_wallet || '').trim();
+    const assetIdField = String(asset_id || '').trim();
+    const strategyId = String(strategy_id || '').trim();
+    const openTx = String(flash_open_tx_id || '').trim();
+    const principalMicro = Number(principal_micro);
+    const minProfitMicro = Number(min_profit_micro ?? 0);
+    const idempotencyKey = String(idempotency_key || req.headers['x-idempotency-key'] || '').trim();
+
+    if (!userAddress || !strategyWallet) return res.status(400).json({ ok: false, error: 'user_address and strategy_wallet are required' });
+    if (!['0field', '1field', '2field'].includes(assetIdField)) return res.status(400).json({ ok: false, error: 'asset_id must be 0field|1field|2field' });
+    if (!Number.isFinite(principalMicro) || principalMicro <= 0) return res.status(400).json({ ok: false, error: 'principal_micro must be > 0' });
+    if (!Number.isFinite(minProfitMicro) || minProfitMicro < 0) return res.status(400).json({ ok: false, error: 'min_profit_micro must be >= 0' });
+    if (!strategyId.endsWith('field')) return res.status(400).json({ ok: false, error: 'strategy_id must be field literal' });
+    if (!openTx) return res.status(400).json({ ok: false, error: 'flash_open_tx_id is required' });
+
+    if (idempotencyKey) {
+      const existing = await getFlashSessionByIdempotencyKey(idempotencyKey);
+      if (existing) return res.json({ ok: true, reused: true, session: existing });
+    }
+    const expiresAt = new Date(Date.now() + FLASH_SESSION_TIMEOUT_MS).toISOString();
+    const { data, error } = await insertFlashSession({
+      status: 'opened',
+      user_address: userAddress,
+      strategy_wallet: strategyWallet,
+      asset_id: assetIdField,
+      principal_micro: Math.round(principalMicro),
+      min_profit_micro: Math.round(minProfitMicro),
+      strategy_id_field: strategyId,
+      flash_open_tx_id: openTx,
+      idempotency_key: idempotencyKey || null,
+      expires_at: expiresAt,
+    });
+    if (error) return res.status(500).json({ ok: false, error: error.message || 'Failed to persist session' });
+    return res.json({ ok: true, session: data });
+  } catch (err) {
+    console.error('❌ /flash/record-open failed:', err);
+    return res.status(400).json({ ok: false, error: err?.message || 'Failed to record flash open' });
+  }
+});
+
+app.get('/flash/sessions', async (req, res) => {
+  try {
+    const wallet = String(req.query.wallet || '').trim();
+    const limitRaw = Number(req.query.limit || 50);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, Math.round(limitRaw))) : 50;
+    if (!wallet) return res.status(400).json({ ok: false, error: 'wallet query param is required' });
+    const sessions = await listFlashSessionsByWallet(wallet, limit);
+    return res.json({ ok: true, sessions });
+  } catch (err) {
+    console.error('❌ /flash/sessions failed:', err);
+    return res.status(400).json({ ok: false, error: err?.message || 'Failed to load flash sessions' });
+  }
+});
+
+app.post('/flash/fund-session', async (req, res) => {
+  try {
+    const sessionId = String(req.body?.session_id || '').trim();
+    if (!sessionId) return res.status(400).json({ ok: false, error: 'session_id is required' });
+    const session = await getFlashSessionById(sessionId);
+    if (!session) return res.status(404).json({ ok: false, error: 'Session not found' });
+    if (!['opened', 'funding_pending'].includes(String(session.status || ''))) {
+      return res.status(400).json({ ok: false, error: `Invalid status for funding: ${session.status}` });
+    }
+
+    const assetId = String(session.asset_id || '0field').trim();
+    if (!['0field', '1field', '2field'].includes(assetId)) {
+      return res.status(400).json({ ok: false, error: `Unsupported flash asset_id: ${assetId}` });
+    }
+
+    await updateFlashSession(sessionId, { status: 'funding_pending' });
+    const amountHuman = Number(session.principal_micro) / 1_000_000;
+    const toAddr = String(session.strategy_wallet);
+    const vaultTxId = await runVaultTask(async () => {
+      if (assetId === '0field') return runWithdrawal(toAddr, amountHuman);
+      if (assetId === '1field') return runWithdrawalUsdc(toAddr, amountHuman);
+      return runWithdrawalUsad(toAddr, amountHuman);
+    });
+    const { data, error } = await updateFlashSession(sessionId, {
+      status: 'funded',
+      vault_fund_tx_id: vaultTxId,
+    });
+    if (error) return res.status(500).json({ ok: false, error: error.message || 'Failed to update funded session' });
+    return res.json({ ok: true, session: data, vault_fund_tx_id: vaultTxId });
+  } catch (err) {
+    console.error('❌ /flash/fund-session failed:', err);
+    return res.status(400).json({ ok: false, error: err?.message || 'Failed to fund flash session' });
+  }
+});
+
+app.post('/flash/mark-settle-pending', async (req, res) => {
+  try {
+    const sessionId = String(req.body?.session_id || '').trim();
+    const settleTxId = String(req.body?.flash_settle_tx_id || '').trim();
+    if (!sessionId || !settleTxId) return res.status(400).json({ ok: false, error: 'session_id and flash_settle_tx_id are required' });
+    const session = await getFlashSessionById(sessionId);
+    if (!session) return res.status(404).json({ ok: false, error: 'Session not found' });
+    if (!['funded', 'settle_pending'].includes(String(session.status || ''))) {
+      return res.status(400).json({ ok: false, error: `Invalid status for settle-pending: ${session.status}` });
+    }
+    const { data, error } = await updateFlashSession(sessionId, {
+      status: 'settle_pending',
+      flash_settle_tx_id: settleTxId,
+    });
+    if (error) return res.status(500).json({ ok: false, error: error.message || 'Failed to update session' });
+    return res.json({ ok: true, session: data });
+  } catch (err) {
+    console.error('❌ /flash/mark-settle-pending failed:', err);
+    return res.status(400).json({ ok: false, error: err?.message || 'Failed to mark settle pending' });
+  }
+});
+
+app.post('/flash/complete-session', async (req, res) => {
+  try {
+    const sessionId = String(req.body?.session_id || '').trim();
+    const settleTxId = String(req.body?.flash_settle_tx_id || '').trim();
+    const actualRepayMicro = req.body?.actual_repay_micro == null ? null : Number(req.body.actual_repay_micro);
+    const profitMicro = req.body?.profit_micro == null ? null : Number(req.body.profit_micro);
+    if (!sessionId) return res.status(400).json({ ok: false, error: 'session_id is required' });
+    const session = await getFlashSessionById(sessionId);
+    if (!session) return res.status(404).json({ ok: false, error: 'Session not found' });
+    if (!['funded', 'settle_pending'].includes(String(session.status || ''))) {
+      return res.status(400).json({ ok: false, error: `Invalid status for complete: ${session.status}` });
+    }
+    const patch = {
+      status: 'settled',
+      flash_settle_tx_id: settleTxId || session.flash_settle_tx_id || null,
+      actual_repay_micro: Number.isFinite(actualRepayMicro) ? Math.round(actualRepayMicro) : null,
+      profit_micro: Number.isFinite(profitMicro) ? Math.round(profitMicro) : null,
+    };
+    const { data, error } = await updateFlashSession(sessionId, patch);
+    if (error) return res.status(500).json({ ok: false, error: error.message || 'Failed to complete session' });
+    return res.json({ ok: true, session: data });
+  } catch (err) {
+    console.error('❌ /flash/complete-session failed:', err);
+    return res.status(400).json({ ok: false, error: err?.message || 'Failed to complete flash session' });
+  }
+});
+
 app.listen(PORT, async () => {
   console.log(`✅ Vault backend (withdraw + borrow) listening on http://localhost:${PORT}`);
   console.log(`   Vault queue: concurrency ${VAULT_QUEUE_CONCURRENCY} (set VAULT_QUEUE_CONCURRENCY in .env to change)`);
@@ -573,5 +860,61 @@ app.listen(PORT, async () => {
     console.log('   Vault watcher: disabled (VAULT_WATCHER_ENABLED=false)');
   }
   startAleoPricePoller();
+  if ((process.env.ACCRUE_SCHEDULER_ENABLED || '').trim().toLowerCase() === 'true') {
+    startAccrueScheduler()
+      .then(() => {
+        console.log('   Accrue scheduler: enabled (ACCRUE_SCHEDULER_ENABLED=true)');
+      })
+      .catch((err) => {
+        console.error('❌ Accrue scheduler failed to start:', err?.message || err);
+      });
+  } else {
+    console.log('   Accrue scheduler: disabled (set ACCRUE_SCHEDULER_ENABLED=true to enable)');
+  }
+
+  if ((process.env.FLASH_SESSION_WATCHER_ENABLED || 'true').trim().toLowerCase() === 'true') {
+    console.log(`   Flash session watcher: enabled (${FLASH_WATCHER_INTERVAL_MS}ms, limit ${FLASH_WATCHER_BATCH_LIMIT})`);
+    const runFlashFundingCycle = async () => {
+      const rows = await getPendingFlashFundingSessions(FLASH_WATCHER_BATCH_LIMIT);
+      if (!rows.length) return;
+      for (const row of rows) {
+        const id = String(row.id || '');
+        if (!id || inProgressFlashFunding.has(id)) continue;
+        const assetId = String(row.asset_id || '0field').trim();
+        if (!['0field', '1field', '2field'].includes(assetId)) continue;
+        const now = Date.now();
+        if (row.expires_at && new Date(row.expires_at).getTime() < now) {
+          await updateFlashSession(id, { status: 'expired', error_message: 'Session expired before funding.' });
+          continue;
+        }
+        const claim = await claimFlashSessionForFunding(id);
+        if (!claim.rowsUpdated) continue;
+        inProgressFlashFunding.add(id);
+        const amountHuman = Number(row.principal_micro) / 1_000_000;
+        const toAddr = String(row.strategy_wallet);
+        runVaultTask(async () => {
+          if (assetId === '0field') return runWithdrawal(toAddr, amountHuman);
+          if (assetId === '1field') return runWithdrawalUsdc(toAddr, amountHuman);
+          return runWithdrawalUsad(toAddr, amountHuman);
+        })
+          .then((vaultTxId) => updateFlashSession(id, { status: 'funded', vault_fund_tx_id: vaultTxId, error_message: null }))
+          .catch(async (e) => {
+            await updateFlashSession(id, {
+              status: 'opened',
+              error_message: e?.message || 'Vault funding failed',
+            });
+          })
+          .finally(() => {
+            inProgressFlashFunding.delete(id);
+          });
+      }
+    };
+    setInterval(() => {
+      runFlashFundingCycle().catch((e) => console.error('Flash watcher cycle failed:', e?.message || e));
+    }, FLASH_WATCHER_INTERVAL_MS);
+    runFlashFundingCycle().catch((e) => console.error('Flash watcher start cycle failed:', e?.message || e));
+  } else {
+    console.log('   Flash session watcher: disabled (FLASH_SESSION_WATCHER_ENABLED=false)');
+  }
 });
 

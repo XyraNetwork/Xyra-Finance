@@ -40,7 +40,7 @@ export type BountyData = {
 // Aleo program ID for the first lending pool.
 // Read from NEXT_PUBLIC_LENDING_POOL_PROGRAM_ID so we can switch pools via env.
 export const BOUNTY_PROGRAM_ID =
-  process.env.NEXT_PUBLIC_LENDING_POOL_PROGRAM_ID || 'xyra_lending_v2.aleo';
+  process.env.NEXT_PUBLIC_LENDING_POOL_PROGRAM_ID || 'xyra_lending_v9.aleo';
 
 // USDC pool program ID.
 // Read from NEXT_PUBLIC_USDC_LENDING_POOL_PROGRAM_ID so we can switch pools via env.
@@ -66,6 +66,13 @@ export const USAD_POOL_PROGRAM_ID =
 // USAD token program (Provable testnet): required for Token records used in USAD pool deposit/repay.
 export const USAD_TOKEN_PROGRAM_ID = 'test_usad_stablecoin.aleo';
 
+/** Same idea as `USDCX_STACK_PROGRAM_IDS` — lending imports `test_usad_stablecoin`; wallets need deps for prove/verify. */
+export const USADX_STACK_PROGRAM_IDS = [
+  'merkle_tree.aleo',
+  'test_usad_freezelist.aleo',
+  USAD_TOKEN_PROGRAM_ID,
+] as const;
+
 // Admin wallet allowed to initialize/admin-manage the pool from frontend.
 export const ADMIN_ADDRESS = (process.env.NEXT_PUBLIC_ADMIN_ADDRESS || '').trim();
 
@@ -81,7 +88,7 @@ export function getWalletConnectProgramIds(): string[] {
     USDC_POOL_PROGRAM_ID,
     ...USDCX_STACK_PROGRAM_IDS,
     USAD_POOL_PROGRAM_ID,
-    USAD_TOKEN_PROGRAM_ID,
+    ...USADX_STACK_PROGRAM_IDS,
     'credits.aleo',
   ];
   const cleaned = raw.map((id) => String(id).trim()).filter(Boolean);

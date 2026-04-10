@@ -8,6 +8,9 @@
     "withdraw-once": "node src/processWithdrawal.js",
     "withdraw-usdc-once": "node src/processWithdrawalUsdc.js",
     "borrow-once": "node src/processBorrow.js",
+    "stake-strategy": "node src/processStakeStrategy.js",
+    "accrue-scheduler": "node src/processAccrueScheduler.js",
+    "flash-open": "node -e \"import('./src/processFlash.js').then(m=>m.runFlashOpen({assetIdField:'0field',principalMicro:1000000,minProfitMicro:0,strategyId:'1field'}).then(console.log).catch(e=>{console.error(e);process.exit(1);}))\"",
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "check-testnet": "node src/checkTestnet.js"

@@ -32,6 +32,14 @@ const Navbar = () => {
   const router = useRouter();
   const { setVisible } = useWalletModal();
   const { address, connected, connecting, disconnect } = useWallet();
+  const configuredAdminAddress = (
+    process.env.NEXT_PUBLIC_LENDING_ADMIN_ADDRESS ||
+    process.env.NEXT_PUBLIC_ADMIN_ADDRESS ||
+    'aleo1rhgdu77hgyqd3xjj8ucu3jj9r2krwz6mnzyd80gncr5fxcwlh5rsvzp9px'
+  )
+    .trim()
+    .toLowerCase();
+  const isAdminWallet = !!address && address.trim().toLowerCase() === configuredAdminAddress;
 
   const isLandingPage = router.pathname === '/';
   const isDashboardPage = router.pathname === '/dashboard';
@@ -50,11 +58,43 @@ const Navbar = () => {
     setIsDropdownOpen(false);
   }, [router.pathname]);
 
-  const navItems = [
+  const baseNavItems = [
     { name: 'DASHBOARD', id: 'dashboard', href: '/dashboard' },
+    { name: 'LIQUIDATION', id: 'liquidation', href: '/liquidation' },
+    {
+      name: 'FLASH LOAN',
+      id: 'flash',
+      href: '/flash',
+    },
+    { name: 'ADMIN', id: 'admin', href: '/admin' },
     { name: 'MARKETS', id: 'markets', href: '/markets' },
-    { name: 'DOCS', id: 'docs', href: '/docs' }
-  ];
+    { name: 'DOCS', id: 'docs', href: '/docs' },
+  ] as const;
+  const navItems = baseNavItems.filter((item) => item.id !== 'admin' || isAdminWallet);
+
+  const dashboardViewParam = Array.isArray(router.query.view)
+    ? router.query.view[0]
+    : router.query.view;
+
+  const isNavItemActive = (id: string, href: string) => {
+    if (id === 'flash') {
+      return router.pathname === '/dashboard' && dashboardViewParam === 'flash';
+    }
+    if (id === 'liquidation') {
+      return router.pathname === '/dashboard' && dashboardViewParam === 'liquidation';
+    }
+    if (id === 'dashboard') {
+      return (
+        router.pathname === '/dashboard' &&
+        dashboardViewParam !== 'flash' &&
+        dashboardViewParam !== 'liquidation' &&
+        dashboardViewParam !== 'markets' &&
+        dashboardViewParam !== 'docs'
+      );
+    }
+    const base = href.split('?')[0];
+    return router.pathname === base;
+  };
 
   const formatAddress = (addr: string) => {
     if (!addr) return '';
@@ -79,8 +119,8 @@ const Navbar = () => {
     setIsDropdownOpen(false);
   };
 
-  const NavLink = ({ item }: { item: typeof navItems[0] }) => {
-    const isActive = router.pathname === item.href;
+  const NavLink = ({ item }: { item: (typeof navItems)[number] }) => {
+    const isActive = isNavItemActive(item.id, item.href);
     return (
       <Link
         key={item.id}
@@ -290,7 +330,7 @@ const Navbar = () => {
           style={{ background: '#030712', backdropFilter: 'blur(20px)' }}
         >
           {navItems.map((item) => {
-            const isActive = router.pathname === item.href;
+            const isActive = isNavItemActive(item.id, item.href);
             return (
               <Link
                 key={item.id}
