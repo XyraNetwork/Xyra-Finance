@@ -1607,35 +1607,53 @@ const DashboardPage: NextPageWithLayout = () => {
 
     (async () => {
       try {
-        await refreshPoolState(true);
-        await refreshUsdcPoolState(true);
-        await refreshUsadPoolState(true);
+        await Promise.all([
+          refreshPoolState(true),
+          refreshUsdcPoolState(true),
+          refreshUsadPoolState(true),
+        ]);
       } finally {
         setUserPositionInitialized(true);
       }
     })();
   }, [connected, publicKey, requestRecords, walletPermissionsInitialized, userPositionInitialized]);
 
-  // Load transaction history from Supabase when wallet address is available
+  // Load Supabase tx history only on views that show it (avoid work on Flash-only visits).
+  const viewWantsTxHistory = view === 'dashboard' || view === 'liquidation';
   useEffect(() => {
-    if (address?.trim()) {
-      fetchTransactionHistory();
-      fetchFlashSessions();
-    } else {
+    if (!address?.trim()) {
       setTxHistory([]);
-      setFlashSessions([]);
+      return;
     }
-  }, [address, fetchTransactionHistory, fetchFlashSessions]);
+    if (viewWantsTxHistory) {
+      fetchTransactionHistory();
+    }
+  }, [address, viewWantsTxHistory, fetchTransactionHistory]);
 
-  // Auto-refresh transaction history every 1 min (e.g. to show vault_tx_id when backend completes)
+  // Flash sessions API only when Flash tab is open (sessions table is not shown elsewhere).
+  useEffect(() => {
+    if (!address?.trim()) {
+      setFlashSessions([]);
+      return;
+    }
+    if (view === 'flash') {
+      fetchFlashSessions();
+    }
+  }, [address, view, fetchFlashSessions]);
+
+  // Poll only what the current view needs (no duplicate 60s load of both lists on every tab).
   useEffect(() => {
     if (!address?.trim()) return;
     const interval = setInterval(() => {
-      fetchTransactionHistory();
-      fetchFlashSessions();
+      if (view === 'dashboard' || view === 'liquidation') {
+        fetchTransactionHistory();
+      }
+      if (view === 'flash') {
+        fetchFlashSessions();
+      }
     }, 60_000);
     return () => clearInterval(interval);
-  }, [address, fetchTransactionHistory, fetchFlashSessions]);
+  }, [address, view, fetchTransactionHistory, fetchFlashSessions]);
 
   useEffect(() => {
     if (!flashSessionId) return;
@@ -2649,6 +2667,10 @@ const DashboardPage: NextPageWithLayout = () => {
   };
 
   useEffect(() => {
+    if (view !== 'liquidation') {
+      setLiqPreview({ loading: false, ok: false, liquidatable: false });
+      return;
+    }
     let cancelled = false;
     const run = async () => {
       if (!publicKey?.trim().startsWith('aleo1') || !requestRecords) {
@@ -2684,7 +2706,7 @@ const DashboardPage: NextPageWithLayout = () => {
     return () => {
       cancelled = true;
     };
-  }, [liqRepayAmountInput, liqSeizeAsset, publicKey, requestRecords, decrypt]);
+  }, [view, liqRepayAmountInput, liqSeizeAsset, publicKey, requestRecords, decrypt]);
 
   useEffect(() => {
     if (view !== 'liquidation' || !connected || !requestRecords || !publicKey?.trim().startsWith('aleo1')) {
