@@ -10,6 +10,7 @@ import {
 } from '@/types';
 import { Network } from '@provablehq/aleo-types';
 import { frontendLogger, safeJsonStringify } from '@/utils/logger';
+import { DEBUG_PRIVACY, privacyLog, privacyWarn } from '@/utils/privacyLog';
 import { TREASURY_ADDRESS, getTreasuryRequestMessage } from '@/config/treasury';
 
 // Note: @aleohq/wasm is not imported directly due to WASM build issues in Next.js
@@ -20,18 +21,6 @@ export const LENDING_POOL_PROGRAM_ID = BOUNTY_PROGRAM_ID;
 export const USDC_LENDING_POOL_PROGRAM_ID = USDC_POOL_PROGRAM_ID;
 export const USAD_LENDING_POOL_PROGRAM_ID = USAD_POOL_PROGRAM_ID;
 export const CREDITS_PROGRAM_ID = 'credits.aleo';
-
-const DEBUG_PRIVACY =
-  typeof process !== 'undefined' &&
-  String(process.env.NEXT_PUBLIC_DEBUG_PRIVACY || '').trim().toLowerCase() === 'true';
-
-function privacyLog(...args: any[]): void {
-  if (DEBUG_PRIVACY) console.log(...args);
-}
-
-function privacyWarn(...args: any[]): void {
-  if (DEBUG_PRIVACY) console.warn(...args);
-}
 
 /**
  * Debug function to diagnose what records are available in the wallet
@@ -107,17 +96,40 @@ export async function debugAllRecords(
 
   privacyLog('🔍 === DIAGNOSIS COMPLETE ===');
   privacyLog('📊 Summary:', results);
-  
-  // Store diagnostic in logger
-  frontendLogger.storeRecordDiagnostic(
-    publicKey,
-    creditsRecordsResult,
-    lendingPoolRecordsResult,
-    allRecordsResult,
-    errors,
-    warnings
-  );
-  
+
+  if (DEBUG_PRIVACY) {
+    frontendLogger.storeRecordDiagnostic(
+      publicKey,
+      creditsRecordsResult,
+      lendingPoolRecordsResult,
+      allRecordsResult,
+      errors,
+      warnings,
+    );
+  }
+
+  if (!DEBUG_PRIVACY) {
+    const sanitized: Record<string, unknown> = {
+      timestamp: results.timestamp,
+      publicKey: results.publicKey,
+      note: 'Full record payloads omitted. Set NEXT_PUBLIC_DEBUG_PRIVACY=true for details.',
+      approaches: {} as Record<string, unknown>,
+      errors,
+      warnings,
+    };
+    for (const key of Object.keys(results.approaches || {})) {
+      const a = (results.approaches as any)[key];
+      if (a && typeof a === 'object') {
+        (sanitized.approaches as Record<string, unknown>)[key] = {
+          success: (a as any).success,
+          count: (a as any).count,
+          error: (a as any).error,
+        };
+      }
+    }
+    return sanitized;
+  }
+
   return results;
 }
 
@@ -1027,10 +1039,10 @@ export async function lendingDeposit(
   decrypt?: (cipherText: string) => Promise<string>,
   poolProgramId: string = LENDING_POOL_PROGRAM_ID,
 ): Promise<string> {
-  console.log('========================================');
-  console.log('💰 LENDING DEPOSIT (credits) CALLED');
-  console.log('========================================');
-  console.log('📥 Input Parameters:', {
+  privacyLog('========================================');
+  privacyLog('💰 LENDING DEPOSIT (credits) CALLED');
+  privacyLog('========================================');
+  privacyLog('📥 Input Parameters:', {
     amount,
     network: CURRENT_NETWORK,
     programId: poolProgramId,
@@ -1070,7 +1082,7 @@ export async function lendingDeposit(
     const oracle = await fetchLendingOraclePublic(poolProgramId);
     const supIdxStr = `${oracle.supIdxAleo.toString()}u64`;
 
-    console.log('🔍 Fetching credits.aleo records for deposit...', {
+    privacyLog('🔍 Fetching credits.aleo records for deposit...', {
       CREDITS_PROGRAM_ID,
       requiredMicro,
     });
@@ -1078,7 +1090,7 @@ export async function lendingDeposit(
     let records = await requestRecords(CREDITS_PROGRAM_ID, false);
     if (!records || !Array.isArray(records)) records = [];
 
-    console.log(`📋 Found ${records.length} credits.aleo records`);
+    privacyLog(`📋 Found ${records.length} credits.aleo records`);
 
     // Helper similar to NullPay: extract microcredits from data or plaintext
     const getMicrocredits = (record: any): number => {
@@ -1108,7 +1120,7 @@ export async function lendingDeposit(
             val = getMicrocredits(r);
           }
         } catch (e) {
-          console.warn('⚠️ Failed to decrypt credits record for deposit:', e);
+          privacyWarn('⚠️ Failed to decrypt credits record for deposit:', e);
         }
       }
       return val;
@@ -1135,7 +1147,7 @@ export async function lendingDeposit(
       );
     }
 
-    console.log('✅ Selected credits.aleo record for deposit:', {
+    privacyLog('✅ Selected credits.aleo record for deposit:', {
       preview: JSON.stringify(payRecord).slice(0, 200),
     });
 
@@ -1143,19 +1155,19 @@ export async function lendingDeposit(
     let recordInput: string | any = payRecord.plaintext;
 
     if (!recordInput) {
-      console.warn('⚠️ Credits record missing plaintext. Attempting to reconstruct...');
+      privacyWarn('⚠️ Credits record missing plaintext. Attempting to reconstruct...');
       const nonce = payRecord.nonce || payRecord._nonce || payRecord.data?._nonce;
       const micro = getMicrocredits(payRecord);
       const owner = payRecord.owner;
 
       if (nonce && micro > 0 && owner) {
         recordInput = `{ owner: ${owner}.private, microcredits: ${micro}u64.private, _nonce: ${nonce}.public }`;
-        console.log('✅ Reconstructed credits plaintext for deposit:', recordInput);
+        privacyLog('✅ Reconstructed credits plaintext for deposit:', recordInput);
       } else if (payRecord.ciphertext || payRecord.recordCiphertext) {
         recordInput = payRecord.ciphertext || payRecord.recordCiphertext;
-        console.log('✅ Using credits ciphertext for deposit input.');
+        privacyLog('✅ Using credits ciphertext for deposit input.');
       } else {
-        console.warn('⚠️ Could not reconstruct credits record; passing raw object (last resort).');
+        privacyWarn('⚠️ Could not reconstruct credits record; passing raw object (last resort).');
         recordInput = payRecord;
       }
     }
@@ -1177,7 +1189,7 @@ export async function lendingDeposit(
 
     const inputs: any[] = [pos.input, recordInput, amountInput, supIdxStrAtSubmit];
 
-    console.log('🔍 Calling executeTransaction for deposit_with_credits...', {
+    privacyLog('🔍 Calling executeTransaction for deposit_with_credits...', {
       program: poolProgramId,
       function: 'deposit_with_credits',
       inputsPreview: {
@@ -1203,10 +1215,10 @@ export async function lendingDeposit(
       throw new Error('Deposit failed: No temporary transactionId returned from wallet.');
     }
 
-    console.log('Temporary Transaction ID (deposit_with_credits):', tempId);
+    privacyLog('Temporary Transaction ID (deposit_with_credits):', tempId);
     return tempId;
   } catch (error: any) {
-    console.error('❌ LENDING DEPOSIT (credits) FAILED:', error);
+    console.error('❌ LENDING DEPOSIT (credits) FAILED:', error?.message ?? error);
 
     const rawMsg = String(error?.message || error || '').toLowerCase();
     const isCancelled =
@@ -1265,7 +1277,7 @@ export async function lendingBorrow(
     const amountMicro = BigInt(Math.round(amount * 1_000_000));
     const inputs = lendingBorrowProgramInputs(pos.input, amountMicro, '0field', oracle);
 
-    console.log('🔍 Calling executeTransaction for borrow (public fee)...');
+    privacyLog('🔍 Calling executeTransaction for borrow (public fee)...');
     const result = await executeTransaction({
       program: poolProgramId,
       function: 'borrow',
@@ -1280,10 +1292,10 @@ export async function lendingBorrow(
       throw new Error('Borrow failed: No temporary transactionId returned from wallet.');
     }
 
-    console.log('Temporary Transaction ID (borrow):', tempId);
+    privacyLog('Temporary Transaction ID (borrow):', tempId);
     return tempId;
   } catch (error: any) {
-    console.error('❌ LENDING BORROW FUNCTION FAILED:', error);
+    console.error('❌ LENDING BORROW FUNCTION FAILED:', error?.message ?? error);
 
     const rawMsg = String(error?.message || error || '').toLowerCase();
     const isCancelled =
@@ -1384,7 +1396,7 @@ export async function lendingRepay(
     const amountMicro = Math.round(amount * 1_000_000);
     const requiredMicro = amountMicro;
 
-    console.log('🔍 Fetching credits.aleo records for repay...', {
+    privacyLog('🔍 Fetching credits.aleo records for repay...', {
       CREDITS_PROGRAM_ID,
       requiredMicro,
     });
@@ -1392,7 +1404,7 @@ export async function lendingRepay(
     let records = await requestRecords(CREDITS_PROGRAM_ID, false);
     if (!records || !Array.isArray(records)) records = [];
 
-    console.log(`📋 Found ${records.length} credits.aleo records (for repay)`);
+    privacyLog(`📋 Found ${records.length} credits.aleo records (for repay)`);
 
     const getMicrocredits = (record: any): number => {
       try {
@@ -1421,7 +1433,7 @@ export async function lendingRepay(
             val = getMicrocredits(r);
           }
         } catch (e) {
-          console.warn('⚠️ Failed to decrypt credits record for repay:', e);
+          privacyWarn('⚠️ Failed to decrypt credits record for repay:', e);
         }
       }
       return val;
@@ -1448,7 +1460,7 @@ export async function lendingRepay(
       );
     }
 
-    console.log('✅ Selected credits.aleo record for repay:', {
+    privacyLog('✅ Selected credits.aleo record for repay:', {
       preview: JSON.stringify(payRecord).slice(0, 200),
     });
 
@@ -1456,19 +1468,19 @@ export async function lendingRepay(
     let recordInput: string | any = payRecord.plaintext;
 
     if (!recordInput) {
-      console.warn('⚠️ Credits record missing plaintext (repay). Attempting to reconstruct...');
+      privacyWarn('⚠️ Credits record missing plaintext (repay). Attempting to reconstruct...');
       const nonce = payRecord.nonce || payRecord._nonce || payRecord.data?._nonce;
       const micro = getMicrocredits(payRecord);
       const owner = payRecord.owner;
 
       if (nonce && micro > 0 && owner) {
         recordInput = `{ owner: ${owner}.private, microcredits: ${micro}u64.private, _nonce: ${nonce}.public }`;
-        console.log('✅ Reconstructed credits plaintext for repay:', recordInput);
+        privacyLog('✅ Reconstructed credits plaintext for repay:', recordInput);
       } else if (payRecord.ciphertext || payRecord.recordCiphertext) {
         recordInput = payRecord.ciphertext || payRecord.recordCiphertext;
-        console.log('✅ Using credits ciphertext for repay input.');
+        privacyLog('✅ Using credits ciphertext for repay input.');
       } else {
-        console.warn('⚠️ Could not reconstruct credits record; passing raw object (last resort).');
+        privacyWarn('⚠️ Could not reconstruct credits record; passing raw object (last resort).');
         recordInput = payRecord;
       }
     }
@@ -1476,7 +1488,7 @@ export async function lendingRepay(
     const amountInput = `${amountMicro}u64`;
     const inputs: any[] = [pos.input, recordInput, amountInput, ...oracleToRepayPublicInputs(oracle)];
 
-    console.log('🔍 Calling executeTransaction for repay_with_credits...', {
+    privacyLog('🔍 Calling executeTransaction for repay_with_credits...', {
       program: poolProgramId,
       function: 'repay_with_credits',
       inputsPreview: {
@@ -1501,10 +1513,10 @@ export async function lendingRepay(
       throw new Error('Repay failed: No temporary transactionId returned from wallet.');
     }
 
-    console.log('Temporary Transaction ID (repay_with_credits):', tempId);
+    privacyLog('Temporary Transaction ID (repay_with_credits):', tempId);
     return tempId;
   } catch (error: any) {
-    console.error('❌ LENDING REPAY (credits) FAILED:', error);
+    console.error('❌ LENDING REPAY (credits) FAILED:', error?.message ?? error);
 
     const rawMsg = String(error?.message || error || '').toLowerCase();
     const isCancelled =
@@ -2090,7 +2102,7 @@ export async function lendingFlashSettleWithUsad(
     if (!txId) throw new Error('flash_settle_with_usad failed: no transactionId returned.');
     return txId;
   } catch (error: any) {
-    console.error('[USAD flash settle] Raw error:', error?.message ?? error, error);
+    console.error('[USAD flash settle] Raw error:', error?.message ?? error);
     return handleUsadTxError(error, 'USAD flash settle');
   }
 }
@@ -2144,7 +2156,7 @@ export async function lendingWithdraw(
     }
     const bh = getWalletRecordBlockHeight(pos.walletRecord);
     const posInputKind = typeof pos.input === 'string' ? 'plaintext' : 'object';
-    console.log(
+    privacyLog(
       '[ALEO withdraw] diagnostics',
       JSON.stringify(
         {
@@ -2188,7 +2200,7 @@ export async function lendingWithdraw(
     );
     const inputs = lendingWithdrawProgramInputs(pos.input, amountMicro, '0field', oracle);
 
-    console.log('🔍 Calling executeTransaction for withdraw (public fee)...');
+    privacyLog('🔍 Calling executeTransaction for withdraw (public fee)...');
     const result = await executeTransaction({
       program: poolProgramId,
       function: 'withdraw',
@@ -2203,10 +2215,10 @@ export async function lendingWithdraw(
       throw new Error('Withdraw failed: No temporary transactionId returned from wallet.');
     }
 
-    console.log('Temporary Transaction ID (withdraw):', tempId);
+    privacyLog('Temporary Transaction ID (withdraw):', tempId);
     return tempId;
   } catch (error: any) {
-    console.error('❌ LENDING WITHDRAW FUNCTION FAILED:', error);
+    console.error('❌ LENDING WITHDRAW FUNCTION FAILED:', error?.message ?? error);
 
     const rawMsg = String(error?.message || error || '').toLowerCase();
     const isCancelled =
@@ -2381,7 +2393,7 @@ async function generateFreezeListProof(targetIndex: number = 1, occupiedLeafValu
 
     return `{ siblings: [${siblings.join(', ')}], leaf_index: ${targetIndex}u32 }`;
   } catch (e: any) {
-    console.warn('Merkle Proof Generation Warning (using fallback):', e?.message || e);
+    privacyWarn('Merkle Proof Generation Warning (using fallback):', e?.message || e);
     const s = Array(16).fill('0field').join(', ');
     return `{ siblings: [${s}], leaf_index: ${targetIndex}u32 }`;
   }
@@ -2402,10 +2414,10 @@ async function generateNullPayStyleUsdcProofPair(): Promise<string> {
       const grp = addr.toGroup();
       index0Field = grp.toXCoordinate().toString();
     } catch (e: any) {
-      console.warn('[USDC proofs] Failed to convert freeze_list_index[0] address to field:', e?.message || e);
+      privacyWarn('[USDC proofs] Failed to convert freeze_list_index[0] address to field:', e?.message || e);
     }
   }
-  console.log(
+  privacyLog(
     `[USDC proofs] Freeze-list state -> root: ${root ?? 'null'}, count: ${count}, index[0]: ${index0 ?? 'null'}, index0Field: ${index0Field ?? 'null'}`,
   );
   const proof = await generateFreezeListProof(1, index0Field);
@@ -2455,12 +2467,12 @@ async function getUsdcMerkleProofsInput(
   // 4) NullPay-style fallback: derive proofs from freeze-list tree in browser.
   try {
     const generated = await generateNullPayStyleUsdcProofPair();
-    console.log(
+    privacyLog(
       '[USDC proofs] Wallet record had no proofs; using NullPay-style generated freeze-list proof pair.',
     );
     return mk(generated, 'generated-nullpay');
   } catch (fallbackErr: any) {
-    console.warn(
+    privacyWarn(
       '[USDC proofs] Dynamic fallback generation failed, using static deposit_proofs.in pair:',
       fallbackErr?.message || fallbackErr,
     );
@@ -2621,11 +2633,11 @@ async function generateNullPayStyleUsadProofPair(): Promise<string> {
       const grp = addr.toGroup();
       index0Field = grp.toXCoordinate().toString();
     } catch (e: any) {
-      console.warn('[USAD proofs] Failed to convert freeze_list_index[0] address to field:', e?.message || e);
+      privacyWarn('[USAD proofs] Failed to convert freeze_list_index[0] address to field:', e?.message || e);
     }
   }
 
-  console.log(
+  privacyLog(
     `[USAD proofs] Freeze-list state -> root: ${root ?? 'null'}, count: ${count}, index[0]: ${index0 ?? 'null'}, index0Field: ${index0Field ?? 'null'}`,
   );
 
@@ -2672,7 +2684,7 @@ async function fetchUsadFreezeListAddresses(): Promise<string[]> {
     }
     return addresses.length > 0 ? addresses : [USAD_FREEZE_DEFAULT_ZERO_ADDRESS];
   } catch (e: any) {
-    console.warn('[USAD proofs] fetchUsadFreezeListAddresses failed:', e?.message || e);
+    privacyWarn('[USAD proofs] fetchUsadFreezeListAddresses failed:', e?.message || e);
     return [USAD_FREEZE_DEFAULT_ZERO_ADDRESS];
   }
 }
@@ -2691,7 +2703,7 @@ async function generateSealanceUsadProofPair(ownerAddress: string): Promise<stri
   const leftProof = sealance.getSiblingPath(tree, leftIdx, USAD_SEALANCE_TREE_DEPTH);
   const rightProof = sealance.getSiblingPath(tree, rightIdx, USAD_SEALANCE_TREE_DEPTH);
   const formatted = sealance.formatMerkleProof([leftProof, rightProof]);
-  console.log(
+  privacyLog(
     `[USAD proofs] SealanceMerkleTree pair for ${ownerAddress.slice(0, 12)}… (freeze entries: ${freezeListAddresses.length})`,
   );
   return formatted;
@@ -2752,16 +2764,16 @@ async function getUsadMerkleProofsInput(
   if (resolvedOwner) {
     try {
       const generated = await generateSealanceUsadProofPair(resolvedOwner);
-      console.log('[USAD proofs] Using SealanceMerkleTree (Veiled Markets–style) proof pair.');
+      privacyLog('[USAD proofs] Using SealanceMerkleTree (Veiled Markets–style) proof pair.');
       return mk(generated, 'sealance-generated');
     } catch (sealanceErr: any) {
-      console.warn(
+      privacyWarn(
         '[USAD proofs] SealanceMerkleTree failed, trying NullPay-style fallback:',
         sealanceErr?.message || sealanceErr,
       );
     }
   } else {
-    console.warn(
+    privacyWarn(
       '[USAD proofs] No wallet address for Sealance proofs; pass owner address or ensure Token plaintext has owner. Trying NullPay-style fallback.',
     );
   }
@@ -2769,10 +2781,10 @@ async function getUsadMerkleProofsInput(
   // 5) NullPay-style fallback: simplified Poseidon tree (browser).
   try {
     const generated = await generateNullPayStyleUsadProofPair();
-    console.log('[USAD proofs] Wallet record had no proofs; using NullPay-style generated proof pair.');
+    privacyLog('[USAD proofs] Wallet record had no proofs; using NullPay-style generated proof pair.');
     return mk(generated, 'generated-nullpay');
   } catch (fallbackErr: any) {
-    console.warn(
+    privacyWarn(
       '[USAD proofs] Dynamic fallback generation failed, using static deposit_proofs.in pair:',
       fallbackErr?.message || fallbackErr,
     );
@@ -3478,8 +3490,8 @@ export async function lendingDepositUsad(
     const proofsLiteral = proofBundle.literal;
 
     const feeMicro = DEFAULT_LENDING_FEE * 1_000_000;
-    console.log('[USAD deposit] ========== pool tx diagnostics ==========');
-    console.log(
+    privacyLog('[USAD deposit] ========== pool tx diagnostics ==========');
+    privacyLog(
       JSON.stringify(
         {
           ts: new Date().toISOString(),
@@ -3519,7 +3531,7 @@ export async function lendingDepositUsad(
       supIdxStrAtSubmit,
     ];
 
-    console.log('[USAD deposit] sup_idx at submit:', supIdxStrAtSubmit);
+    privacyLog('[USAD deposit] sup_idx at submit:', supIdxStrAtSubmit);
 
     const result = await executeTransaction({
       program: poolProgramId,
@@ -3535,7 +3547,7 @@ export async function lendingDepositUsad(
     logAleoTxExplorer('USAD deposit', tempId);
     return tempId;
   } catch (error: any) {
-    console.error('[USAD deposit] Raw error:', error?.message ?? error, error);
+    console.error('[USAD deposit] Raw error:', error?.message ?? error);
     return handleUsadTxError(error, 'USAD deposit');
   }
 }
@@ -3584,8 +3596,8 @@ export async function lendingRepayUsad(
     const proofsLiteral = proofBundle.literal;
 
     const feeMicro = DEFAULT_LENDING_FEE * 1_000_000;
-    console.log('[USAD repay] ========== pool tx diagnostics ==========');
-    console.log(
+    privacyLog('[USAD repay] ========== pool tx diagnostics ==========');
+    privacyLog(
       JSON.stringify(
         {
           ts: new Date().toISOString(),
@@ -3636,7 +3648,7 @@ export async function lendingRepayUsad(
     logAleoTxExplorer('USAD repay', tempId);
     return tempId;
   } catch (error: any) {
-    console.error('[USAD repay] Raw error:', error?.message ?? error, error);
+    console.error('[USAD repay] Raw error:', error?.message ?? error);
     return handleUsadTxError(error, 'USAD repay');
   }
 }
@@ -3681,7 +3693,7 @@ export async function lendingWithdrawUsad(
     if (amountMicro > LENDING_U64_MAX) throw new Error('Withdraw amount exceeds u64.');
     const bh = getWalletRecordBlockHeight(pos.walletRecord);
     const posInputKind = typeof pos.input === 'string' ? 'plaintext' : 'object';
-    console.log(
+    privacyLog(
       '[USAD withdraw] diagnostics',
       JSON.stringify(
         {
@@ -3826,8 +3838,8 @@ export async function lendingDepositUsdc(
     const proofsLiteral = proofBundle.literal;
     const feeMicro = DEFAULT_LENDING_FEE * 1_000_000;
 
-    console.log('[USDC deposit] ========== pool tx diagnostics ==========');
-    console.log(
+    privacyLog('[USDC deposit] ========== pool tx diagnostics ==========');
+    privacyLog(
       JSON.stringify(
         {
           ts: new Date().toISOString(),
@@ -3867,8 +3879,8 @@ export async function lendingDepositUsdc(
       supIdxStrAtSubmit,
     ];
 
-    console.log('[USDC deposit] input2 proofs preview:', proofsLiteral.slice(0, 220));
-    console.log('[USDC deposit] sup_idx at submit:', supIdxStrAtSubmit);
+    privacyLog('[USDC deposit] input2 proofs preview:', proofsLiteral.slice(0, 220));
+    privacyLog('[USDC deposit] sup_idx at submit:', supIdxStrAtSubmit);
 
     const result = await executeTransaction({
       program: poolProgramId,
@@ -3884,7 +3896,7 @@ export async function lendingDepositUsdc(
     logAleoTxExplorer('USDC deposit', tempId);
     return tempId;
   } catch (error: any) {
-    console.error('[USDC deposit] Raw error:', error?.message ?? error, error);
+    console.error('[USDC deposit] Raw error:', error?.message ?? error);
     return handleUsdcTxError(error, 'USDC deposit');
   }
 }
@@ -3931,8 +3943,8 @@ export async function lendingRepayUsdc(
     const proofsLiteral = proofBundle.literal;
     const feeMicro = DEFAULT_LENDING_FEE * 1_000_000;
 
-    console.log('[USDC repay] ========== pool tx diagnostics ==========');
-    console.log(
+    privacyLog('[USDC repay] ========== pool tx diagnostics ==========');
+    privacyLog(
       JSON.stringify(
         {
           ts: new Date().toISOString(),
@@ -3965,7 +3977,7 @@ export async function lendingRepayUsdc(
       ...oracleToRepayPublicInputs(oracle),
     ];
 
-    console.log('[USDC repay] input2 proofs preview:', proofsLiteral.slice(0, 220));
+    privacyLog('[USDC repay] input2 proofs preview:', proofsLiteral.slice(0, 220));
 
     const tokenRecords = await requestRecords(USDC_TOKEN_PROGRAM, false);
     const tokenIdx = findWalletRecordIndexInList(tokenRecords, tokenRecord);
@@ -3984,7 +3996,7 @@ export async function lendingRepayUsdc(
     logAleoTxExplorer('USDC repay', tempId);
     return tempId;
   } catch (error: any) {
-    console.error('[USDC repay] Raw error:', error?.message ?? error, error);
+    console.error('[USDC repay] Raw error:', error?.message ?? error);
     return handleUsdcTxError(error, 'USDC repay');
   }
 }
@@ -4026,7 +4038,7 @@ export async function lendingWithdrawUsdc(
     if (amountMicro > LENDING_U64_MAX) throw new Error('Withdraw amount exceeds u64.');
     const bh = getWalletRecordBlockHeight(pos.walletRecord);
     const posInputKind = typeof pos.input === 'string' ? 'plaintext' : 'object';
-    console.log(
+    privacyLog(
       '[USDC withdraw] diagnostics',
       JSON.stringify(
         {
@@ -4214,10 +4226,10 @@ export async function lendingInitializeUsadPool(
 export async function lendingAccrueInterest(
   executeTransaction: ((tx: any) => Promise<any>) | undefined,
 ): Promise<string> {
-  console.log('========================================');
-  console.log('📈 LENDING ACCRUE INTEREST FUNCTION CALLED (Aleo pool)');
-  console.log('========================================');
-  console.log('📥 Input Parameters:', {
+  privacyLog('========================================');
+  privacyLog('📈 LENDING ACCRUE INTEREST FUNCTION CALLED (Aleo pool)');
+  privacyLog('========================================');
+  privacyLog('📥 Input Parameters:', {
     network: CURRENT_NETWORK,
     programId: LENDING_POOL_PROGRAM_ID,
   });
@@ -4229,12 +4241,12 @@ export async function lendingAccrueInterest(
 
   try {
     const inputs: string[] = ['0field'];
-    console.log('💰 Transaction Configuration:', {
+    privacyLog('💰 Transaction Configuration:', {
       inputs,
       fee: `${fee} microcredits`,
     });
 
-    console.log('🔍 Calling executeTransaction for accrue_interest (public fee)...');
+    privacyLog('🔍 Calling executeTransaction for accrue_interest (public fee)...');
     const result = await executeTransaction({
       program: LENDING_POOL_PROGRAM_ID,
       function: 'accrue_interest',
@@ -4248,20 +4260,11 @@ export async function lendingAccrueInterest(
       throw new Error('Accrue interest failed: No temporary transactionId returned from wallet.');
     }
 
-    console.log('Temporary Transaction ID (accrue_interest):', tempId);
-    console.log('========================================\n');
+    privacyLog('Temporary Transaction ID (accrue_interest):', tempId);
+    privacyLog('========================================\n');
     return tempId;
   } catch (error: any) {
-    console.error('========================================');
-    console.error('❌ LENDING ACCRUE INTEREST FUNCTION FAILED');
-    console.error('========================================');
-    console.error('📋 Error Details:', {
-      message: error?.message,
-      name: error?.name,
-      stack: error?.stack,
-      error: error,
-    });
-    console.error('========================================\n');
+    console.error('❌ LENDING ACCRUE INTEREST FUNCTION FAILED:', error?.message ?? error);
 
     const rawMsg = String(error?.message || error || '').toLowerCase();
     const isCancelled =
@@ -5015,8 +5018,9 @@ function weightedCollateralUsdMicro(realSup: bigint, price: bigint, ltv: bigint)
   return rpTimesLOk ? (rp * ltv) / den : ((rp / LENDING_PRICE_SCALE) * ltv) / LENDING_LTV_SCALE;
 }
 
-/** Set `NEXT_PUBLIC_XYRA_WITHDRAW_DEBUG=true` in `.env` and restart dev — logs `[xyra withdraw audit]` before each withdraw tx. */
+/** Requires `NEXT_PUBLIC_DEBUG_PRIVACY=true` and `NEXT_PUBLIC_XYRA_WITHDRAW_DEBUG=true` — logs `[xyra withdraw audit]` before each withdraw tx. */
 const XYRA_WITHDRAW_AUDIT_DEBUG =
+  DEBUG_PRIVACY &&
   typeof process !== 'undefined' &&
   (process.env.NEXT_PUBLIC_XYRA_WITHDRAW_DEBUG === 'true' ||
     process.env.NEXT_PUBLIC_XYRA_WITHDRAW_DEBUG === '1');
@@ -5250,7 +5254,7 @@ async function logLendingWithdrawAuditIfEnabled(
   if (!XYRA_WITHDRAW_AUDIT_DEBUG) return;
   const sim = simulateLendingWithdrawTransitionAudit(scaled, oracle, amountMicro, outField);
   const liquidity = await previewLendingWithdrawFinalizeLiquidity(poolProgramId, outField, amountMicro);
-  console.log(
+  privacyLog(
     '[xyra withdraw audit]',
     JSON.stringify(
       {
@@ -5456,7 +5460,7 @@ export async function probeLendingPositionMappings(
     notes.push(`probeUserKeyVariantsForAleoSupply: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  console.log('[probeLendingPositionMappings]', {
+  privacyLog('[probeLendingPositionMappings]', {
     rpcUrl: CURRENT_RPC_URL,
     programId,
     address: trimmed,
@@ -6252,7 +6256,7 @@ export async function getAddressHashFromContract(
     };
     
     const txId = await requestTransaction(transaction);
-    console.log('✅ get_address_hash transaction submitted:', txId);
+    privacyLog('✅ get_address_hash transaction submitted:', txId);
     
     // Wait for transaction to finalize and extract hash from output
     // Note: This is a simplified version - you may need to adjust based on actual transaction output format
@@ -6291,7 +6295,7 @@ export async function getUserActivityFromContract(
     };
     
     const txId = await requestTransaction(transaction);
-    console.log('✅ get_user_activity transaction submitted:', txId);
+    privacyLog('✅ get_user_activity transaction submitted:', txId);
     
     return txId;
   } catch (error: any) {
@@ -6654,18 +6658,7 @@ export async function getUserPosition(
   
   // Fallback: Read from records (may be placeholders, but better than nothing)
   if (!requestRecords) {
-    console.warn('getUserPosition: requestRecords not available');
-    return { 
-      supplied: '0', 
-      borrowed: '0',
-      totalDeposits: '0',
-      totalWithdrawals: '0',
-      totalBorrows: '0',
-      totalRepayments: '0',
-    };
-  }
-  if (!requestRecords) {
-    console.warn('getUserPosition: requestRecords not available');
+    privacyWarn('getUserPosition: requestRecords not available');
     return { 
       supplied: '0', 
       borrowed: '0',
@@ -6679,41 +6672,41 @@ export async function getUserPosition(
   try {
     // Request all UserActivity records from the wallet for lending_pool_v8.aleo
     // These are PRIVATE records - only visible to the wallet owner
-    console.log('========================================');
-    console.log('🔍 getUserPosition: RECORD FETCH DEBUG');
-    console.log('========================================');
-    console.log('Step 1: Calling requestRecords with program ID:', LENDING_POOL_PROGRAM_ID);
-    console.log('User Address:', publicKey);
-    console.log('requestRecords function type:', typeof requestRecords);
+    privacyLog('========================================');
+    privacyLog('🔍 getUserPosition: RECORD FETCH DEBUG');
+    privacyLog('========================================');
+    privacyLog('Step 1: Calling requestRecords with program ID:', LENDING_POOL_PROGRAM_ID);
+    privacyLog('User Address:', publicKey);
+    privacyLog('requestRecords function type:', typeof requestRecords);
     
     // Request records from current program only (lending_pool_v8.aleo)
     let records: any[] | null = null;
     
     try {
-      console.log('Requesting records for program:', LENDING_POOL_PROGRAM_ID);
+      privacyLog('Requesting records for program:', LENDING_POOL_PROGRAM_ID);
       // requestRecords takes two parameters: (programId: string, includeSpent?: boolean)
       records = await requestRecords(LENDING_POOL_PROGRAM_ID, false);
-      console.log('requestRecords returned:', records?.length || 0, 'records');
+      privacyLog('requestRecords returned:', records?.length || 0, 'records');
       
       if (records && Array.isArray(records) && records.length > 0) {
-        console.log('✅ Successfully got records from current program');
+        privacyLog('✅ Successfully got records from current program');
       } else {
-        console.warn('⚠️ No records found for current program');
+        privacyWarn('⚠️ No records found for current program');
       }
     } catch (recordsError: any) {
-      console.warn('requestRecords failed:', recordsError?.message);
+      privacyWarn('requestRecords failed:', recordsError?.message);
       records = null;
     }
     
-    console.log('Final records result:');
-    console.log('  - Records:', records);
-    console.log('  - Is Array:', Array.isArray(records));
-    console.log('  - Records Count:', records?.length || 0);
-    console.log('  - Records Type:', typeof records);
-    console.log('  - Is Null:', records === null);
-    console.log('  - Is Undefined:', records === undefined);
-    console.log('  - Full Records (first 1000 chars):', JSON.stringify(records, null, 2).substring(0, 1000));
-    console.log('========================================');
+    privacyLog('Final records result:');
+    privacyLog('  - Records:', records);
+    privacyLog('  - Is Array:', Array.isArray(records));
+    privacyLog('  - Records Count:', records?.length || 0);
+    privacyLog('  - Records Type:', typeof records);
+    privacyLog('  - Is Null:', records === null);
+    privacyLog('  - Is Undefined:', records === undefined);
+    privacyLog('  - Full Records (first 1000 chars):', JSON.stringify(records, null, 2).substring(0, 1000));
+    privacyLog('========================================');
     
     // Check if records is null, undefined, or empty
     if (records === null || records === undefined) {
@@ -6735,12 +6728,12 @@ export async function getUserPosition(
     if (!Array.isArray(records)) {
       console.error('❌ getUserPosition: requestRecords did not return an array');
       console.error('Returned type:', typeof records);
-      console.error('Returned value:', records);
+      privacyLog('Returned value:', records);
       // Try to convert to array if it's an object
       if (records && typeof records === 'object') {
-        console.log('Attempting to convert object to array...');
+        privacyLog('Attempting to convert object to array...');
         records = Object.values(records);
-        console.log('Converted records:', records);
+        privacyLog('Converted records:', records);
       } else {
         return { 
           supplied: '0', 
@@ -6781,30 +6774,30 @@ export async function getUserPosition(
     let recordsProcessed = 0;
 
     // Iterate through ALL records and sum them up
-    console.log('📊 Processing', records.length, 'records...');
+    privacyLog('📊 Processing', records.length, 'records...');
     for (let i = 0; i < records.length; i++) {
       const record = records[i];
       try {
-        console.log(`\n--- Processing Record ${i + 1}/${records.length} ---`);
-        console.log('Record type:', typeof record);
-        console.log('Record:', record);
+        privacyLog(`\n--- Processing Record ${i + 1}/${records.length} ---`);
+        privacyLog('Record type:', typeof record);
+        privacyLog('Record:', record);
         
         let recordData: any;
         if (typeof record === 'string') {
           try {
             recordData = JSON.parse(record);
-            console.log('Parsed from JSON string');
+            privacyLog('Parsed from JSON string');
           } catch {
             recordData = { raw: record };
-            console.log('Could not parse as JSON, treating as raw string');
+            privacyLog('Could not parse as JSON, treating as raw string');
           }
         } else {
           recordData = record;
-          console.log('Record is already an object');
+          privacyLog('Record is already an object');
         }
         
-        console.log('Record Data:', JSON.stringify(recordData, null, 2));
-        console.log('Record Keys:', recordData ? Object.keys(recordData) : 'null');
+        privacyLog('Record Data:', JSON.stringify(recordData, null, 2));
+        privacyLog('Record Keys:', recordData ? Object.keys(recordData) : 'null');
         
         // Check if this is a UserActivity record - be more lenient
         const hasUserActivityFields = 
@@ -6826,12 +6819,12 @@ export async function getUserPosition(
         
         const isUserActivity = hasUserActivityFields || matchesProgram;
         
-        console.log('Is UserActivity?', isUserActivity);
-        console.log('  - Has UserActivity fields:', hasUserActivityFields);
-        console.log('  - Matches program:', matchesProgram);
+        privacyLog('Is UserActivity?', isUserActivity);
+        privacyLog('  - Has UserActivity fields:', hasUserActivityFields);
+        privacyLog('  - Matches program:', matchesProgram);
         
         if (isUserActivity || hasUserActivityFields) {
-          console.log('✅ Found UserActivity record!');
+          privacyLog('✅ Found UserActivity record!');
           
           // Helper function to extract numeric value from various formats
           const extractValue = (value: any): number | undefined => {
@@ -6867,12 +6860,12 @@ export async function getUserPosition(
             totalWithdrawals = extractValue(recordData.data.total_withdrawals);
             totalBorrows = extractValue(recordData.data.total_borrows);
             totalRepayments = extractValue(recordData.data.total_repayments);
-            console.log('getUserPosition: Extracted from data - deposits:', totalDeposits, 'withdrawals:', totalWithdrawals, 'borrows:', totalBorrows, 'repayments:', totalRepayments);
+            privacyLog('getUserPosition: Extracted from data - deposits:', totalDeposits, 'withdrawals:', totalWithdrawals, 'borrows:', totalBorrows, 'repayments:', totalRepayments);
           }
           
           // Structure 2: recordData.total_deposits (top level)
           if (totalDeposits === undefined && recordData.total_deposits !== undefined) {
-            console.log('📦 Trying top-level total_deposits');
+            privacyLog('📦 Trying top-level total_deposits');
             totalDeposits = extractValue(recordData.total_deposits);
           }
           if (totalWithdrawals === undefined && recordData.total_withdrawals !== undefined) {
@@ -6913,7 +6906,7 @@ export async function getUserPosition(
             }
           }
           
-          console.log('getUserPosition: Extracted values from record - deposits:', totalDeposits, 'withdrawals:', totalWithdrawals, 'borrows:', totalBorrows, 'repayments:', totalRepayments);
+          privacyLog('getUserPosition: Extracted values from record - deposits:', totalDeposits, 'withdrawals:', totalWithdrawals, 'borrows:', totalBorrows, 'repayments:', totalRepayments);
           
           // Sum up all values to get cumulative totals
           // Each record represents one transaction, so summing all gives cumulative
@@ -6931,11 +6924,11 @@ export async function getUserPosition(
           }
           
           recordsProcessed++;
-          console.log('getUserPosition: Cumulative totals so far - deposits:', cumulativeTotalDeposits, 'withdrawals:', cumulativeTotalWithdrawals, 'borrows:', cumulativeTotalBorrows, 'repayments:', cumulativeTotalRepayments);
+          privacyLog('getUserPosition: Cumulative totals so far - deposits:', cumulativeTotalDeposits, 'withdrawals:', cumulativeTotalWithdrawals, 'borrows:', cumulativeTotalBorrows, 'repayments:', cumulativeTotalRepayments);
         }
       } catch (e) {
         // Skip records that can't be parsed
-        console.warn('getUserPosition: Failed to parse record:', e, record);
+        privacyWarn('getUserPosition: Failed to parse record:', e, record);
       }
     }
 
@@ -6943,22 +6936,22 @@ export async function getUserPosition(
     const calculatedNetSupplied = cumulativeTotalDeposits - cumulativeTotalWithdrawals;
     const calculatedNetBorrowed = cumulativeTotalBorrows - cumulativeTotalRepayments;
 
-    console.log('========================================');
-    console.log('📊 getUserPosition: CUMULATIVE TOTALS FROM RECORDS');
-    console.log('========================================');
-    console.log('📝 Records Processed:', recordsProcessed, 'out of', records.length);
-    console.log('💰 Cumulative Activity Totals (Sum of All Records):');
-    console.log('  - Total Deposits:', cumulativeTotalDeposits, '(sum of all deposit records)');
-    console.log('  - Total Withdrawals:', cumulativeTotalWithdrawals, '(sum of all withdrawal records)');
-    console.log('  - Total Borrows:', cumulativeTotalBorrows, '(sum of all borrow records)');
-    console.log('  - Total Repayments:', cumulativeTotalRepayments, '(sum of all repay records)');
-    console.log('📈 Net Positions:');
-    console.log('  - Net Supplied:', calculatedNetSupplied, '(deposits - withdrawals)');
-    console.log('  - Net Borrowed:', calculatedNetBorrowed, '(borrows - repayments)');
-    console.log('========================================');
-    console.log('ℹ️  Note: These are cumulative totals calculated by summing all UserActivity records.');
-    console.log('ℹ️  Each transaction creates a new record, so summing all gives the cumulative total.');
-    console.log('========================================');
+    privacyLog('========================================');
+    privacyLog('📊 getUserPosition: CUMULATIVE TOTALS FROM RECORDS');
+    privacyLog('========================================');
+    privacyLog('📝 Records Processed:', recordsProcessed, 'out of', records.length);
+    privacyLog('💰 Cumulative Activity Totals (Sum of All Records):');
+    privacyLog('  - Total Deposits:', cumulativeTotalDeposits, '(sum of all deposit records)');
+    privacyLog('  - Total Withdrawals:', cumulativeTotalWithdrawals, '(sum of all withdrawal records)');
+    privacyLog('  - Total Borrows:', cumulativeTotalBorrows, '(sum of all borrow records)');
+    privacyLog('  - Total Repayments:', cumulativeTotalRepayments, '(sum of all repay records)');
+    privacyLog('📈 Net Positions:');
+    privacyLog('  - Net Supplied:', calculatedNetSupplied, '(deposits - withdrawals)');
+    privacyLog('  - Net Borrowed:', calculatedNetBorrowed, '(borrows - repayments)');
+    privacyLog('========================================');
+    privacyLog('ℹ️  Note: These are cumulative totals calculated by summing all UserActivity records.');
+    privacyLog('ℹ️  Each transaction creates a new record, so summing all gives the cumulative total.');
+    privacyLog('========================================');
 
     // Return net positions (for backward compatibility) and individual counters
     // All values are returned as strings for display
@@ -6971,7 +6964,10 @@ export async function getUserPosition(
       totalRepayments: String(cumulativeTotalRepayments), // Cumulative repayments (sum of all records)
     };
   } catch (error) {
-    console.error('getUserPosition: Failed to fetch user activity from private records:', error);
+    console.error(
+      'getUserPosition: Failed to fetch user activity from private records:',
+      error instanceof Error ? error.message : error,
+    );
     return { 
       supplied: '0', 
       borrowed: '0',

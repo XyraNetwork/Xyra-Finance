@@ -77,6 +77,7 @@ import {
   type SelfLiquidationUiLimits,
 } from '@/components/aleo/rpc';
 import { frontendLogger } from '@/utils/logger';
+import { privacyLog, privacyWarn } from '@/utils/privacyLog';
 import { CURRENT_NETWORK } from '@/types';
 import { getSupabaseBrowserClient } from '@/utils/supabase/client';
 import {
@@ -659,30 +660,30 @@ const DashboardPage: NextPageWithLayout = () => {
   // Background record fetching function (non-blocking) - memoized with useCallback
   const fetchRecordsInBackground = useCallback(async (programId: string = LENDING_POOL_PROGRAM_ID) => {
     if (!connected || !requestRecords || !publicKey) {
-      console.log('📋 fetchRecordsInBackground: Skipping - wallet not connected or requestRecords not available');
+      privacyLog('📋 fetchRecordsInBackground: Skipping - wallet not connected or requestRecords not available');
       return;
     }
 
     // Don't fetch if already fetching
     if (isFetchingRecords) {
-      console.log('📋 fetchRecordsInBackground: Already fetching, skipping duplicate request');
+      privacyLog('📋 fetchRecordsInBackground: Already fetching, skipping duplicate request');
       return;
     }
 
     setIsFetchingRecords(true);
-    console.log(`📋 fetchRecordsInBackground: Starting background fetch for ${programId}...`);
+    privacyLog(`📋 fetchRecordsInBackground: Starting background fetch for ${programId}...`);
 
     try {
       // Step 1: Fetch encrypted records for this user from lending_pool_v8.aleo.
       // We use includePlaintext=false so we explicitly decrypt via decrypt().
       const records = await requestRecords(programId, false);
-      console.log(
+      privacyLog(
         `📋 fetchRecordsInBackground: Fetched ${records?.length || 0} records for ${programId}`,
         records,
       );
 
       if (!records || !Array.isArray(records) || records.length === 0) {
-        console.log('📋 fetchRecordsInBackground: No records found yet (may need more time to index)');
+        privacyLog('📋 fetchRecordsInBackground: No records found yet (may need more time to index)');
         // Reset user position to zero when no records
         setUserSupplied('0');
         setUserBorrowed('0');
@@ -694,7 +695,7 @@ const DashboardPage: NextPageWithLayout = () => {
       }
 
       if (!decrypt) {
-        console.warn('📋 fetchRecordsInBackground: decrypt() not available on wallet, cannot compute user position from records.');
+        privacyWarn('📋 fetchRecordsInBackground: decrypt() not available on wallet, cannot compute user position from records.');
         return;
       }
 
@@ -706,17 +707,17 @@ const DashboardPage: NextPageWithLayout = () => {
 
       for (let i = 0; i < records.length; i++) {
         const rec = records[i];
-        console.log(`📋 Decrypting record [${i}]`, rec);
+        privacyLog(`📋 Decrypting record [${i}]`, rec);
 
         const cipher = extractCiphertext(rec);
         if (!cipher) {
-          console.warn(`📋 Record [${i}] has no ciphertext field, skipping.`);
+          privacyWarn(`📋 Record [${i}] has no ciphertext field, skipping.`);
           continue;
         }
 
         try {
           const decryptedText = await decrypt(cipher);
-          console.log(`📋 Decrypted record [${i}] text:`, decryptedText);
+          privacyLog(`📋 Decrypted record [${i}] text:`, decryptedText);
 
           // In v2, one program emits UserActivity for all assets.
           // Filter to ALEO records only for this fetch path.
@@ -729,7 +730,7 @@ const DashboardPage: NextPageWithLayout = () => {
           totalBorrowsAccum += extractU64FromText('total_borrows', decryptedText);
           totalRepaymentsAccum += extractU64FromText('total_repayments', decryptedText);
         } catch (e: any) {
-          console.warn(`📋 Failed to decrypt record [${i}]:`, e?.message || e);
+          privacyWarn(`📋 Failed to decrypt record [${i}]:`, e?.message || e);
         }
       }
 
@@ -744,7 +745,7 @@ const DashboardPage: NextPageWithLayout = () => {
       setUserSupplied(String(netSupplied));
       setUserBorrowed(String(netBorrowed));
 
-      console.log('📋 fetchRecordsInBackground: User position updated from decrypted records', {
+      privacyLog('📋 fetchRecordsInBackground: User position updated from decrypted records', {
         totalDepositsAccum,
         totalWithdrawalsAccum,
         totalBorrowsAccum,
@@ -754,10 +755,10 @@ const DashboardPage: NextPageWithLayout = () => {
       });
     } catch (error: any) {
       // Silently handle errors in background fetch (don't spam user)
-      console.warn('📋 fetchRecordsInBackground: Error fetching records (non-critical):', error?.message);
+      privacyWarn('📋 fetchRecordsInBackground: Error fetching records (non-critical):', error?.message);
     } finally {
       setIsFetchingRecords(false);
-      console.log('📋 fetchRecordsInBackground: Background fetch completed');
+      privacyLog('📋 fetchRecordsInBackground: Background fetch completed');
     }
   }, [connected, requestRecords, publicKey, decrypt, isFetchingRecords]);
 
@@ -807,7 +808,7 @@ const DashboardPage: NextPageWithLayout = () => {
       setUserSuppliedUsdc(String(netSupplied));
       setUserBorrowedUsdc(String(netBorrowed));
     } catch (error: any) {
-      console.warn('fetchRecordsInBackgroundUsdc:', error?.message);
+      privacyWarn('fetchRecordsInBackgroundUsdc:', error?.message);
     } finally {
       setIsFetchingRecords(false);
     }
@@ -851,7 +852,7 @@ const DashboardPage: NextPageWithLayout = () => {
             const sampleWithdrawals = extractU64FromText('total_withdrawals', decryptedText);
             const sampleBorrows = extractU64FromText('total_borrows', decryptedText);
             const sampleRepayments = extractU64FromText('total_repayments', decryptedText);
-            console.log('[USAD records debug] sample', {
+            privacyLog('[USAD records debug] sample', {
               i,
               assetId,
               textPrefix: String(decryptedText).slice(0, 120),
@@ -875,8 +876,8 @@ const DashboardPage: NextPageWithLayout = () => {
       }
       const netSupplied = Math.max(0, totalDepositsAccum - totalWithdrawalsAccum);
       const netBorrowed = Math.max(0, totalBorrowsAccum - totalRepaymentsAccum);
-      console.log('[USAD records debug] assetId distribution', Object.fromEntries(seenAssetIds.entries()));
-      console.log('[USAD records debug] computed nets', {
+      privacyLog('[USAD records debug] assetId distribution', Object.fromEntries(seenAssetIds.entries()));
+      privacyLog('[USAD records debug] computed nets', {
         total_deposits: totalDepositsAccum,
         total_withdrawals: totalWithdrawalsAccum,
         total_borrows: totalBorrowsAccum,
@@ -891,7 +892,7 @@ const DashboardPage: NextPageWithLayout = () => {
       setUserSuppliedUsad(String(netSupplied));
       setUserBorrowedUsad(String(netBorrowed));
     } catch (error: any) {
-      console.warn('fetchRecordsInBackgroundUsad:', error?.message);
+      privacyWarn('fetchRecordsInBackgroundUsad:', error?.message);
     } finally {
       setIsFetchingRecords(false);
     }
@@ -900,33 +901,33 @@ const DashboardPage: NextPageWithLayout = () => {
   // Fetch all user records (both credits.aleo and lending_pool_v8.aleo)
   const fetchAllUserRecords = useCallback(async () => {
     if (!connected || !requestRecords || !publicKey) {
-      console.log('📋 fetchAllUserRecords: Skipping - wallet not connected');
+      privacyLog('📋 fetchAllUserRecords: Skipping - wallet not connected');
       return;
     }
 
     if (isFetchingRecords) {
-      console.log('📋 fetchAllUserRecords: Already fetching, skipping');
+      privacyLog('📋 fetchAllUserRecords: Already fetching, skipping');
       return;
     }
 
     setIsFetchingRecords(true);
-    console.log('📋 fetchAllUserRecords: Fetching all user records on refresh...');
+    privacyLog('📋 fetchAllUserRecords: Fetching all user records on refresh...');
 
     try {
       // Fetch credits.aleo records
       try {
         const creditsRecords = await requestRecords('credits.aleo', false);
-        console.log(`📋 fetchAllUserRecords: Fetched ${creditsRecords?.length || 0} credits.aleo records`);
+        privacyLog(`📋 fetchAllUserRecords: Fetched ${creditsRecords?.length || 0} credits.aleo records`);
       } catch (error: any) {
-        console.warn('📋 fetchAllUserRecords: Error fetching credits.aleo records:', error?.message);
+        privacyWarn('📋 fetchAllUserRecords: Error fetching credits.aleo records:', error?.message);
       }
 
       // Fetch lending_pool_v8.aleo records and update user position
       await fetchRecordsInBackground(LENDING_POOL_PROGRAM_ID);
       
-      console.log('📋 fetchAllUserRecords: All records fetched successfully');
+      privacyLog('📋 fetchAllUserRecords: All records fetched successfully');
     } catch (error: any) {
-      console.warn('📋 fetchAllUserRecords: Error fetching records:', error?.message);
+      privacyWarn('📋 fetchAllUserRecords: Error fetching records:', error?.message);
     } finally {
       setIsFetchingRecords(false);
     }
@@ -1141,7 +1142,7 @@ const DashboardPage: NextPageWithLayout = () => {
       }
       setTxHistory(Array.isArray(data) ? data : []);
     } catch (e: any) {
-      console.warn('Failed to fetch transaction history:', e);
+      privacyWarn('Failed to fetch transaction history:', e);
       setTxHistoryError(e?.message || 'Network error');
       setTxHistory([]);
     } finally {
@@ -1209,12 +1210,12 @@ const DashboardPage: NextPageWithLayout = () => {
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
-        console.warn('Save transaction failed:', err?.error || res.statusText);
+        privacyWarn('Save transaction failed:', err?.error || res.statusText);
         return;
       }
       await fetchTransactionHistory();
     } catch (e) {
-      console.warn('Failed to save transaction:', e);
+      privacyWarn('Failed to save transaction:', e);
     }
   };
 
@@ -1266,13 +1267,13 @@ const DashboardPage: NextPageWithLayout = () => {
           return;
         }
         if (isDevAppEnv) {
-          console.warn('[chain caps] borrow or withdraw null', { borrow: !!borrow, withdraw: !!withdraw });
+          privacyWarn('[chain caps] borrow or withdraw null', { borrow: !!borrow, withdraw: !!withdraw });
         }
       } catch (e) {
-        if (isDevAppEnv) console.warn('[chain caps] attempt failed', i, e);
+        if (isDevAppEnv) privacyWarn('[chain caps] attempt failed', i, e);
       }
     }
-    if (isDevAppEnv) console.warn('[chain caps] all retries exhausted for', addr);
+    if (isDevAppEnv) privacyWarn('[chain caps] all retries exhausted for', addr);
     setChainBorrowCaps(null);
     setChainWithdrawCaps(null);
   }, [publicKey, requestRecords, decrypt]);
@@ -1322,7 +1323,7 @@ const DashboardPage: NextPageWithLayout = () => {
           }
           await refreshChainPortfolioCaps();
         } catch (error) {
-          console.warn('Failed to refresh user position from records:', error);
+          privacyWarn('Failed to refresh user position from records:', error);
           setUserSupplied('0');
           setUserBorrowed('0');
           setTotalDeposits('0');
@@ -1406,7 +1407,7 @@ const DashboardPage: NextPageWithLayout = () => {
           getPrivateUsdcBalance(requestRecords, decrypt).then(setPrivateUsdcBalance).catch(() => setPrivateUsdcBalance(null));
           await refreshChainPortfolioCaps();
         } catch (error) {
-          console.warn('Failed to refresh USDC user position:', error);
+          privacyWarn('Failed to refresh USDC user position:', error);
           setUserSuppliedUsdc('0');
           setUserBorrowedUsdc('0');
           setTotalDepositsUsdc('0');
@@ -1482,14 +1483,14 @@ const DashboardPage: NextPageWithLayout = () => {
 
           const privUsad = await getPrivateUsadBalance(requestRecords, decrypt);
           setPrivateUsadBalance(privUsad);
-          console.log('[USAD refresh debug]', {
+          privacyLog('[USAD refresh debug]', {
             effectiveSupply_usad: effective?.effectiveSupplyBalance ?? null,
             effectiveBorrow_usad: effective?.effectiveBorrowDebt ?? null,
             privateBalance_usad: privUsad,
           });
           await refreshChainPortfolioCaps();
         } catch (error) {
-          console.warn('Failed to refresh USAD user position:', error);
+          privacyWarn('Failed to refresh USAD user position:', error);
           setUserSuppliedUsad('0');
           setUserBorrowedUsad('0');
           setTotalDepositsUsad('0');
@@ -1553,36 +1554,36 @@ const DashboardPage: NextPageWithLayout = () => {
 
     (async () => {
       try {
-        console.log('🔐 Initializing wallet record permissions (one-time request)...');
+        privacyLog('🔐 Initializing wallet record permissions (one-time request)...');
         // Some wallets do not allow an empty program string. Instead, request for
         // the specific programs this dApp cares about so the user sees at most
         // one prompt per program.
         try {
           await requestRecords(LENDING_POOL_PROGRAM_ID, false);
-          console.log(`✅ Wallet record permissions initialized for ${LENDING_POOL_PROGRAM_ID}`);
+          privacyLog(`✅ Wallet record permissions initialized for ${LENDING_POOL_PROGRAM_ID}`);
         } catch (e: any) {
-          console.warn(
+          privacyWarn(
             `⚠️ Failed to pre-initialize permissions for ${LENDING_POOL_PROGRAM_ID}:`,
             e?.message,
           );
         }
         try {
           await requestRecords(USDC_LENDING_POOL_PROGRAM_ID, false);
-          console.log(`✅ Wallet record permissions initialized for ${USDC_LENDING_POOL_PROGRAM_ID}`);
+          privacyLog(`✅ Wallet record permissions initialized for ${USDC_LENDING_POOL_PROGRAM_ID}`);
         } catch (e: any) {
-          console.warn(`⚠️ Failed to pre-initialize permissions for ${USDC_LENDING_POOL_PROGRAM_ID}:`, e?.message);
+          privacyWarn(`⚠️ Failed to pre-initialize permissions for ${USDC_LENDING_POOL_PROGRAM_ID}:`, e?.message);
         }
         try {
           await requestRecords(USAD_LENDING_POOL_PROGRAM_ID, false);
-          console.log(`✅ Wallet record permissions initialized for ${USAD_LENDING_POOL_PROGRAM_ID}`);
+          privacyLog(`✅ Wallet record permissions initialized for ${USAD_LENDING_POOL_PROGRAM_ID}`);
         } catch (e: any) {
-          console.warn(`⚠️ Failed to pre-initialize permissions for ${USAD_LENDING_POOL_PROGRAM_ID}:`, e?.message);
+          privacyWarn(`⚠️ Failed to pre-initialize permissions for ${USAD_LENDING_POOL_PROGRAM_ID}:`, e?.message);
         }
         try {
           await requestRecords('credits.aleo', false);
-          console.log('✅ Wallet record permissions initialized for credits.aleo');
+          privacyLog('✅ Wallet record permissions initialized for credits.aleo');
         } catch (e: any) {
-          console.warn('⚠️ Failed to pre-initialize permissions for credits.aleo:', e?.message);
+          privacyWarn('⚠️ Failed to pre-initialize permissions for credits.aleo:', e?.message);
         }
       } finally {
         setWalletPermissionsInitialized(true);
@@ -1707,7 +1708,7 @@ const DashboardPage: NextPageWithLayout = () => {
       const error = 'Please connect your wallet first.';
       setStatusMessage(error);
       console.error('❌ VALIDATION FAILED: Wallet not connected');
-      console.log('========================================\n');
+      privacyLog('========================================\n');
       return;
     }
     
@@ -1715,7 +1716,7 @@ const DashboardPage: NextPageWithLayout = () => {
       const error = 'Public key not available. Please reconnect your wallet.';
       setStatusMessage(error);
       console.error('❌ VALIDATION FAILED: Public key not available');
-      console.log('========================================\n');
+      privacyLog('========================================\n');
       return;
     }
 
@@ -1852,10 +1853,10 @@ const DashboardPage: NextPageWithLayout = () => {
       const startTime = Date.now();
 
       // v7: Contract reads user data from mappings automatically - only amount needed
-      console.log(`🔄 Executing ${action} transaction...`);
+      privacyLog(`🔄 Executing ${action} transaction...`);
       switch (action) {
         case 'deposit':
-          console.log('💰 DEPOSIT: Starting deposit transaction (executeTransaction)...');
+          privacyLog('💰 DEPOSIT: Starting deposit transaction (executeTransaction)...');
           tx = await lendingDeposit(
             executeTransaction,
             amountToUse,
@@ -1863,10 +1864,10 @@ const DashboardPage: NextPageWithLayout = () => {
             requestRecords,
             decrypt,
           );
-          console.log('💰 DEPOSIT: Transaction submitted successfully:', tx);
+          privacyLog('💰 DEPOSIT: Transaction submitted successfully:', tx);
           break;
         case 'borrow':
-          console.log('📥 BORROW: Starting borrow transaction (executeTransaction)...');
+          privacyLog('📥 BORROW: Starting borrow transaction (executeTransaction)...');
           setVaultBorrowTxId(null);
           tx = await lendingBorrow(
             executeTransaction,
@@ -1875,10 +1876,10 @@ const DashboardPage: NextPageWithLayout = () => {
             requestRecords,
             decrypt,
           );
-          console.log('📥 BORROW: Transaction submitted successfully:', tx);
+          privacyLog('📥 BORROW: Transaction submitted successfully:', tx);
           break;
         case 'repay':
-          console.log('💳 REPAY: Starting repay_with_credits transaction (executeTransaction)...');
+          privacyLog('💳 REPAY: Starting repay_with_credits transaction (executeTransaction)...');
           tx = await lendingRepay(
             executeTransaction,
             amountToUse,
@@ -1886,10 +1887,10 @@ const DashboardPage: NextPageWithLayout = () => {
             requestRecords,
             decrypt,
           );
-          console.log('💳 REPAY: Transaction submitted successfully:', tx);
+          privacyLog('💳 REPAY: Transaction submitted successfully:', tx);
           break;
         case 'withdraw':
-          console.log('💸 WITHDRAW: Starting withdraw transaction (executeTransaction)...');
+          privacyLog('💸 WITHDRAW: Starting withdraw transaction (executeTransaction)...');
           setVaultWithdrawTxId(null);
           {
             let microOverride: bigint | undefined;
@@ -1907,7 +1908,7 @@ const DashboardPage: NextPageWithLayout = () => {
               microOverride,
             );
           }
-          console.log('💸 WITHDRAW: Transaction submitted successfully:', tx);
+          privacyLog('💸 WITHDRAW: Transaction submitted successfully:', tx);
           break;
         default:
           throw new Error(`Unknown action: ${action}`);
@@ -1915,25 +1916,25 @@ const DashboardPage: NextPageWithLayout = () => {
 
       // If wallet action was cancelled, upstream helper returns sentinel value.
       if (tx === '__CANCELLED__') {
-        console.log(`💡 ${action.toUpperCase()} transaction was cancelled by user (no error).`);
+        privacyLog(`💡 ${action.toUpperCase()} transaction was cancelled by user (no error).`);
         setStatusMessage('Transaction cancelled by user.');
         if (!isDevAppEnv) {
           setTimeout(() => setStatusMessage(''), 2500);
         }
         setLoading(false);
-        console.log('========================================\n');
+        privacyLog('========================================\n');
         return;
       }
 
       const transactionTime = Date.now() - startTime;
-      console.log(`⏱️ Transaction submitted in ${transactionTime}ms`);
+      privacyLog(`⏱️ Transaction submitted in ${transactionTime}ms`);
 
       setTxId(null);
       setTxFinalized(false);
       setStatusMessage('Transaction submitted. Waiting for finalization…');
       
-      console.log('📤 Transaction ID:', tx);
-      console.log('⏳ Starting finalization polling...');
+      privacyLog('📤 Transaction ID:', tx);
+      privacyLog('⏳ Starting finalization polling...');
 
       // Poll for transaction finalization; then save to Supabase (withdraw/borrow). Backend watcher performs vault transfer.
       let finalized = false;
@@ -1943,13 +1944,13 @@ const DashboardPage: NextPageWithLayout = () => {
       const delayMs = 2000;
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        console.log(`🔄 Polling transaction status (attempt ${attempt}/${maxAttempts})...`);
+        privacyLog(`🔄 Polling transaction status (attempt ${attempt}/${maxAttempts})...`);
         await new Promise((resolve) => setTimeout(resolve, delayMs));
 
         if (transactionStatus) {
           try {
             const statusResult = await transactionStatus(tx);
-            console.log(`📊 Transaction status (attempt ${attempt}):`, statusResult);
+            privacyLog(`📊 Transaction status (attempt ${attempt}):`, statusResult);
 
             const statusText =
               typeof statusResult === 'string'
@@ -1959,7 +1960,7 @@ const DashboardPage: NextPageWithLayout = () => {
 
             if (statusLower === 'finalized' || statusLower === 'accepted') {
               finalized = true;
-              console.log('✅ Transaction finalized!', statusResult);
+              privacyLog('✅ Transaction finalized!', statusResult);
               const resolvedId =
                 (typeof statusResult === 'object' && (statusResult as any).transactionId) || tx;
               finalTxId = resolvedId;
@@ -1976,24 +1977,24 @@ const DashboardPage: NextPageWithLayout = () => {
                 `Transaction ${statusLower} on-chain (not a vault step). Try a slightly lower amount, refresh caps, or repay any remaining borrow dust and retry.`,
               );
               setLoading(false);
-              console.log('========================================\n');
+              privacyLog('========================================\n');
               return;
             }
             setStatusMessage(`Transaction ${statusText || 'pending'}... (attempt ${attempt}/${maxAttempts})`);
           } catch (e) {
-            console.warn(`⚠️ Failed to check transaction status (attempt ${attempt}):`, e);
+            privacyWarn(`⚠️ Failed to check transaction status (attempt ${attempt}):`, e);
           }
         } else {
           if (attempt === maxAttempts) {
             finalized = true;
-            console.log('⏰ Max attempts reached, assuming finalized');
+            privacyLog('⏰ Max attempts reached, assuming finalized');
           }
         }
       }
 
       if (txFailed) {
         setLoading(false);
-        console.log('========================================\n');
+        privacyLog('========================================\n');
         return;
       }
       if (!finalized) {
@@ -2001,12 +2002,12 @@ const DashboardPage: NextPageWithLayout = () => {
           'Transaction not finalized in time. Please check the explorer. Backend will process vault transfer once it is finalized.'
         );
         setLoading(false);
-        console.log('========================================\n');
+        privacyLog('========================================\n');
         return;
       }
 
       setTxFinalized(true);
-      console.log('✅ Transaction finalized successfully!');
+      privacyLog('✅ Transaction finalized successfully!');
 
       if (action === 'deposit' || action === 'repay') {
         if (publicKey) {
@@ -2040,7 +2041,7 @@ const DashboardPage: NextPageWithLayout = () => {
       }
 
       setAmount(0);
-      console.log('📋 Refreshing pool and user position after transaction finalization...');
+      privacyLog('📋 Refreshing pool and user position after transaction finalization...');
       try {
         // Cross-asset repay updates every asset's scaled borrow on-chain; refresh all rows.
         if (action === 'repay') {
@@ -2059,15 +2060,15 @@ const DashboardPage: NextPageWithLayout = () => {
         }
         if (!isDevAppEnv) setTimeout(() => setStatusMessage(''), 5000);
       } catch (refreshError) {
-        console.warn('⚠️ Failed to refresh pool state after transaction:', refreshError);
+        privacyWarn('⚠️ Failed to refresh pool state after transaction:', refreshError);
         setStatusMessage('Transaction finalized, but automatic refresh failed. Please click Refresh to update.');
       }
-      console.log('✅ Transaction flow completed successfully');
-      console.log('========================================\n');
+      privacyLog('✅ Transaction flow completed successfully');
+      privacyLog('========================================\n');
     } catch (e: any) {
       const displayMsg = getErrorMessage(e);
       if (process.env.NODE_ENV === 'development') {
-        console.warn(`[${action}]`, displayMsg, e);
+        privacyWarn(`[${action}]`, displayMsg, e);
       }
       
       // Detect wallet cancellation/rejection
@@ -2091,7 +2092,7 @@ const DashboardPage: NextPageWithLayout = () => {
       }
     } finally {
       setLoading(false);
-      console.log(`🏁 ${action.toUpperCase()} flow ended (loading set to false)`);
+      privacyLog(`🏁 ${action.toUpperCase()} flow ended (loading set to false)`);
     }
   };
 
@@ -2133,7 +2134,7 @@ const DashboardPage: NextPageWithLayout = () => {
           setFlashStatusMessage(`Transaction ${statusText || 'pending'}… (${attempt}/${maxAttempts})`);
         } catch (e) {
           if (e instanceof Error && e.message.startsWith('Transaction ')) throw e;
-          console.warn('Flash tx status poll:', e);
+          privacyWarn('Flash tx status poll:', e);
         }
       }
     }
@@ -3005,7 +3006,7 @@ const DashboardPage: NextPageWithLayout = () => {
         case 'deposit': {
           let tokenRecord = await getSuitableUsdcTokenRecord(requestRecords, amountMicro, publicKey, decrypt);
           if (!tokenRecord) {
-            console.warn('[USDC Deposit] No suitable USDCx record. See [getSuitableUsdcTokenRecord] logs above for details.');
+            privacyWarn('[USDC Deposit] No suitable USDCx record. See [getSuitableUsdcTokenRecord] logs above for details.');
             setAmountErrorUsdc(
               'No single USDCx record covers this amount (one private Token record must hold the full deposit). If your balance is split across multiple records, send USDCx to yourself to consolidate, or reduce the amount. Check console (F12) for details.',
             );
@@ -3020,7 +3021,7 @@ const DashboardPage: NextPageWithLayout = () => {
                 const plain = await decrypt(cipher);
                 if (plain) tokenRecord = { ...tokenRecord, plaintext: plain };
               } catch (e) {
-                console.warn('[USDC Deposit] Decrypt failed, using ciphertext:', e);
+                privacyWarn('[USDC Deposit] Decrypt failed, using ciphertext:', e);
               }
             }
           }
@@ -3035,7 +3036,7 @@ const DashboardPage: NextPageWithLayout = () => {
           break;
         }
         case 'repay': {
-          console.log('[Dashboard][USDC repay] pre-submit context', {
+          privacyLog('[Dashboard][USDC repay] pre-submit context', {
             amountToUse,
             amountMicro,
             netBorrowedMicro,
@@ -3047,7 +3048,7 @@ const DashboardPage: NextPageWithLayout = () => {
           });
           let tokenRecord = await getSuitableUsdcTokenRecord(requestRecords, amountMicro, publicKey, decrypt);
           if (!tokenRecord) {
-            console.warn('[USDC Repay] No suitable USDCx record. See [getSuitableUsdcTokenRecord] logs above for details.');
+            privacyWarn('[USDC Repay] No suitable USDCx record. See [getSuitableUsdcTokenRecord] logs above for details.');
             setAmountErrorUsdc(
               'No single USDCx record covers this repay amount. Consolidate private balance into one record or reduce the amount. See console (F12).',
             );
@@ -3062,7 +3063,7 @@ const DashboardPage: NextPageWithLayout = () => {
                 const plain = await decrypt(cipher);
                 if (plain) tokenRecord = { ...tokenRecord, plaintext: plain };
               } catch (e) {
-                console.warn('[USDC Repay] Decrypt failed, using ciphertext:', e);
+                privacyWarn('[USDC Repay] Decrypt failed, using ciphertext:', e);
               }
             }
           }
@@ -3082,7 +3083,7 @@ const DashboardPage: NextPageWithLayout = () => {
             chainBorrowCaps.totalDebtUsd > BigInt(0) &&
             portfolioDebtUsdForRepay < 0.01
           ) {
-            console.warn(
+            privacyWarn(
               '[USDC withdraw] On-chain debt is sub-cent but non-zero; if the tx fails, accrue interest and repay USDCx dust, then retry.',
             );
           }
@@ -3342,7 +3343,7 @@ const DashboardPage: NextPageWithLayout = () => {
                 const plain = await decrypt(cipher);
                 if (plain) tokenRecord = { ...tokenRecord, plaintext: plain };
               } catch (e) {
-                console.warn('[USAD Deposit] Decrypt failed, using ciphertext:', e);
+                privacyWarn('[USAD Deposit] Decrypt failed, using ciphertext:', e);
               }
             }
           }
@@ -3359,7 +3360,7 @@ const DashboardPage: NextPageWithLayout = () => {
         }
 
         case 'repay': {
-          console.log('[Dashboard][USAD repay] pre-submit context', {
+          privacyLog('[Dashboard][USAD repay] pre-submit context', {
             amountUsad,
             amountMicro,
             netBorrowedMicro,
@@ -3385,7 +3386,7 @@ const DashboardPage: NextPageWithLayout = () => {
                 const plain = await decrypt(cipher);
                 if (plain) tokenRecord = { ...tokenRecord, plaintext: plain };
               } catch (e) {
-                console.warn('[USAD Repay] Decrypt failed, using ciphertext:', e);
+                privacyWarn('[USAD Repay] Decrypt failed, using ciphertext:', e);
               }
             }
           }
@@ -3567,7 +3568,7 @@ const DashboardPage: NextPageWithLayout = () => {
         if (transactionStatus) {
           try {
             const status = await transactionStatus(tx);
-            console.log(`🧪 Create Test Credits: Poll attempt ${attempt}/${maxAttempts}, status:`, status);
+            privacyLog(`🧪 Create Test Credits: Poll attempt ${attempt}/${maxAttempts}, status:`, status);
             
             if (status && (status.status === 'Finalized' || (status as any).finalized)) {
               finalized = true;
@@ -3581,7 +3582,7 @@ const DashboardPage: NextPageWithLayout = () => {
               break;
             }
           } catch (statusError: any) {
-            console.warn(`🧪 Create Test Credits: Status check failed (attempt ${attempt}):`, statusError?.message);
+            privacyWarn(`🧪 Create Test Credits: Status check failed (attempt ${attempt}):`, statusError?.message);
           }
         }
       }
@@ -3646,7 +3647,7 @@ const DashboardPage: NextPageWithLayout = () => {
         if (transactionStatus) {
           try {
             const status = await transactionStatus(tx);
-            console.log(`🧪 Deposit Test Real: Poll attempt ${attempt}/${maxAttempts}, status:`, status);
+            privacyLog(`🧪 Deposit Test Real: Poll attempt ${attempt}/${maxAttempts}, status:`, status);
             
             if (status && (status.status === 'Finalized' || (status as any).finalized)) {
               finalized = true;
@@ -3660,7 +3661,7 @@ const DashboardPage: NextPageWithLayout = () => {
               break;
             }
           } catch (statusError: any) {
-            console.warn(`🧪 Deposit Test Real: Status check failed (attempt ${attempt}):`, statusError?.message);
+            privacyWarn(`🧪 Deposit Test Real: Status check failed (attempt ${attempt}):`, statusError?.message);
           }
         }
       }
@@ -3719,7 +3720,7 @@ const DashboardPage: NextPageWithLayout = () => {
         
           try {
             const statusResult = await transactionStatus(tx);
-            console.log(`📊 Accrue interest status (attempt ${attempt}):`, statusResult);
+            privacyLog(`📊 Accrue interest status (attempt ${attempt}):`, statusResult);
 
             const statusText =
               typeof statusResult === 'string'
@@ -3735,7 +3736,7 @@ const DashboardPage: NextPageWithLayout = () => {
               setTxFinalized(true);
               // Fetch records in background after interest accrual finalizes
               if (requestRecords && publicKey) {
-                console.log('📋 Interest accrual finalized - fetching records in background...');
+                privacyLog('📋 Interest accrual finalized - fetching records in background...');
                 fetchRecordsInBackground(LENDING_POOL_PROGRAM_ID);
               }
               break;
@@ -3745,7 +3746,7 @@ const DashboardPage: NextPageWithLayout = () => {
             );
           } catch (e) {
           // If transactionStatus fails, continue polling; assume finalized at max wait.
-            console.warn('Failed to check transaction status:', e);
+            privacyWarn('Failed to check transaction status:', e);
           if (attempt === maxAttempts) {
             finalized = true;
           }
@@ -3756,14 +3757,14 @@ const DashboardPage: NextPageWithLayout = () => {
         setTxFinalized(true);
         // Refresh pool + user data once interest accrual is finalized
         try {
-          console.log('📋 Interest accrual finalized - refreshing pool and user position...');
+          privacyLog('📋 Interest accrual finalized - refreshing pool and user position...');
           await refreshPoolState(true);
           setStatusMessage('Interest accrued and finalized! Pool and position have been refreshed.');
           if (!isDevAppEnv) {
             setTimeout(() => setStatusMessage(''), 2500);
           }
         } catch (refreshError) {
-          console.warn('⚠️ Failed to refresh after interest accrual:', refreshError);
+          privacyWarn('⚠️ Failed to refresh after interest accrual:', refreshError);
           setStatusMessage(
             'Interest accrued and finalized, but automatic refresh failed. Please click Refresh.',
           );
@@ -4529,7 +4530,7 @@ const DashboardPage: NextPageWithLayout = () => {
 
   useEffect(() => {
     if (!connected || !dashboardDataReady) return;
-    console.log('[Portfolio pricing] resolved prices', {
+    privacyLog('[Portfolio pricing] resolved prices', {
       aleo: { usd: ALEO_PRICE_USD, source: ALEO_PRICE_SOURCE, raw: assetPriceAleo },
       usdcx: { usd: USDCX_PRICE_USD, source: USDCX_PRICE_SOURCE, raw: assetPriceUsdc },
       usad: { usd: USAD_PRICE_USD, source: USAD_PRICE_SOURCE, raw: assetPriceUsad },
@@ -4551,7 +4552,7 @@ const DashboardPage: NextPageWithLayout = () => {
   /** UI-row estimate only (per-asset supplied × price). Hero metrics use `chainBorrowCaps` when set. */
   useEffect(() => {
     if (!connected || !dashboardDataReady) return;
-    console.log('[Portfolio estimate] per-asset USD from displayed supply/borrow (chain-backed when caps loaded)', {
+    privacyLog('[Portfolio estimate] per-asset USD from displayed supply/borrow (chain-backed when caps loaded)', {
       totalCollateralUsd,
       weightedCollateralUsd,
       breakdown: {
@@ -6480,7 +6481,7 @@ const DashboardPage: NextPageWithLayout = () => {
               ].map(btn => (
                 <button key={btn.label} onClick={btn.onClick} className="px-4 py-2 rounded-xl text-sm text-slate-300 hover:text-white transition-colors" style={dashGlass}>{btn.label}</button>
               ))}
-              <button onClick={() => { if (requestRecords && publicKey) { debugAllRecords(requestRecords, publicKey).then(r => { console.log('Diagnostic results:', r); setStatusMessage('✅ Diagnostic complete.'); }); } else { setStatusMessage('❌ Wallet not connected'); } }} disabled={!connected} className="px-4 py-2 rounded-xl text-sm text-slate-300 hover:text-white transition-colors disabled:opacity-40" style={dashGlass}>🔍 Run Diagnosis</button>
+              <button onClick={() => { if (requestRecords && publicKey) { debugAllRecords(requestRecords, publicKey).then(r => { privacyLog('Diagnostic results:', r); setStatusMessage('✅ Diagnostic complete.'); }); } else { setStatusMessage('❌ Wallet not connected'); } }} disabled={!connected} className="px-4 py-2 rounded-xl text-sm text-slate-300 hover:text-white transition-colors disabled:opacity-40" style={dashGlass}>🔍 Run Diagnosis</button>
           </div>
           {showLogsPanel && logsSummary && (
               <div className="rounded-xl p-4 space-y-2 max-h-96 overflow-y-auto" style={{ backgroundColor: 'rgba(255,255,255,0.03)' }}>
