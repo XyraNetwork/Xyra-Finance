@@ -28,6 +28,7 @@ const customStyles: Record<string, React.CSSProperties> = {
 const Navbar = () => {
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [isResourcesMobileOpen, setIsResourcesMobileOpen] = useState(false);
   const [hovered, setHovered] = useState<string | null>(null);
   const router = useRouter();
   const { setVisible } = useWalletModal();
@@ -56,6 +57,7 @@ const Navbar = () => {
   useEffect(() => {
     setIsMobileMenuOpen(false);
     setIsDropdownOpen(false);
+    setIsResourcesMobileOpen(false);
   }, [router.pathname]);
 
   const baseNavItems = [
@@ -68,9 +70,13 @@ const Navbar = () => {
     },
     { name: 'ADMIN', id: 'admin', href: '/admin' },
     { name: 'MARKETS', id: 'markets', href: '/markets' },
-    { name: 'DOCS', id: 'docs', href: '/docs' },
-    { name: 'WHITEPAPER', id: 'whitepaper', href: '/whitepaper' },
   ] as const;
+
+  const resourceLinks = [
+    { name: 'Documentation', id: 'docs', href: '/docs' },
+    { name: 'Whitepaper', id: 'whitepaper', href: '/whitepaper' },
+  ] as const;
+
   const navItems = baseNavItems.filter((item) => item.id !== 'admin' || isAdminWallet);
 
   const dashboardViewParam = Array.isArray(router.query.view)
@@ -96,6 +102,9 @@ const Navbar = () => {
     const base = href.split('?')[0];
     return router.pathname === base;
   };
+
+  const isResourcesActive =
+    router.pathname === '/docs' || router.pathname === '/whitepaper';
 
   const formatAddress = (addr: string) => {
     if (!addr) return '';
@@ -190,6 +199,62 @@ const Navbar = () => {
           {navItems.map((item) => (
             <NavLink key={item.id} item={item} />
           ))}
+          {/* Resources: docs + whitepaper */}
+          <div
+            className="relative group h-full flex items-center"
+            onMouseEnter={() => setHovered('resources')}
+            onMouseLeave={() => setHovered(null)}
+          >
+            <span
+              className="text-[11px] font-bold tracking-widest transition-all relative flex flex-col items-center justify-center h-full px-2 cursor-default gap-0.5"
+              style={{
+                color: isResourcesActive ? '#ffffff' : hovered === 'resources' ? '#ffffff' : '#94a3b8',
+                fontFamily: "'Space Grotesk', 'Inter', sans-serif",
+                fontWeight: isResourcesActive ? '700' : '500',
+              }}
+            >
+              <span className="flex items-center gap-1">
+                RESOURCES
+                <svg width="8" height="5" viewBox="0 0 10 6" fill="none" className="opacity-60" aria-hidden>
+                  <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </span>
+              {isResourcesActive && (
+                <span
+                  style={{
+                    position: 'absolute',
+                    bottom: '-6px',
+                    left: '50%',
+                    transform: 'translateX(-50%)',
+                    width: '100%',
+                    height: '2px',
+                    background: '#22d3ee',
+                    boxShadow: '0 0 10px rgba(34, 211, 238, 0.6)',
+                    borderRadius: '2px',
+                  }}
+                />
+              )}
+            </span>
+            <div
+              className="absolute left-1/2 -translate-x-1/2 top-full pt-2 w-[200px] opacity-0 invisible pointer-events-none group-hover:opacity-100 group-hover:visible group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:visible group-focus-within:pointer-events-auto transition-opacity z-[120]"
+            >
+              <div
+                className="rounded-xl border border-white/10 py-2 shadow-2xl"
+                style={{ background: '#030712', backdropFilter: 'blur(24px)' }}
+              >
+                {resourceLinks.map((link) => (
+                  <Link
+                    key={link.id}
+                    href={link.href}
+                    className="block px-4 py-2.5 text-xs font-semibold tracking-wide text-slate-400 hover:text-white hover:bg-white/5 transition-colors"
+                    style={{ fontFamily: "'Space Grotesk', 'Inter', sans-serif" }}
+                  >
+                    {link.name}
+                  </Link>
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
 
         {/* Mobile nav toggle */}
@@ -348,6 +413,52 @@ const Navbar = () => {
               </Link>
             );
           })}
+          <div className="mt-1 border-t border-white/5 pt-1">
+            <button
+              type="button"
+              onClick={() => setIsResourcesMobileOpen((v) => !v)}
+              className="flex w-full items-center justify-between px-3 py-2.5 rounded-xl text-xs font-bold tracking-widest text-left"
+              style={{
+                color: isResourcesActive ? '#ffffff' : '#94a3b8',
+                backgroundColor: isResourcesActive ? 'rgba(255,255,255,0.08)' : 'transparent',
+                fontFamily: "'Space Grotesk', 'Inter', sans-serif",
+              }}
+              aria-expanded={isResourcesMobileOpen}
+            >
+              RESOURCES
+              <svg
+                width="10"
+                height="6"
+                viewBox="0 0 10 6"
+                fill="none"
+                className={`shrink-0 opacity-50 transition-transform ${isResourcesMobileOpen ? 'rotate-180' : ''}`}
+                aria-hidden
+              >
+                <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            {isResourcesMobileOpen && (
+              <div className="pb-1 pl-2">
+                {resourceLinks.map((link) => {
+                  const subActive = router.pathname === link.href;
+                  return (
+                    <Link
+                      key={link.id}
+                      href={link.href}
+                      onClick={() => setIsMobileMenuOpen(false)}
+                      className="block px-3 py-2 rounded-lg text-xs font-semibold tracking-wide"
+                      style={{
+                        color: subActive ? '#22d3ee' : '#94a3b8',
+                        fontFamily: "'Space Grotesk', 'Inter', sans-serif",
+                      }}
+                    >
+                      {link.name}
+                    </Link>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </nav>
