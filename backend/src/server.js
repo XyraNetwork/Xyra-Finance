@@ -51,6 +51,8 @@ let vaultBalancesCache = {
   ts: 0,
   value: null,
 };
+/** When cache is cold, concurrent GETs share one `getVaultPublicBalances()` (avoids RPC stampede). */
+let vaultBalancesRefreshInFlight = null;
 
 function parseLeoUint(raw) {
   if (raw == null) return 0n;
@@ -591,8 +593,16 @@ app.get('/vault-balances', async (_req, res) => {
       return res.json({ ok: true, cached: true, ...vaultBalancesCache.value });
     }
 
-    const value = await getVaultPublicBalances();
-    vaultBalancesCache = { ts: now, value };
+    if (!vaultBalancesRefreshInFlight) {
+      vaultBalancesRefreshInFlight = (async () => {
+        const value = await getVaultPublicBalances();
+        vaultBalancesCache = { ts: Date.now(), value };
+        return value;
+      })().finally(() => {
+        vaultBalancesRefreshInFlight = null;
+      });
+    }
+    const value = await vaultBalancesRefreshInFlight;
     return res.json({ ok: true, cached: false, ...value });
   } catch (err) {
     console.error('❌ /vault-balances failed:', err);
