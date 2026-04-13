@@ -5445,7 +5445,7 @@ const DashboardPage: NextPageWithLayout = () => {
                     onClick={() => {
                       const v = liqUiLimits?.effectiveMaxRepayAleo;
                       if (v == null || !Number.isFinite(v) || v <= 0) return;
-                      const s = v.toFixed(6).replace(/\.?0+$/, '');
+                      const s = v.toFixed(2).replace(/\.?0+$/, '');
                       setLiqRepayAmountInput(s || '0');
                     }}
                     className="shrink-0 rounded-2xl bg-white/10 border border-white/15 px-4 py-3 text-sm text-slate-200 disabled:opacity-40"
